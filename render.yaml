@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: flask-stripe-app
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: STRIPE_SECRET_KEY
+        value: your_stripe_secret_key_here
+      - key: STRIPE_ENDPOINT_SECRET
+        value: your_webhook_secret_here
