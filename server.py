@@ -1,7 +1,7 @@
 import os
 import uuid
 import stripe
-import subprocess
+# import subprocess  # Commented out since Blender won't be used
 from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
@@ -26,18 +26,17 @@ def upload():
             f.write(request.data)
 
         print(f"📥 Uploaded mold to {raw_path}")
-        print(f"⚙️ Running Blender to process mold...")
+        print(f"⚠️ Skipping Blender call (commented out)")
 
-        subprocess.run([
-            "blender", "--background", "--python", "blender_script.py",
-            "--", raw_path, final_path
-        ], check=True)
+        # Simulate processed file by copying raw to final
+        with open(raw_path, "rb") as src, open(final_path, "wb") as dst:
+            dst.write(src.read())
 
-        print(f"✅ Mold processed and saved to {final_path}")
+        print(f"✅ Mold copied to {final_path} (Blender skipped)")
         return jsonify({ "job_id": job_id }), 200
 
     except Exception as e:
-        print(f"❌ Upload or Blender error: {e}")
+        print(f"❌ Upload error: {e}")
         return jsonify({ "error": str(e) }), 500
 
 # -------------------- POLL FOR STATUS --------------------
