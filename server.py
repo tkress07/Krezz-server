@@ -1,10 +1,11 @@
 import os
 import stripe
+import subprocess
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Load environment variables
+# Environment vars
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_ENDPOINT_SECRET")
 
@@ -18,7 +19,6 @@ def stripe_webhook():
     sig_header = request.headers.get("Stripe-Signature")
 
     try:
-        # Verify signature and parse event
         event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
     except stripe.error.SignatureVerificationError as e:
         print(f"❌ Signature verification failed: {e}")
@@ -27,18 +27,33 @@ def stripe_webhook():
         print(f"❌ Unexpected error: {e}")
         return "Webhook error", 400
 
-    # Log received event type
     print(f"📦 Received event: {event['type']}")
 
-    # Handle specific event
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         print("✅ Checkout session completed.")
-        print(f"🔗 Session ID: {session.get('id')}")
-        # TODO: trigger mold delivery or update status
+        session_id = session.get('id')
+
+        # Simulate STL input path
+        input_path = f"/tmp/{session_id}_raw.stl"
+        output_path = f"/tmp/{session_id}_processed.stl"
+
+        print(f"⚙️ Running Blender: input → {input_path}, output → {output_path}")
+
+        try:
+            subprocess.run([
+                "blender", "--background",
+                "--python", "blender/process_mold.py",
+                "--", input_path, output_path
+            ], check=True)
+            print("✅ Blender finished processing.")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Blender error: {e}")
+            return "Mold processing failed", 500
+
+        # Optional: Upload processed mold to cloud or notify mobile app
 
     return jsonify(success=True)
 
 if __name__ == '__main__':
-    # Use 0.0.0.0 so Render can expose it
     app.run(host='0.0.0.0', port=5000)
