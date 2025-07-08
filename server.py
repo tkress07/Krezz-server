@@ -1,55 +1,37 @@
-import os
-import uuid
+from flask import Flask, request, jsonify
 import stripe
-# import subprocess  # Commented out since Blender won't be used
-from flask import Flask, request, jsonify, send_file
+import os
 
 app = Flask(__name__)
 
-# Stripe configuration from environment variables
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_ENDPOINT_SECRET")
 
 @app.route('/')
 def index():
-    return '✅ Krezz server is live and ready to receive requests.'
+    return '✅ Krezz server is live and ready to receive Stripe events.'
 
-# -------------------- UPLOAD MOLDS --------------------
-@app.route('/upload', methods=['POST'])
-def upload():
-    job_id = str(uuid.uuid4())
-    raw_path = f"/tmp/{job_id}_raw.stl"
-    final_path = f"/tmp/{job_id}.stl"
-
+@app.route('/create-checkout-session', methods=['POST'])
+def create_checkout_session():
     try:
-        with open(raw_path, "wb") as f:
-            f.write(request.data)
-
-        print(f"📥 Uploaded mold to {raw_path}")
-        print(f"⚠️ Skipping Blender call (commented out)")
-
-        # Simulate processed file by copying raw to final
-        with open(raw_path, "rb") as src, open(final_path, "wb") as dst:
-            dst.write(src.read())
-
-        print(f"✅ Mold copied to {final_path} (Blender skipped)")
-        return jsonify({ "job_id": job_id }), 200
-
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            mode='payment',
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'product_data': { 'name': 'Custom Beard Mold' },
+                    'unit_amount': 7500,
+                },
+                'quantity': 1,
+            }],
+            success_url='https://your-app.com/success',
+            cancel_url='https://your-app.com/cancel'
+        )
+        return jsonify({ 'url': session.url })
     except Exception as e:
-        print(f"❌ Upload error: {e}")
-        return jsonify({ "error": str(e) }), 500
+        return jsonify({ 'error': str(e) }), 500
 
-# -------------------- POLL FOR STATUS --------------------
-@app.route('/status/<job_id>', methods=['GET'])
-def status(job_id):
-    result_path = f"/tmp/{job_id}.stl"
-    if os.path.exists(result_path):
-        print(f"📤 Returning STL for job {job_id}")
-        return send_file(result_path, mimetype='application/sla')
-    else:
-        return jsonify({ "status": "processing" }), 404
-
-# -------------------- STRIPE WEBHOOK --------------------
 @app.route('/webhook', methods=['POST'])
 def stripe_webhook():
     payload = request.data
@@ -64,16 +46,9 @@ def stripe_webhook():
         print(f"❌ Unexpected error: {e}")
         return "Webhook error", 400
 
-    print(f"📦 Received event: {event['type']}")
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        print("✅ Stripe checkout completed.")
-        print(f"🧾 Session ID: {session.get('id')}")
-
+    print(f"📦 Event: {event['type']}")
     return jsonify(success=True)
 
-# -------------------- RUN SERVER --------------------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
