@@ -99,9 +99,14 @@ def stripe_webhook():
     return jsonify(success=True)
 
 # -------------------- GET ORDER INFO --------------------
-@app.route('/order/<job_id>', methods=['GET'])
-def get_order(job_id):
-    return jsonify(ORDER_DATA.get(job_id, []))
+@app.route('/order-data/<job_id>', methods=['GET'])
+def get_order_data(job_id):
+    data = ORDER_DATA.get(job_id)
+    if data:
+        return jsonify({"job_id": job_id, "items": data})
+    else:
+        return jsonify({"error": "Job ID not found"}), 404
+
 
 # -------------------- RUN --------------------
 if __name__ == '__main__':
