@@ -1,8 +1,9 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file, abort
 import stripe
 import os
 import uuid
 from datetime import datetime
+
 
 app = Flask(__name__)
 
@@ -110,6 +111,17 @@ def get_order_data(job_id):
         print("❌ Job ID not found")
         return jsonify({"error": "Job ID not found"}), 404
 
+
+@app.route('/stl/<job_id>.stl', methods=['GET'])
+def serve_stl(job_id):
+    stl_path = os.path.join("output", job_id, f"{job_id}.stl")
+    
+    if not os.path.exists(stl_path):
+        print(f"❌ STL not found at: {stl_path}")
+        return abort(404)
+    
+    print(f"📤 Serving STL file: {stl_path}")
+    return send_file(stl_path, mimetype='application/sla', as_attachment=True)
 
 # -------------------- RUN --------------------
 if __name__ == '__main__':
