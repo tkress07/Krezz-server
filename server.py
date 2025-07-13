@@ -16,6 +16,9 @@ if not stripe.api_key or not endpoint_secret:
 
 ORDER_DATA = {}
 
+UPLOAD_DIR = "/data/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 @app.route('/')
 def index():
     return '✅ Krezz server is live and ready to receive Stripe events.'
@@ -114,7 +117,8 @@ def get_order_data(job_id):
 
 @app.route('/stl/<job_id>.stl', methods=['GET'])
 def serve_stl(job_id):
-    stl_path = os.path.join("output", job_id, f"{job_id}.stl")
+    stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
+
     
     if not os.path.exists(stl_path):
         print(f"❌ STL not found at: {stl_path}")
@@ -122,6 +126,26 @@ def serve_stl(job_id):
     
     print(f"📤 Serving STL file: {stl_path}")
     return send_file(stl_path, mimetype='application/sla', as_attachment=True)
+
+# -------------------- UPLOAD STL FILE --------------------
+@app.route('/upload', methods=['POST'])
+def upload_stl():
+    job_id = request.form.get('job_id')
+    file = request.files.get('file')
+
+    if not job_id or not file:
+        return jsonify({ "error": "Missing job_id or file" }), 400
+
+    # Save STL to /data/uploads/<job_id>.stl
+    save_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
+    try:
+        file.save(save_path)
+        print(f"✅ Uploaded STL for job_id: {job_id} -> {save_path}")
+        return jsonify({ "success": True, "path": save_path })
+    except Exception as e:
+        print(f"❌ Failed to save STL: {e}")
+        return jsonify({ "error": str(e) }), 500
+
 
 # -------------------- RUN --------------------
 if __name__ == '__main__':
