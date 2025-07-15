@@ -32,7 +32,7 @@ def create_checkout_session():
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
-        job_id = str(uuid.uuid4())
+        job_id = items[0].get("job_id") or str(uuid.uuid4())  
         ORDER_DATA[job_id] = items
 
         line_items = []
