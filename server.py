@@ -125,7 +125,13 @@ def serve_stl(job_id):
         return abort(404)
     
     print(f"📤 Serving STL file: {stl_path}")
-    return send_file(stl_path, mimetype='application/sla', as_attachment=True)
+    return send_file(
+        stl_path,
+        mimetype='application/sla',
+        as_attachment=True,
+        download_name=f"mold_{job_id}.stl"  # ✅ This sets the proper filename
+    )
+
 
 # -------------------- UPLOAD STL FILE --------------------
 @app.route('/upload', methods=['POST'])
