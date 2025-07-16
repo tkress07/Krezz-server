@@ -4,7 +4,6 @@ import os
 import uuid
 from datetime import datetime
 
-
 app = Flask(__name__)
 
 # ✅ Load from environment variables (safe for GitHub)
@@ -29,22 +28,46 @@ def create_checkout_session():
     try:
         data = request.get_json()
         items = data.get("items", [])
+        shipping_info = data.get("shippingInfo", {})
+
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
-        job_id = items[0].get("job_id") or str(uuid.uuid4())  
-        ORDER_DATA[job_id] = items
+        job_id = items[0].get("job_id") or str(uuid.uuid4())
+
+        # ✅ Store both items and shipping info
+        ORDER_DATA[job_id] = {
+            "items": items,
+            "shipping": shipping_info
+        }
 
         line_items = []
         for item in items:
             line_items.append({
                 "price_data": {
                     "currency": "usd",
-                    "product_data": { "name": item.get("name", "Beard Mold") },
+                    "product_data": {
+                        "name": item.get("name", "Beard Mold")
+                    },
                     "unit_amount": int(item.get("price", 7500)),
                 },
                 "quantity": 1
             })
+
+        # ✅ Pass shipping info in metadata (optional but useful)
+        metadata = {
+            "job_id": job_id,
+            "shipping_name": shipping_info.get("fullName", ""),
+            "shipping_email": shipping_info.get("email", ""),
+            "shipping_phone": shipping_info.get("phone", ""),
+            "shipping_address": shipping_info.get("addressLine", ""),
+            "shipping_city": shipping_info.get("city", ""),
+            "shipping_state": shipping_info.get("state", ""),
+            "shipping_zip": shipping_info.get("zipCode", ""),
+            "shipping_country": shipping_info.get("country", ""),
+            "shipping_material": shipping_info.get("material", ""),
+            "shipping_color": shipping_info.get("color", "")
+        }
 
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
@@ -52,7 +75,7 @@ def create_checkout_session():
             line_items=line_items,
             success_url=f'krezzapp://order-confirmed?job_id={job_id}',  # 🔁 Deep link
             cancel_url='https://krezzapp.com/cancel',
-            metadata={ "job_id": job_id }
+            metadata=metadata
         )
 
         print(f"✅ Created checkout session: {session.id}")
@@ -60,7 +83,7 @@ def create_checkout_session():
 
     except Exception as e:
         print(f"❌ Error in checkout session: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({ "error": str(e) }), 500
 
 # -------------------- WEBHOOK HANDLER --------------------
 @app.route('/webhook', methods=['POST'])
@@ -93,9 +116,9 @@ def stripe_webhook():
         }
 
         if job_id not in ORDER_DATA:
-            ORDER_DATA[job_id] = []
+            ORDER_DATA[job_id] = { "items": [], "shipping": {} }
 
-        for item in ORDER_DATA[job_id]:
+        for item in ORDER_DATA[job_id]["items"]:
             item.update(order)
 
         print(f"✅ Payment confirmed for job_id: {job_id}")
@@ -109,17 +132,20 @@ def get_order_data(job_id):
     data = ORDER_DATA.get(job_id)
     print(f"🧾 ORDER_DATA content for job_id: {data}")
     if data:
-        return jsonify({"job_id": job_id, "items": data})
+        return jsonify({
+            "job_id": job_id,
+            "items": data.get("items", []),
+            "shipping": data.get("shipping", {})
+        })
     else:
         print("❌ Job ID not found")
         return jsonify({"error": "Job ID not found"}), 404
 
-
+# -------------------- SERVE STL FILE --------------------
 @app.route('/stl/<job_id>.stl', methods=['GET'])
 def serve_stl(job_id):
     stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
 
-    
     if not os.path.exists(stl_path):
         print(f"❌ STL not found at: {stl_path}")
         return abort(404)
@@ -129,9 +155,8 @@ def serve_stl(job_id):
         stl_path,
         mimetype='application/sla',
         as_attachment=True,
-        download_name=f"mold_{job_id}.stl"  # ✅ This sets the proper filename
+        download_name=f"mold_{job_id}.stl"
     )
-
 
 # -------------------- UPLOAD STL FILE --------------------
 @app.route('/upload', methods=['POST'])
@@ -142,7 +167,6 @@ def upload_stl():
     if not job_id or not file:
         return jsonify({ "error": "Missing job_id or file" }), 400
 
-    # Save STL to /data/uploads/<job_id>.stl
     save_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
     try:
         file.save(save_path)
@@ -151,7 +175,6 @@ def upload_stl():
     except Exception as e:
         print(f"❌ Failed to save STL: {e}")
         return jsonify({ "error": str(e) }), 500
-
 
 # -------------------- RUN --------------------
 if __name__ == '__main__':
