@@ -1,27 +1,28 @@
-# In Krezz-server/render.yaml
 services:
   - type: web
     name: flask-stripe-app
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app
+    startCommand: gunicorn -b 0.0.0.0:$PORT server:app
+    autoDeploy: true
     envVars:
       - key: FLASK_ENV
         value: production
       - key: STRIPE_SECRET_KEY
-        value: your_stripe_secret_key_here
+        sync: false
       - key: STRIPE_ENDPOINT_SECRET
-        value: your_webhook_secret_here
+        sync: false
 
-  # 👇 NEW: separate Blender service on its own VM
   - type: web
     name: blender-service
     env: docker
     rootDir: blender-service
     plan: starter
-    # Disk is optional for today's test, but add it once we run jobs
-    disk:
-      name: jobs
-      mountPath: /data
-      sizeGB: 10
+    autoDeploy: true
+    healthCheckPath: /
+    # If you want persistent job files:
+    # disk:
+    #   name: jobs
+    #   mountPath: /data
+    #   sizeGB: 10
