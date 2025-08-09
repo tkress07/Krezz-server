@@ -1,3 +1,4 @@
+# In Krezz-server/render.yaml
 services:
   - type: web
     name: flask-stripe-app
@@ -12,3 +13,15 @@ services:
         value: your_stripe_secret_key_here
       - key: STRIPE_ENDPOINT_SECRET
         value: your_webhook_secret_here
+
+  # 👇 NEW: separate Blender service on its own VM
+  - type: web
+    name: blender-service
+    env: docker
+    rootDir: blender-service
+    plan: starter
+    # Disk is optional for today's test, but add it once we run jobs
+    disk:
+      name: jobs
+      mountPath: /data
+      sizeGB: 10
