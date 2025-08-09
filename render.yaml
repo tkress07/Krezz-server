@@ -9,10 +9,16 @@ services:
     envVars:
       - key: FLASK_ENV
         value: production
+      - key: UPLOAD_DIR
+        value: /data/uploads
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_ENDPOINT_SECRET
         sync: false
+    disk:
+      name: uploads
+      mountPath: /data
+      sizeGB: 5
 
   - type: web
     name: blender-service
@@ -21,8 +27,10 @@ services:
     plan: starter
     autoDeploy: true
     healthCheckPath: /
-    # If you want persistent job files:
-    # disk:
-    #   name: jobs
-    #   mountPath: /data
-    #   sizeGB: 10
+    envVars:
+      - key: JOBS_DIR
+        value: /data/jobs
+    disk:
+      name: jobs
+      mountPath: /data
+      sizeGB: 10
