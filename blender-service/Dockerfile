@@ -19,10 +19,11 @@ RUN blender -v
 
 # App
 WORKDIR /app
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
 COPY . /app/
+RUN pip3 install --no-cache-dir -r requirements.txt
 
+# Render provides $PORT. Ensure we bind to it.
 ENV PORT=8000
 CMD gunicorn -b 0.0.0.0:$PORT app:app
+
 
