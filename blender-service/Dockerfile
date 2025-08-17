@@ -12,12 +12,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Sanity check: make sure blender is on PATH during build
 RUN blender -v
 
-# App
+# App directory
 WORKDIR /app
-# Build context is blender-service/, so these files must live in that folder
+
+# COPY app files
 COPY . /app/
+
+# ✅ Make sure the Blender generation script is copied
+COPY generate_stl.py /app/
+
+# Install Python dependencies
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Render provides $PORT; bind gunicorn to it
+# Set default port
 ENV PORT=8000
+
+# Run server
 CMD gunicorn -b 0.0.0.0:$PORT app:app
