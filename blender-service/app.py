@@ -24,6 +24,8 @@ def blender_version():
 def generate_stl():
     try:
         data = request.get_json()
+        print("🛬 Received JSON:", data)
+
         vertices = data.get("vertices", [])
         neckline = data.get("neckline", [])
 
@@ -51,3 +53,4 @@ def generate_stl():
         return jsonify({"error": f"Blender failed: {e}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
