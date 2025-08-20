@@ -138,8 +138,22 @@ for idx in hole_indices:
             rotation=(math.pi / 2, 0, 0)
         )
 
-# --- Join everything and export STL
-bpy.ops.object.select_all(action='SELECT')
-bpy.context.view_layer.objects.active = bpy.context.selected_objects[0]
+# ✅ Filter & join only valid mesh objects
+mesh_objects = [
+    obj for obj in bpy.context.scene.objects
+    if obj.type == 'MESH' and len(obj.data.vertices) > 0
+]
+
+if not mesh_objects:
+    print("⚠️ No valid mesh objects to join — skipping join/export")
+    exit()
+
+for o in bpy.context.selected_objects:
+    o.select_set(False)
+for o in mesh_objects:
+    o.select_set(True)
+bpy.context.view_layer.objects.active = mesh_objects[0]
 bpy.ops.object.join()
+
+# --- Export STL
 bpy.ops.export_mesh.stl(filepath=output_path, use_selection=False)
