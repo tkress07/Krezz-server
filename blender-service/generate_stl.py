@@ -111,6 +111,13 @@ if neckline:
         faces.append([n0_idx, n1_idx, b1_idx])
 
 # --- Create Blender mesh ---
+if len(faces) == 0:
+    print("⚠️ No faces generated from input. Creating fallback cube STL.")
+    bpy.ops.mesh.primitive_cube_add(size=0.01, location=(0, 0, 0))
+    fallback_obj = bpy.context.active_object
+    bpy.ops.export_mesh.stl(filepath=output_path, use_selection=False)
+    exit()
+
 mesh = bpy.data.meshes.new("Mold")
 obj = bpy.data.objects.new("MoldObject", mesh)
 bpy.context.collection.objects.link(obj)
@@ -145,15 +152,17 @@ mesh_objects = [
 ]
 
 if not mesh_objects:
-    print("⚠️ No valid mesh objects to join — skipping join/export")
+    print("⚠️ Still no valid mesh objects after extrusion. Creating fallback cube STL.")
+    bpy.ops.mesh.primitive_cube_add(size=0.01, location=(0, 0, 0))
+    fallback_obj = bpy.context.active_object
+    bpy.ops.export_mesh.stl(filepath=output_path, use_selection=False)
     exit()
 
+# Join and export
 for o in bpy.context.selected_objects:
     o.select_set(False)
 for o in mesh_objects:
     o.select_set(True)
 bpy.context.view_layer.objects.active = mesh_objects[0]
 bpy.ops.object.join()
-
-# --- Export STL
 bpy.ops.export_mesh.stl(filepath=output_path, use_selection=False)
