@@ -39,18 +39,33 @@ def generate_stl():
         with open(input_path, "w") as f:
             json.dump({"vertices": vertices, "neckline": neckline}, f)
 
-        subprocess.run([
+        print(f"📦 Calling Blender with input: {input_path}, output: {output_path}")
+
+        result = subprocess.run([
             "blender", "--background", "--python", "generate_stl.py", "--",
             input_path, output_path
-        ], check=True)
+        ], capture_output=True, text=True, timeout=60)
+
+        print("✅ Blender STDOUT:\n", result.stdout)
+        print("⚠️ Blender STDERR:\n", result.stderr)
+
+        if result.returncode != 0:
+            return jsonify({
+                "error": "Blender failed",
+                "stderr": result.stderr,
+                "stdout": result.stdout
+            }), 500
 
         if not os.path.exists(output_path):
-            return jsonify({"error": "STL generation failed"}), 500
+            return jsonify({"error": "STL not created", "stderr": result.stderr}), 500
 
         return send_file(output_path, mimetype="application/octet-stream", as_attachment=True, download_name="mold.stl")
 
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Blender timed out"}), 504
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": f"Blender failed: {e}"}), 500
+        return jsonify({"error": f"Blender crashed", "details": str(e)}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
