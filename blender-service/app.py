@@ -28,6 +28,8 @@ def generate_stl():
 
         vertices = data.get("vertices", [])
         neckline = data.get("neckline", [])
+        overlay = data.get("overlay", "default")
+        job_id = data.get("job_id", uuid.uuid4().hex[:8])  # fallback UUID if not provided
 
         if not vertices:
             return jsonify({"error": "No vertices provided"}), 400
@@ -36,8 +38,14 @@ def generate_stl():
         input_path = f"/tmp/input_{temp_id}.json"
         output_path = f"/tmp/output_{temp_id}.stl"
 
+        # Write full payload with overlay & job_id
         with open(input_path, "w") as f:
-            json.dump({"vertices": vertices, "neckline": neckline}, f)
+            json.dump({
+                "vertices": vertices,
+                "neckline": neckline,
+                "overlay": overlay,
+                "job_id": job_id
+            }, f)
 
         print(f"📦 Calling Blender with input: {input_path}, output: {output_path}")
 
