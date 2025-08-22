@@ -3,18 +3,20 @@ import sys
 import json
 import math
 
-# Parse CLI args
+# --- CLI args ---
 argv = sys.argv
 argv = argv[argv.index("--") + 1:]
 input_path = argv[0]
 output_path = argv[1]
 
-# Load input JSON
+# --- Load JSON payload ---
 with open(input_path, "r") as f:
     payload = json.load(f)
 
 beardline = payload.get("vertices", [])
 neckline = payload.get("neckline", [])
+overlay_name = payload.get("overlay", "unknown")
+job_id = payload.get("job_id", "mold")
 
 if not beardline:
     raise Exception("No beardline provided")
@@ -22,7 +24,7 @@ if not beardline:
 beardline = [(v["x"], v["y"], v["z"]) for v in beardline]
 neckline = [(v["x"], v["y"], v["z"]) for v in neckline] if neckline else []
 
-# Scene setup
+# --- Scene Setup ---
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
 hole_indices = [927, 1004]
@@ -33,7 +35,7 @@ smooth_passes = 3
 arc_steps = 24
 ring_count = arc_steps + 1
 
-# --- Smooth beardline ---
+# --- Helper: Smooth Vertices ---
 def smooth(verts, passes):
     for _ in range(passes):
         new = []
@@ -49,8 +51,30 @@ def smooth(verts, passes):
     return verts
 
 beardline = smooth(beardline, smooth_passes)
+if neckline:
+    neckline = smooth(neckline, smooth_passes)
 
-# --- Lip arc ---
+# --- Mustache fallback (optional) ---
+def bezier_curve(p0, p1, p2, steps=40):
+    return [( (1 - t)**2 * p0[0] + 2*(1 - t)*t*p1[0] + t**2*p2[0],
+              (1 - t)**2 * p0[1] + 2*(1 - t)*t*p1[1] + t**2*p2[1],
+              (1 - t)**2 * p0[2] + 2*(1 - t)*t*p1[2] + t**2*p2[2] )
+            for t in [i / steps for i in range(steps + 1)]]
+
+mustache_start = (beardline[0][0], beardline[0][1], beardline[0][2])
+mustache_end = (beardline[-1][0], beardline[-1][1], beardline[-1][2])
+mustache_control = (
+    (mustache_start[0] + mustache_end[0]) / 2,
+    (mustache_start[1] + mustache_end[1]) / 2 + 0.005,
+    (mustache_start[2] + mustache_end[2]) / 2
+)
+mustache_curve = bezier_curve(mustache_start, mustache_control, mustache_end)
+
+# Only add if it's not already in beardline
+if not any(p[1] > mustache_control[1] for p in beardline):
+    beardline += mustache_curve
+
+# --- Lip Arc ---
 min_x = min(p[0] for p in beardline)
 max_x = max(p[0] for p in beardline)
 center_x = (min_x + max_x) / 2
@@ -74,11 +98,10 @@ for base in base_points:
         z = base[2] + r * math.cos(angle)
         lip_vertices.append((base[0], y, z))
 
-# --- Combine verts ---
+# --- Combine Verts and Faces ---
 verts = beardline + lip_vertices
 faces = []
 
-# --- Add lip faces ---
 for i in range(len(base_points) - 1):
     for j in range(arc_steps):
         a = len(beardline) + i * ring_count + j
@@ -88,7 +111,7 @@ for i in range(len(base_points) - 1):
         faces.append([a, c, b])
         faces.append([b, c, d])
 
-# --- Face wrapping: beardline ↔ neckline ---
+# --- Neckline bridging ---
 def find_closest(point, candidates):
     return min(candidates, key=lambda c: (c[0] - point[0])**2 + (c[1] - point[1])**2 + (c[2] - point[2])**2)
 
@@ -110,9 +133,9 @@ if neckline:
         faces.append([b0_idx, n0_idx, b1_idx])
         faces.append([n0_idx, n1_idx, b1_idx])
 
-# --- Create Blender mesh ---
+# --- Create Blender Mesh ---
 if len(faces) == 0 or len(verts) == 0:
-    print("⚠️ No faces or verts generated. Using fallback cube STL.")
+    print("⚠️ No geometry — exporting fallback cube.")
     bpy.ops.mesh.primitive_cube_add(size=0.01, location=(0, 0, 0))
     bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
     exit()
@@ -133,7 +156,9 @@ bpy.ops.mesh.select_all(action='SELECT')
 bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={"value": (0, 0, -extrude_depth)})
 bpy.ops.object.editmode_toggle()
 
-# --- Hole cylinders
+# --- Create and Boolean Hole Cylinders
+cutter_objs = []
+
 for idx in hole_indices:
     if idx < len(beardline):
         x, y, z = beardline[idx]
@@ -143,10 +168,25 @@ for idx in hole_indices:
             location=(x, y, z - hole_depth / 2),
             rotation=(math.pi / 2, 0, 0)
         )
+        cutter = bpy.context.object
+        cutter.name = f"Hole_{idx}"
+        cutter_objs.append(cutter)
 
-# --- Final export
+# --- Apply Boolean Difference for each hole
+bpy.context.view_layer.objects.active = obj
+for cutter in cutter_objs:
+    bool_mod = obj.modifiers.new(name=f"bool_{cutter.name}", type='BOOLEAN')
+    bool_mod.object = cutter
+    bool_mod.operation = 'DIFFERENCE'
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+    cutter.select_set(True)
+    bpy.ops.object.delete()
+
+# --- Final Export
 bpy.ops.object.select_all(action='SELECT')
-bpy.context.view_layer.objects.active = bpy.context.selected_objects[0]
+bpy.context.view_layer.objects.active = obj
 bpy.ops.object.join()
 bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
 
+print(f"✅ STL file saved for overlay: {overlay_name}, job ID: {job_id}")
