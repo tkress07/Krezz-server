@@ -1,188 +1,101 @@
 import bpy
-import sys
+import bmesh
 import json
+import sys
 import math
+from mathutils import Vector
 
-# --- CLI Args ---
-argv = sys.argv
-argv = argv[argv.index("--") + 1:]
-input_path = argv[0]
-output_path = argv[1]
+def smooth_vertices(vertices, iterations=2):
+    for _ in range(iterations):
+        new_vertices = []
+        for i in range(len(vertices)):
+            prev_vertex = vertices[i - 1]
+            next_vertex = vertices[(i + 1) % len(vertices)]
+            current_vertex = vertices[i]
+            new_vertex = (
+                (prev_vertex[0] + current_vertex[0] + next_vertex[0]) / 3,
+                (prev_vertex[1] + current_vertex[1] + next_vertex[1]) / 3,
+                (prev_vertex[2] + current_vertex[2] + next_vertex[2]) / 3,
+            )
+            new_vertices.append(new_vertex)
+        vertices = new_vertices
+    return vertices
 
-# --- Load JSON Payload ---
-with open(input_path, "r") as f:
-    payload = json.load(f)
+def create_mold_mesh(vertices, lip_radius=0.002, extrude_depth=-0.006):
+    mesh = bpy.data.meshes.new(name="BeardMold")
+    obj = bpy.data.objects.new("BeardMold", mesh)
+    bpy.context.collection.objects.link(obj)
 
-beardline = payload.get("vertices", [])
-neckline = payload.get("neckline", [])
-overlay_name = payload.get("overlay", "unknown")
-job_id = payload.get("job_id", "mold")
+    bm = bmesh.new()
+    top_verts = [bm.verts.new(Vector(v)) for v in vertices]
+    bmesh.ops.contextual_create(bm, geom=top_verts)
 
-if not beardline:
-    raise Exception("No beardline provided")
+    bm.verts.index_update()
+    bm.faces.index_update()
 
-beardline = [(v["x"], v["y"], v["z"]) for v in beardline]
-neckline = [(v["x"], v["y"], v["z"]) for v in neckline] if neckline else []
+    # Extrude downward
+    ret = bmesh.ops.extrude_face_region(bm, geom=bm.faces[:])
+    extruded_geom = ret['geom']
+    verts_extruded = [ele for ele in extruded_geom if isinstance(ele, bmesh.types.BMVert)]
+    bmesh.ops.translate(bm, verts=verts_extruded, vec=Vector((0, extrude_depth, 0)))
 
-# --- Blender Scene Reset ---
-bpy.ops.wm.read_factory_settings(use_empty=True)
+    # Recalculate normals
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
-# --- Constants ---
-hole_indices = [927, 1004]
-hole_radius = 0.0015875
-hole_depth = 0.01
-extrude_depth = 0.008
-smooth_passes = 3
-arc_steps = 24
-ring_count = arc_steps + 1
+    # Finish
+    bm.to_mesh(mesh)
+    bm.free()
 
-# --- Smoothing ---
-def smooth(points, passes):
-    for _ in range(passes):
-        new = []
-        for i in range(len(points)):
-            if i == 0 or i == len(points) - 1:
-                new.append(points[i])
-            else:
-                x = (points[i-1][0] + points[i][0] + points[i+1][0]) / 3
-                y = (points[i-1][1] + points[i][1] + points[i+1][1]) / 3
-                z = (points[i-1][2] + points[i][2] + points[i+1][2]) / 3
-                new.append((x, y, z))
-        points = new
-    return points
+    return obj
 
-beardline = smooth(beardline, smooth_passes)
-if neckline:
-    neckline = smooth(neckline, smooth_passes)
+def create_cylinders(holes, radius=0.0015, depth=0.01):
+    cylinders = []
+    for hole in holes:
+        loc = Vector((hole['x'], hole['y'], hole['z']))
+        bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=loc)
+        cyl = bpy.context.active_object
+        cyl.rotation_euler[0] = math.radians(90)
+        cyl.location.z -= depth / 2
+        cylinders.append(cyl)
+    return cylinders
 
-# --- Mustache Bezier Arc ---
-def bezier_curve(p0, p1, p2, steps=40):
-    return [
-        (
-            (1 - t)**2 * p0[0] + 2*(1 - t)*t*p1[0] + t**2*p2[0],
-            (1 - t)**2 * p0[1] + 2*(1 - t)*t*p1[1] + t**2*p2[1],
-            (1 - t)**2 * p0[2] + 2*(1 - t)*t*p1[2] + t**2*p2[2],
-        )
-        for t in [i / steps for i in range(steps + 1)]
-    ]
+def apply_boolean_cut(mold_obj, cutters):
+    for cutter in cutters:
+        mod = mold_obj.modifiers.new(name="Boolean", type='BOOLEAN')
+        mod.object = cutter
+        mod.operation = 'DIFFERENCE'
+        bpy.context.view_layer.objects.active = mold_obj
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+        bpy.data.objects.remove(cutter, do_unlink=True)
 
-mustache_start = beardline[0]
-mustache_end = beardline[-1]
-mustache_control = (
-    (mustache_start[0] + mustache_end[0]) / 2,
-    (mustache_start[1] + mustache_end[1]) / 2 + 0.005,
-    (mustache_start[2] + mustache_end[2]) / 2,
-)
-mustache_curve = bezier_curve(mustache_start, mustache_control, mustache_end)
+def export_stl(filepath):
+    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
 
-if not any(p[1] > mustache_control[1] for p in beardline):
-    beardline += mustache_curve
+def main():
+    argv = sys.argv
+    argv = argv[argv.index("--") + 1:] if "--" in argv else []
+    if len(argv) != 2:
+        raise ValueError("Expected input and output file paths after '--'")
+    input_path, output_path = argv
 
-# --- Lip Arc Geometry ---
-min_x, max_x = min(p[0] for p in beardline), max(p[0] for p in beardline)
-center_x = (min_x + max_x) / 2
+    with open(input_path, 'r') as f:
+        data = json.load(f)
 
-def tapered_radius(x):
-    taper = max(0.0, 1.0 - abs(x - center_x) * 25)
-    return 0.003 + taper * (0.008 - 0.003)
+    vertices = [(v['x'], v['y'], v['z']) for v in data['vertices']]
+    holes = data.get('holes', [])
 
-base_points = [
-    min(beardline, key=lambda p: abs(p[0] - (min_x + (max_x - min_x) * i / 99)))
-    for i in range(100)
-]
+    smooth_verts = smooth_vertices(vertices)
+    mold_obj = create_mold_mesh(smooth_verts)
+    for obj in bpy.data.objects:
+        obj.select_set(False)
+    mold_obj.select_set(True)
 
-lip_vertices = []
-for base in base_points:
-    r = tapered_radius(base[0])
-    for j in range(ring_count):
-        angle = math.pi * j / arc_steps
-        y = base[1] - r * (1 - math.sin(angle))
-        z = base[2] + r * math.cos(angle)
-        lip_vertices.append((base[0], y, z))
+    if holes:
+        hole_objs = create_cylinders(holes)
+        apply_boolean_cut(mold_obj, hole_objs)
 
-# --- Combine Geometry ---
-verts = beardline + lip_vertices
-faces = []
+    export_stl(output_path)
+    print(f"STL export complete for job ID: {data.get('jobID', 'N/A')} with overlay: {data.get('overlay', 'N/A')}")
 
-for i in range(len(base_points) - 1):
-    for j in range(arc_steps):
-        a = len(beardline) + i * ring_count + j
-        b = a + 1
-        c = a + ring_count
-        d = c + 1
-        faces.append([a, c, b])
-        faces.append([b, c, d])
-
-# --- Neckline Bridging ---
-def find_closest(point, candidates):
-    return min(candidates, key=lambda c: sum((c[k] - point[k])**2 for k in range(3)))
-
-if neckline:
-    offset = len(verts)
-    verts.extend(neckline)
-    for i in range(len(beardline) - 1):
-        b0 = beardline[i]
-        b1 = beardline[i + 1]
-        n0 = find_closest(b0, neckline)
-        n1 = find_closest(b1, neckline)
-
-        b0_idx = i
-        b1_idx = i + 1
-        n0_idx = offset + neckline.index(n0)
-        n1_idx = offset + neckline.index(n1)
-
-        faces.append([b0_idx, n0_idx, b1_idx])
-        faces.append([n0_idx, n1_idx, b1_idx])
-
-# --- Mesh Creation ---
-if not verts or not faces:
-    print("⚠️ Empty mesh — creating fallback cube")
-    bpy.ops.mesh.primitive_cube_add(size=0.01, location=(0, 0, 0))
-    bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
-    exit()
-
-mesh = bpy.data.meshes.new("Mold")
-obj = bpy.data.objects.new("MoldObject", mesh)
-bpy.context.collection.objects.link(obj)
-mesh.from_pydata(verts, [], faces)
-mesh.update()
-
-# --- Extrude
-bpy.context.view_layer.objects.active = obj
-bpy.ops.object.select_all(action='DESELECT')
-obj.select_set(True)
-bpy.ops.object.mode_set(mode='EDIT')
-bpy.ops.mesh.select_all(action='SELECT')
-bpy.ops.transform.translate(value=(0, 0, -extrude_depth))
-bpy.ops.object.mode_set(mode='OBJECT')
-
-# --- Hole Cylinders + Boolean ---
-cutter_objs = []
-for idx in hole_indices:
-    if idx < len(beardline):
-        x, y, z = beardline[idx]
-        bpy.ops.mesh.primitive_cylinder_add(
-            radius=hole_radius,
-            depth=hole_depth,
-            location=(x, y, z - hole_depth / 2),
-            rotation=(math.pi / 2, 0, 0)
-        )
-        cutter = bpy.context.object
-        cutter_objs.append(cutter)
-
-for cutter in cutter_objs:
-    mod = obj.modifiers.new(name=f"bool_{cutter.name}", type='BOOLEAN')
-    mod.object = cutter
-    mod.operation = 'DIFFERENCE'
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.modifier_apply(modifier=mod.name)
-    cutter.select_set(True)
-    bpy.ops.object.delete()
-
-# --- Final Export ---
-bpy.ops.object.select_all(action='DESELECT')
-obj.select_set(True)
-bpy.context.view_layer.objects.active = obj
-bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
-
-print(f"✅ STL exported: {output_path} (Overlay: {overlay_name}, Job: {job_id})")
+if __name__ == '__main__':
+    main()
