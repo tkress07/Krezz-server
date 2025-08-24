@@ -60,7 +60,14 @@ def smooth_bezier(vertices, connections):
 
 # --- Main ---
 def main():
-    data = json.load(sys.stdin)
+    argv = sys.argv
+    argv = argv[argv.index("--") + 1:] if "--" in argv else []
+    if len(argv) != 2:
+        raise ValueError("Expected input and output file paths after '--'")
+    input_path, output_path = argv
+
+    with open(input_path, 'r') as f:
+        data = json.load(f)
 
     vertices_data = data['vertices']
     shared_connections = data.get('sharedConnections', [])
@@ -84,10 +91,8 @@ def main():
             hole_pos = vertices[index]
             add_cylinder_hole(mold, hole_pos)
 
-    # Export
-    export_path = f"/mnt/data/{job_id}.stl"
-    bpy.ops.export_mesh.stl(filepath=export_path, use_selection=True)
-    print(json.dumps({"status": "success", "path": export_path}))
+    bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
+    print(json.dumps({"status": "success", "path": output_path}))
 
 if __name__ == "__main__":
     main()
