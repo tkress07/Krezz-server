@@ -1,148 +1,98 @@
-# Rewritten generate_stl.py
-# Converts SCNVector3-based Swift logic to Blender-compatible Python
 
-import bpy
-import sys
 import json
 import math
+import os
+import tempfile
+import uuid
+from stl import mesh
+import numpy as np
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# --- CLI Args ---
-argv = sys.argv
-argv = argv[argv.index("--") + 1:]
-input_path = argv[0]
-output_path = argv[1]
+app = Flask(__name__)
+CORS(app)
 
-# --- Load JSON Payload ---
-with open(input_path, "r") as f:
-    payload = json.load(f)
+def generate_lip_arc(p1, p2, radius=0.01, smoothness=10):
+    arc_points = []
+    mid = (np.array(p1) + np.array(p2)) / 2
+    direction = np.array(p2) - np.array(p1)
+    perpendicular = np.cross(direction, [0, 1, 0])
+    perpendicular = perpendicular / np.linalg.norm(perpendicular)
+    for i in range(smoothness + 1):
+        angle = math.pi * (i / smoothness)
+        offset = radius * math.sin(angle)
+        interp = np.array(p1) + direction * (i / smoothness)
+        arc_point = interp + perpendicular * offset
+        arc_points.append(arc_point.tolist())
+    return arc_points
 
-beardline = payload.get("vertices", [])
-neckline = payload.get("neckline", [])
-overlay_name = payload.get("overlay", "unknown")
-job_id = payload.get("job_id", "mold")
+def make_face_strip(top_points, bottom_points):
+    faces = []
+    for i in range(len(top_points) - 1):
+        t0, t1 = top_points[i], top_points[i + 1]
+        b0, b1 = bottom_points[i], bottom_points[i + 1]
+        faces.append([t0, b0, b1])
+        faces.append([t0, b1, t1])
+    return faces
 
-if not beardline:
-    raise Exception("No beardline provided")
+def extrude(points, height=0.005):
+    top = [(x, y + height, z) for (x, y, z) in points]
+    return top
 
-beardline = [(v["x"], v["y"], v["z"]) for v in beardline]
-neckline = [(v["x"], v["y"], v["z"]) for v in neckline] if neckline else []
+def insert_arc(beardline, shared_connections, radius=0.01, smoothness=10):
+    if not shared_connections or len(shared_connections) < 2:
+        raise ValueError("sharedConnections must include two indices")
+    start_idx, end_idx = shared_connections[0], shared_connections[1]
+    arc = generate_lip_arc(beardline[start_idx], beardline[end_idx], radius, smoothness)
+    return beardline[:start_idx+1] + arc + beardline[end_idx:]
 
-# --- Constants ---
-arc_steps = 24
-ring_count = arc_steps + 1
-extrude_depth = -0.008
-hole_indices = [927, 1004]
-hole_radius = 0.0015875
-hole_depth = 0.01
+@app.route("/generate-stl", methods=["POST"])
+def generate_stl():
+    try:
+        data = request.get_json()
+        vertices = data.get("vertices", [])
+        beardline_indices = data.get("beardline", [])
+        shared_connections = data.get("sharedConnections", [])
+        hole_indices = data.get("holeIndices", [])
 
-# --- Utils ---
-def smooth(verts, passes):
-    for _ in range(passes):
-        new = []
-        for i in range(len(verts)):
-            if i == 0 or i == len(verts) - 1:
-                new.append(verts[i])
-            else:
-                x = (verts[i-1][0] + verts[i][0] + verts[i+1][0]) / 3
-                y = (verts[i-1][1] + verts[i][1] + verts[i+1][1]) / 3
-                z = (verts[i-1][2] + verts[i][2] + verts[i+1][2]) / 3
-                new.append((x, y, z))
-        verts = new
-    return verts
+        if not vertices or not beardline_indices:
+            return jsonify({"error": "Missing vertices or beardline"}), 400
 
-def tapered_radius(x, min_x, max_x):
-    center_x = (min_x + max_x) / 2
-    taper = max(0.0, 1.0 - abs(x - center_x) * 25)
-    return 0.003 + taper * (0.008 - 0.003)
+        # Build base path
+        beardline = [tuple(vertices[i].values()) for i in beardline_indices]
+        if shared_connections and len(shared_connections) >= 2:
+            beardline = insert_arc(beardline, shared_connections)
 
-# --- Base Points from Beardline ---
-beardline = smooth(beardline, 3)
-min_x = min(v[0] for v in beardline)
-max_x = max(v[0] for v in beardline)
+        top = extrude(beardline)
+        faces = make_face_strip(top, beardline)
 
-base_points = []
-for i in range(100):
-    x = min_x + (max_x - min_x) * i / 99
-    closest = min(beardline, key=lambda p: abs(p[0] - x))
-    base_points.append(closest)
+        # Optional: add holes
+        hole_radius = 0.002
+        for i in hole_indices:
+            if 0 <= i < len(vertices):
+                center = np.array(tuple(vertices[i].values()))
+                num_segments = 8
+                for j in range(num_segments):
+                    theta1 = 2 * math.pi * j / num_segments
+                    theta2 = 2 * math.pi * (j + 1) / num_segments
+                    p1 = center + hole_radius * np.array([math.cos(theta1), 0, math.sin(theta1)])
+                    p2 = center + hole_radius * np.array([math.cos(theta2), 0, math.sin(theta2)])
+                    faces.append([center.tolist(), p1.tolist(), p2.tolist()])
 
-# --- Lip Arc ---
-lip_vertices = []
-for base in base_points:
-    r = tapered_radius(base[0], min_x, max_x)
-    for j in range(ring_count):
-        angle = math.pi * j / arc_steps
-        y = base[1] - r * (1 - math.sin(angle))
-        z = base[2] + r * math.cos(angle)
-        lip_vertices.append((base[0], y, z))
+        all_faces = np.array(faces)
+        flat_faces = all_faces.reshape(-1, 3, 3)
+        mold_mesh = mesh.Mesh(np.zeros(flat_faces.shape[0], dtype=mesh.Mesh.dtype))
+        for i, f in enumerate(flat_faces):
+            mold_mesh.vectors[i] = f
 
-# --- Combine Mesh Geometry ---
-verts = beardline + lip_vertices + neckline
-faces = []
+        file_id = str(uuid.uuid4())
+        temp_dir = tempfile.gettempdir()
+        file_path = os.path.join(temp_dir, f"{file_id}.stl")
+        mold_mesh.save(file_path)
 
-# Lip arc faces
-for i in range(len(base_points) - 1):
-    for j in range(arc_steps):
-        a = len(beardline) + i * ring_count + j
-        b = a + 1
-        c = a + ring_count
-        d = c + 1
-        faces.append([a, c, b])
-        faces.append([b, c, d])
+        return jsonify({"fileId": file_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# Stitch neckline
-if neckline:
-    neckline = smooth(neckline, 3)
-    offset = len(beardline) + len(lip_vertices)
-    for i in range(len(beardline) - 1):
-        b0 = beardline[i]
-        b1 = beardline[i + 1]
-        n0 = min(neckline, key=lambda n: sum((n[k] - b0[k])**2 for k in range(3)))
-        n1 = min(neckline, key=lambda n: sum((n[k] - b1[k])**2 for k in range(3)))
-        n0_idx = offset + neckline.index(n0)
-        n1_idx = offset + neckline.index(n1)
-        faces.append([i, n0_idx, i+1])
-        faces.append([n0_idx, n1_idx, i+1])
-
-# --- Blender Setup ---
-bpy.ops.wm.read_factory_settings(use_empty=True)
-mesh = bpy.data.meshes.new("Guard")
-obj = bpy.data.objects.new("GuardObj", mesh)
-bpy.context.collection.objects.link(obj)
-mesh.from_pydata(verts, [], faces)
-mesh.update()
-
-# --- Extrude ---
-bpy.context.view_layer.objects.active = obj
-bpy.ops.object.select_all(action='DESELECT')
-obj.select_set(True)
-bpy.ops.object.convert(target='MESH')
-bpy.ops.object.editmode_toggle()
-bpy.ops.mesh.select_all(action='SELECT')
-bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={"value": (0, 0, extrude_depth)})
-bpy.ops.object.editmode_toggle()
-
-# --- Drill Holes ---
-cutter_objs = []
-for idx in hole_indices:
-    if idx < len(beardline):
-        x, y, z = beardline[idx]
-        bpy.ops.mesh.primitive_cylinder_add(radius=hole_radius, depth=hole_depth, location=(x, y, z - hole_depth/2), rotation=(math.pi / 2, 0, 0))
-        cutter = bpy.context.object
-        cutter_objs.append(cutter)
-
-bpy.context.view_layer.objects.active = obj
-for cutter in cutter_objs:
-    mod = obj.modifiers.new(name="bool", type='BOOLEAN')
-    mod.object = cutter
-    mod.operation = 'DIFFERENCE'
-    bpy.ops.object.modifier_apply(modifier=mod.name)
-    cutter.select_set(True)
-    bpy.ops.object.delete()
-
-# --- Export ---
-bpy.ops.object.select_all(action='SELECT')
-bpy.context.view_layer.objects.active = obj
-bpy.ops.object.join()
-bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
-print(f"✅ STL saved for overlay: {overlay_name}, job: {job_id}")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
