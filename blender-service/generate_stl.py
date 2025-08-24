@@ -1,5 +1,3 @@
-Still not working.. 
-
 import bpy
 import sys
 import json
