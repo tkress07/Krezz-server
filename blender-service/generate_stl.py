@@ -24,7 +24,7 @@ if not beardline:
 beardline = [(v["x"], v["y"], v["z"]) for v in beardline]
 neckline = [(v["x"], v["y"], v["z"]) for v in neckline] if neckline else []
 
-# --- Blender Scene Reset ---
+# --- Reset Scene ---
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
 # --- Constants ---
@@ -35,8 +35,9 @@ extrude_depth = 0.008
 smooth_passes = 3
 arc_steps = 24
 ring_count = arc_steps + 1
+lip_segments = 100
 
-# --- Smoothing ---
+# --- Smoothing Function ---
 def smooth(points, passes):
     for _ in range(passes):
         new = []
@@ -55,7 +56,7 @@ beardline = smooth(beardline, smooth_passes)
 if neckline:
     neckline = smooth(neckline, smooth_passes)
 
-# --- Mustache Bezier Arc ---
+# --- Bezier Mustache Curve (always append like Swift) ---
 def bezier_curve(p0, p1, p2, steps=40):
     return [
         (
@@ -74,12 +75,11 @@ mustache_control = (
     (mustache_start[2] + mustache_end[2]) / 2,
 )
 mustache_curve = bezier_curve(mustache_start, mustache_control, mustache_end)
-
-if not any(p[1] > mustache_control[1] for p in beardline):
-    beardline += mustache_curve
+beardline += mustache_curve
 
 # --- Lip Arc Geometry ---
-min_x, max_x = min(p[0] for p in beardline), max(p[0] for p in beardline)
+min_x = min(p[0] for p in beardline)
+max_x = max(p[0] for p in beardline)
 center_x = (min_x + max_x) / 2
 
 def tapered_radius(x):
@@ -87,8 +87,8 @@ def tapered_radius(x):
     return 0.003 + taper * (0.008 - 0.003)
 
 base_points = [
-    min(beardline, key=lambda p: abs(p[0] - (min_x + (max_x - min_x) * i / 99)))
-    for i in range(100)
+    min(beardline, key=lambda p: abs(p[0] - (min_x + (max_x - min_x) * i / (lip_segments - 1))))
+    for i in range(lip_segments)
 ]
 
 lip_vertices = []
@@ -100,10 +100,9 @@ for base in base_points:
         z = base[2] + r * math.cos(angle)
         lip_vertices.append((base[0], y, z))
 
-# --- Combine Geometry ---
+# --- Lip Arc Faces ---
 verts = beardline + lip_vertices
 faces = []
-
 for i in range(len(base_points) - 1):
     for j in range(arc_steps):
         a = len(beardline) + i * ring_count + j
@@ -113,7 +112,7 @@ for i in range(len(base_points) - 1):
         faces.append([a, c, b])
         faces.append([b, c, d])
 
-# --- Neckline Bridging ---
+# --- Neckline Bridge Faces ---
 def find_closest(point, candidates):
     return min(candidates, key=lambda c: sum((c[k] - point[k])**2 for k in range(3)))
 
@@ -134,52 +133,70 @@ if neckline:
         faces.append([b0_idx, n0_idx, b1_idx])
         faces.append([n0_idx, n1_idx, b1_idx])
 
-# --- Mesh Creation ---
-if not verts or not faces:
-    print("⚠️ Empty mesh — creating fallback cube")
-    bpy.ops.mesh.primitive_cube_add(size=0.01, location=(0, 0, 0))
-    bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
-    exit()
+# --- Extrusion (Match Swift’s manual logic) ---
+extruded_faces = []
 
+for face in faces:
+    front = [verts[i] for i in face]
+    back = [(x, y, z - extrude_depth) for (x, y, z) in front]
+
+    front_indices = [len(verts) + len(extruded_faces) * 6 + i for i in range(3)]
+    verts.extend(front)
+
+    back_indices = [len(verts) + i for i in range(3)]
+    verts.extend(back[::-1])  # Reverse for correct normals
+
+    extruded_faces.append(front_indices)
+    extruded_faces.append(back_indices)
+
+    for i in range(3):
+        next_i = (i + 1) % 3
+        a = front_indices[i]
+        b = front_indices[next_i]
+        c = back_indices[next_i]
+        d = back_indices[i]
+        extruded_faces.append([a, b, c])
+        extruded_faces.append([c, d, a])
+
+# --- Hole Cylinders (Match Swift’s generateCylinder) ---
+def generate_hole_cylinder(center, radius, depth, segments=24):
+    cx, cy, cz = center
+    top = []
+    bottom = []
+    for i in range(segments):
+        angle = 2 * math.pi * i / segments
+        dx = radius * math.cos(angle)
+        dy = radius * math.sin(angle)
+        top.append((cx + dx, cy + dy, cz))
+        bottom.append((cx + dx, cy + dy, cz - depth))
+
+    start_idx = len(verts)
+    verts.extend(top + bottom)
+
+    hole_faces = []
+    for i in range(segments):
+        next_i = (i + 1) % segments
+        a = start_idx + i
+        b = start_idx + next_i
+        c = start_idx + segments + next_i
+        d = start_idx + segments + i
+        hole_faces.append([a, b, c])
+        hole_faces.append([c, d, a])
+    return hole_faces
+
+for idx in hole_indices:
+    if idx < len(beardline):
+        center = beardline[idx]
+        hole_faces = generate_hole_cylinder(center, hole_radius, hole_depth)
+        extruded_faces.extend(hole_faces)
+
+# --- Final Mesh Creation and Export ---
 mesh = bpy.data.meshes.new("Mold")
 obj = bpy.data.objects.new("MoldObject", mesh)
 bpy.context.collection.objects.link(obj)
-mesh.from_pydata(verts, [], faces)
+mesh.from_pydata(verts, [], extruded_faces)
 mesh.update()
 
-# --- Extrude
-bpy.context.view_layer.objects.active = obj
-bpy.ops.object.select_all(action='DESELECT')
-obj.select_set(True)
-bpy.ops.object.mode_set(mode='EDIT')
-bpy.ops.mesh.select_all(action='SELECT')
-bpy.ops.transform.translate(value=(0, 0, -extrude_depth))
-bpy.ops.object.mode_set(mode='OBJECT')
-
-# --- Hole Cylinders + Boolean ---
-cutter_objs = []
-for idx in hole_indices:
-    if idx < len(beardline):
-        x, y, z = beardline[idx]
-        bpy.ops.mesh.primitive_cylinder_add(
-            radius=hole_radius,
-            depth=hole_depth,
-            location=(x, y, z - hole_depth / 2),
-            rotation=(math.pi / 2, 0, 0)
-        )
-        cutter = bpy.context.object
-        cutter_objs.append(cutter)
-
-for cutter in cutter_objs:
-    mod = obj.modifiers.new(name=f"bool_{cutter.name}", type='BOOLEAN')
-    mod.object = cutter
-    mod.operation = 'DIFFERENCE'
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.modifier_apply(modifier=mod.name)
-    cutter.select_set(True)
-    bpy.ops.object.delete()
-
-# --- Final Export ---
 bpy.ops.object.select_all(action='DESELECT')
 obj.select_set(True)
 bpy.context.view_layer.objects.active = obj
