@@ -1,15 +1,14 @@
+
 import bpy
 import sys
 import json
 import math
 
-# --- CLI Args ---
 argv = sys.argv
 argv = argv[argv.index("--") + 1:]
 input_path = argv[0]
 output_path = argv[1]
 
-# --- Load JSON Payload ---
 with open(input_path, "r") as f:
     payload = json.load(f)
 
@@ -24,10 +23,8 @@ if not beardline:
 beardline = [(v["x"], v["y"], v["z"]) for v in beardline]
 neckline = [(v["x"], v["y"], v["z"]) for v in neckline] if neckline else []
 
-# --- Blender Scene Reset ---
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
-# --- Constants ---
 hole_indices = [927, 1004]
 hole_radius = 0.0015875
 hole_depth = 0.01
@@ -36,7 +33,6 @@ smooth_passes = 3
 arc_steps = 24
 ring_count = arc_steps + 1
 
-# --- Smoothing ---
 def smooth(points, passes):
     for _ in range(passes):
         new = []
@@ -55,7 +51,6 @@ beardline = smooth(beardline, smooth_passes)
 if neckline:
     neckline = smooth(neckline, smooth_passes)
 
-# --- Mustache Bezier Arc ---
 def bezier_curve(p0, p1, p2, steps=40):
     return [
         (
@@ -78,7 +73,6 @@ mustache_curve = bezier_curve(mustache_start, mustache_control, mustache_end)
 if not any(p[1] > mustache_control[1] for p in beardline):
     beardline += mustache_curve
 
-# --- Lip Arc Geometry ---
 min_x, max_x = min(p[0] for p in beardline), max(p[0] for p in beardline)
 center_x = (min_x + max_x) / 2
 
@@ -100,7 +94,6 @@ for base in base_points:
         z = base[2] + r * math.cos(angle)
         lip_vertices.append((base[0], y, z))
 
-# --- Combine Geometry ---
 verts = beardline + lip_vertices
 faces = []
 
@@ -113,7 +106,6 @@ for i in range(len(base_points) - 1):
         faces.append([a, c, b])
         faces.append([b, c, d])
 
-# --- Neckline Bridging ---
 def find_closest(point, candidates):
     return min(candidates, key=lambda c: sum((c[k] - point[k])**2 for k in range(3)))
 
@@ -125,18 +117,14 @@ if neckline:
         b1 = beardline[i + 1]
         n0 = find_closest(b0, neckline)
         n1 = find_closest(b1, neckline)
-
         b0_idx = i
         b1_idx = i + 1
         n0_idx = offset + neckline.index(n0)
         n1_idx = offset + neckline.index(n1)
-
         faces.append([b0_idx, n0_idx, b1_idx])
         faces.append([n0_idx, n1_idx, b1_idx])
 
-# --- Mesh Creation ---
 if not verts or not faces:
-    print("⚠️ Empty mesh — creating fallback cube")
     bpy.ops.mesh.primitive_cube_add(size=0.01, location=(0, 0, 0))
     bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
     exit()
@@ -147,7 +135,6 @@ bpy.context.collection.objects.link(obj)
 mesh.from_pydata(verts, [], faces)
 mesh.update()
 
-# --- Extrude
 bpy.context.view_layer.objects.active = obj
 bpy.ops.object.select_all(action='DESELECT')
 obj.select_set(True)
@@ -156,7 +143,6 @@ bpy.ops.mesh.select_all(action='SELECT')
 bpy.ops.transform.translate(value=(0, 0, -extrude_depth))
 bpy.ops.object.mode_set(mode='OBJECT')
 
-# --- Hole Cylinders + Boolean ---
 cutter_objs = []
 for idx in hole_indices:
     if idx < len(beardline):
@@ -179,10 +165,8 @@ for cutter in cutter_objs:
     cutter.select_set(True)
     bpy.ops.object.delete()
 
-# --- Final Export ---
 bpy.ops.object.select_all(action='DESELECT')
 obj.select_set(True)
 bpy.context.view_layer.objects.active = obj
 bpy.ops.export_mesh.stl(filepath=output_path, use_selection=True)
-
 print(f"✅ STL exported: {output_path} (Overlay: {overlay_name}, Job: {job_id})")
