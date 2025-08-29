@@ -1,4 +1,4 @@
-# generate_stl.py
+# generate_stl.py (patched)
 import bpy
 import bmesh
 import json
@@ -115,12 +115,11 @@ def skin_beardline_to_neckline_monotone(beardline, neckline, skin_max_dist):
     if len(beardline) < 2 or len(neckline) < 2:
         return faces
 
-    # Precompute order on neckline by X to get a consistent index progression.
-    # (You can switch to arc-length order if needed.)
+    # Sort neckline by X for a consistent rank progression
     neck_sorted_idx = sorted(range(len(neckline)), key=lambda k: neckline[k][0])
     neck_pos_to_rank = {idx: rank for rank, idx in enumerate(neck_sorted_idx)}
 
-    # Map each beard pt to nearest neckline point (by distance), then enforce monotonicity by rank
+    # Nearest neckline for each beard point
     nearest_idx = []
     for b in beardline:
         j = min(range(len(neckline)), key=lambda k: dist2(neckline[k], b))
@@ -130,40 +129,37 @@ def skin_beardline_to_neckline_monotone(beardline, neckline, skin_max_dist):
     fixed_idx = [nearest_idx[0]]
     for j in nearest_idx[1:]:
         prev = fixed_idx[-1]
-        # convert to ranks
         prev_r = neck_pos_to_rank[prev]
         cur_r  = neck_pos_to_rank[j]
         if cur_r < prev_r:
-            # bump forward to prev rank (no backward crossings)
-            # find the neck index that has rank == prev_r
             j = neck_sorted_idx[prev_r]
         fixed_idx.append(j)
 
-    # Now triangulate consecutive quads with distance and degeneracy checks
+    # Triangulate with distance cap
     for i in range(len(beardline) - 1):
         b0, b1 = beardline[i], beardline[i+1]
         n0, n1 = neckline[fixed_idx[i]], neckline[fixed_idx[i+1]]
 
-        # Distance cap (avoid long stretched kites)
         if math.sqrt(dist2(b0, n0)) > skin_max_dist or math.sqrt(dist2(b1, n1)) > skin_max_dist:
             continue
 
-        f1 = (b0, n0, b1)
-        f2 = (n0, n1, b1)
-        faces.extend([f1, f2])
+        faces.append((b0, n0, b1))
+        faces.append((n0, n1, b1))
 
     return faces
 
-def filter_tris(tris, scale_diag):
-    """Remove degenerate/near-zero area or over-long-edge triangles."""
+def filter_tris(tris, scale_diag, max_edge_hint=None):
+    """Remove degenerate/near-zero area or over-long-edge triangles (with optional clamp)."""
     out = []
     min_area = (1e-6 * scale_diag) ** 2     # scale-aware tiny
-    max_edge = 0.6 * scale_diag             # forbid crazy long edges
+    max_edge = 0.6 * scale_diag             # general guard
+    if max_edge_hint is not None:
+        max_edge = min(max_edge, max_edge_hint)
+
     for a,b,c in tris:
         area = tri_area(a,b,c)
         if area < min_area:
             continue
-        # check max edge
         emax = max(math.sqrt(dist2(a,b)), math.sqrt(dist2(b,c)), math.sqrt(dist2(c,a)))
         if emax > max_edge:
             continue
@@ -176,7 +172,6 @@ def make_object_from_tris(name, tris):
     verts = []
     faces = []
     def key(p):
-        # stable rounding to avoid duplicates
         return (round(p[0], 7), round(p[1], 7), round(p[2], 7))
     for (a,b,c) in tris:
         ids = []
@@ -202,13 +197,9 @@ def clean_mesh_bmesh(obj, merge_eps=1e-5, laplace_iters=0, laplace_lambda=0.2):
     bm = bmesh.new()
     bm.from_mesh(me)
 
-    # Remove doubles
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_eps)
-
-    # Dissolve degenerate faces/edges
     bmesh.ops.dissolve_degenerate(bm, dist=merge_eps)
 
-    # Optional Laplacian smooth (very mild to relax tiny kinks)
     if laplace_iters > 0 and 0.0 < laplace_lambda < 1.0:
         try:
             bmesh.ops.smooth_laplacian(
@@ -222,10 +213,7 @@ def clean_mesh_bmesh(obj, merge_eps=1e-5, laplace_iters=0, laplace_lambda=0.2):
         except Exception:
             pass
 
-    # Triangulate to be explicit (optional; booleans fine with quads too)
     bmesh.ops.triangulate(bm, faces=bm.faces)
-
-    # Recalc normals consistently
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     bm.to_mesh(me)
@@ -279,13 +267,11 @@ def boolean_difference_exact(target, cutter):
     bpy.ops.object.modifier_apply(modifier=mod.name)
 
 def recenter_to_origin(obj):
-    # Set origin to geometry, then move object to world origin
     bpy.context.view_layer.objects.active = obj
     for o in bpy.data.objects:
         o.select_set(False)
     obj.select_set(True)
     bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
-    loc = obj.location.copy()
     obj.location = (0.0, 0.0, 0.0)
 
 def export_stl_selected(filepath):
@@ -305,15 +291,23 @@ def build_surface_tris(beardline, neckline, params):
     max_lip_radius = float(params.get("maxLipRadius", 0.008))
     min_lip_radius = float(params.get("minLipRadius", 0.003))
     taper_mult     = float(params.get("taperMult", 25.0))
-    skin_max_dist  = float(params.get("skinMaxDist", 0.02))  # tighten to 0.015/0.01 to skip risky spans
+
+    # NEW: gating + tighter default
+    enable_skin    = bool(params.get("enableNeckSkin", False))  # default OFF
+    skin_max_dist  = float(params.get("skinMaxDist", 0.008))    # 6–10mm typical face scale
+
     smooth_neck    = int(params.get("neckSmoothingPasses", 3))
 
-    # Smoothing neckline only (to avoid jagged kites)
+    # Smoothing neckline only
     if neckline and smooth_neck > 0:
         neckline = smooth_vertices_open(neckline, passes=smooth_neck)
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
+
+    # NEW: clamp based on lip width to forbid long kites/needles
+    width_x = max(1e-6, maxX - minX)
+    max_edge_hint = 0.35 * width_x  # ~35% of lip width
 
     lip_vertices, ring_count = generate_lip_rings(
         base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
@@ -322,13 +316,13 @@ def build_surface_tris(beardline, neckline, params):
     # Lip strips (no end-caps; rims will be closed by Solidify)
     tris = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # Optional beard->neck skin (monotone + capped)
-    if neckline:
+    # Optional beard->neck skin (monotone + capped), now gated
+    if enable_skin and neckline:
         tris.extend(skin_beardline_to_neckline_monotone(beardline, neckline, skin_max_dist))
 
-    # Cull degenerates/overlong
+    # Cull degenerates/overlong (with clamp)
     scale = bb_diag(beardline + neckline + lip_vertices)
-    tris = filter_tris(tris, scale)
+    tris  = filter_tris(tris, scale, max_edge_hint=max_edge_hint)
 
     return tris
 
@@ -363,10 +357,10 @@ def main():
 
     # Thickness for solidify
     shell_thickness = float(params.get("shellThickness", 0.008))  # ~8mm
-    laplace_iters = int(params.get("laplaceIters", 0))            # try 1-3 if you want subtle smoothing
+    laplace_iters = int(params.get("laplaceIters", 0))            # try 1-3 for subtle smoothing
     laplace_lambda = float(params.get("laplaceLambda", 0.2))
 
-    # 1) Build a single clean surface (no per-tri extrusion!)
+    # 1) Build a single clean surface
     surf_tris = build_surface_tris(beardline, neckline, params)
 
     # 2) Make object & clean
@@ -384,7 +378,6 @@ def main():
         cutters = create_joined_cylinders_z(holes_in, shell_thickness, radius=radius, embed_offset=embed_offset)
         if cutters:
             boolean_difference_exact(mold_obj, cutters)
-            # cleanup cutters object
             try:
                 bpy.data.objects.remove(cutters, do_unlink=True)
             except Exception:
