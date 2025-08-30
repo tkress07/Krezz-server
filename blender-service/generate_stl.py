@@ -1,4 +1,6 @@
-# generate_stl.py (patched v2)
+New updated
+
+# generate_stl.py
 import bpy
 import bmesh
 import json
@@ -6,35 +8,19 @@ import sys
 import math
 from mathutils import Vector
 
-# =========================
-# Helpers (geometry & math)
-# =========================
+# ===========================
+# Geometry & math helpers
+# ===========================
 
 def to_vec3(p):
     return (float(p['x']), float(p['y']), float(p['z']))
-
-def is_finite3(v):
-    return all(math.isfinite(c) for c in v)
 
 def dist2(a, b):
     dx = a[0]-b[0]; dy = a[1]-b[1]; dz = a[2]-b[2]
     return dx*dx + dy*dy + dz*dz
 
-def tri_area(a, b, c):
-    ax,ay,az = a; bx,by,bz = b; cx,cy,cz = c
-    ux,uy,uz = (bx-ax, by-ay, bz-az)
-    vx,vy,vz = (cx-ax, cy-ay, cz-az)
-    cxp = (uy*vz - uz*vy, uz*vx - ux*vz, ux*vy - uy*vx)
-    return 0.5 * math.sqrt(cxp[0]**2 + cxp[1]**2 + cxp[2]**2)
-
-def bb_diag(pts):
-    if not pts: return 1.0
-    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]; zs = [p[2] for p in pts]
-    minx,maxx = min(xs),max(xs); miny,maxy = min(ys),max(ys); minz,maxz = min(zs),max(zs)
-    dx = maxx-minx; dy = maxy-miny; dz = maxz-minz
-    return max(1e-6, math.sqrt(dx*dx + dy*dy + dz*dz))
-
 def smooth_vertices_open(vertices, passes=1):
+    """Moving-average smoothing for an open polyline (preserve endpoints)."""
     if len(vertices) < 3 or passes <= 0:
         return vertices[:]
     V = vertices[:]
@@ -63,7 +49,10 @@ def sample_base_points_along_x(beardline, lip_segments):
     for i in range(lip_segments):
         x = minX + i*seg_w
         top = min(beardline, key=lambda p: abs(p[0]-x)) if beardline else None
-        base.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
+        if top is not None:
+            base.append((x, top[1], top[2]))
+        else:
+            base.append((x, fallbackY, fallbackZ))
     return base, minX, maxX
 
 def tapered_radius(x, centerX, min_r, max_r, taper_mult):
@@ -71,6 +60,7 @@ def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     return min_r + taper * (max_r - min_r)
 
 def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
+    """Return (lip_vertices, ring_count). Each base point gets a semicircle ring in YZ plane."""
     ring_count = arc_steps + 1
     verts = []
     for (bx, by, bz) in base_points:
@@ -90,235 +80,310 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
             b = lip_vertices[i * ring_count + j + 1]
             c = lip_vertices[(i + 1) * ring_count + j]
             d = lip_vertices[(i + 1) * ring_count + j + 1]
-            faces.append((a, c, b))
-            faces.append((b, c, d))
+            # Consistent winding (CCW when seen from +X side)
+            faces.append([a, c, b])
+            faces.append([b, c, d])
     return faces
 
-def skin_beardline_to_neckline_monotone(beardline, neckline, skin_max_dist):
+def skin_beardline_to_neckline_monotone(beardline, neckline):
+    """Greedy monotone pairing to reduce crossings/degenerates."""
     faces = []
-    if len(beardline) < 2 or len(neckline) < 2:
+    if len(beardline) < 2 or not neckline:
         return faces
-    neck_sorted_idx = sorted(range(len(neckline)), key=lambda k: neckline[k][0])
-    neck_pos_to_rank = {idx: rank for rank, idx in enumerate(neck_sorted_idx)}
-    nearest_idx = [min(range(len(neckline)), key=lambda k: dist2(neckline[k], b)) for b in beardline]
-    fixed_idx = [nearest_idx[0]]
-    for j in nearest_idx[1:]:
-        prev = fixed_idx[-1]
-        if neck_pos_to_rank[j] < neck_pos_to_rank[prev]:
-            j = neck_sorted_idx[neck_pos_to_rank[prev]]
-        fixed_idx.append(j)
-    for i in range(len(beardline) - 1):
+    prev = 0
+    for i in range(len(beardline)-1):
         b0, b1 = beardline[i], beardline[i+1]
-        n0, n1 = neckline[fixed_idx[i]], neckline[fixed_idx[i+1]]
-        if math.sqrt(dist2(b0, n0)) > skin_max_dist or math.sqrt(dist2(b1, n1)) > skin_max_dist:
-            continue
-        faces.append((b0, n0, b1))
-        faces.append((n0, n1, b1))
+        n0 = min(range(prev, len(neckline)), key=lambda k: dist2(neckline[k], b0))
+        n1 = min(range(n0, len(neckline)), key=lambda k: dist2(neckline[k], b1))
+        v0, v1 = neckline[n0], neckline[n1]
+        faces.append([b0, v0, b1])
+        faces.append([v0, v1, b1])
+        prev = n0
     return faces
 
-def filter_tris(tris, scale_diag, max_edge_hint=None):
-    """Cull degenerate and over-long-edge triangles (robust floors)."""
-    out = []
-    # hard floors so an outlier can't inflate the threshold
-    scale_diag = max(scale_diag, 1e-3)
-    min_area = max(1e-10, (1e-6 * scale_diag) ** 2)
-    max_edge = 0.6 * scale_diag
-    if max_edge_hint is not None:
-        max_edge = min(max_edge, max_edge_hint)
-    for a,b,c in tris:
-        area = tri_area(a,b,c)
-        if area < min_area:
-            continue
-        emax = max(math.sqrt(dist2(a,b)), math.sqrt(dist2(b,c)), math.sqrt(dist2(c,a)))
-        if emax > max_edge:
-            continue
-        out.append((a,b,c))
-    return out
+def stitch_first_column_to_base(base_points, lip_vertices, ring_count):
+    """Close the boundary at j=0 to the base polyline."""
+    faces = []
+    for i in range(len(base_points) - 1):
+        a = base_points[i]
+        b = base_points[i+1]
+        c = lip_vertices[i * ring_count + 0]
+        d = lip_vertices[(i+1) * ring_count + 0]
+        faces.append([a, c, b])
+        faces.append([b, c, d])
+    return faces
 
-def make_object_from_tris(name, tris):
-    v2i, verts, faces = {}, [], []
-    def key(p): return (round(p[0], 7), round(p[1], 7), round(p[2], 7))
+def end_caps(lip_vertices, base_points, ring_count):
+    """Cap the ends across base index (i=0 and i=end)."""
+    faces = []
+    if not base_points:
+        return faces
+    # first end
+    first_base = base_points[0]
+    for i in range(ring_count - 1):
+        a = lip_vertices[i]
+        b = lip_vertices[i+1]
+        faces.append([a, b, first_base])
+    # last end
+    last_base = base_points[-1]
+    start_idx = (len(base_points) - 1) * ring_count
+    for i in range(ring_count - 1):
+        a = lip_vertices[start_idx + i]
+        b = lip_vertices[start_idx + i + 1]
+        faces.append([a, b, last_base])
+    return faces
+
+# ===========================
+# Mesh build / cleanup
+# ===========================
+
+def make_mesh_from_tris(tris, name="BeardMoldSurface"):
+    """Create a Blender mesh object from triangle vertex positions (deduped)."""
+    v2i = {}
+    verts = []
+    faces = []
+    def key(p):
+        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
     for (a,b,c) in tris:
         ids = []
         for p in (a,b,c):
             k = key(p)
             if k not in v2i:
-                v2i[k] = len(verts); verts.append(k)
+                v2i[k] = len(verts)
+                verts.append(k)
             ids.append(v2i[k])
         faces.append(tuple(ids))
-    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
-    mesh.validate(clean_customdata=True); mesh.update()
+    mesh.validate(verbose=False)
+    mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
     return obj
 
-def clean_mesh_bmesh(obj, merge_eps=1e-5, laplace_iters=0, laplace_lambda=0.2):
-    me = obj.data; bm = bmesh.new(); bm.from_mesh(me)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_eps)
-    bmesh.ops.dissolve_degenerate(bm, dist=merge_eps)
-    if laplace_iters > 0 and 0.0 < laplace_lambda < 1.0:
+def make_manifold_and_solidify(obj, thickness, merge_epsilon=1e-6, center=True):
+    """
+    Clean single-surface mesh and add true thickness without hole-filling fans.
+    - No fill_holes (Solidify with use_rim closes the border cleanly)
+    - Merge tiny cracks, dissolve degenerates, recalc normals
+    - Apply Solidify once (watertight), then optionally center to origin
+    """
+    # Ensure object mode -> edit
+    if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+
+    # Merge tiny gaps
+    try:
+        bpy.ops.mesh.merge_by_distance(distance=merge_epsilon)
+    except Exception:
+        bpy.ops.mesh.remove_doubles(threshold=merge_epsilon)
+
+    # Remove zero-area/needle faces that can explode triangulation
+    try:
+        bpy.ops.mesh.dissolve_degenerate(threshold=1e-7)
+    except Exception:
+        pass
+
+    # Consistent outward normals
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+
+    # Back to object mode
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Add real thickness; cap rim instead of fill_holes
+    solid = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
+    solid.thickness = float(thickness)
+    solid.offset    = 1.0
+    solid.use_even_offset = True
+    solid.use_rim   = True  # closes the open border as proper side walls
+    bpy.ops.object.modifier_apply(modifier=solid.name)
+
+    # Final validate
+    obj.data.validate(verbose=False)
+    obj.data.update()
+
+    # Optional: recenter so preview bounds aren't huge from any past spikes
+    if center:
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
         try:
-            bmesh.ops.smooth_laplacian(
-                bm, verts=bm.verts, lambda_factor=laplace_lambda,
-                repeat=laplace_iters, preserve_volume=False,
-                use_x=True, use_y=True, use_z=True)
+            bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
         except Exception:
             pass
-    bmesh.ops.triangulate(bm, faces=bm.faces)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    bm.to_mesh(me); me.validate(clean_customdata=True); me.update(); bm.free()
+        obj.location = (0.0, 0.0, 0.0)
 
-def solidify_apply(obj, thickness):
-    bpy.context.view_layer.objects.active = obj
-    mod = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
-    mod.thickness = float(thickness)
-    mod.offset = -1.0
-    mod.use_rim = True
-    mod.use_even_offset = True
-    mod.use_quality_normals = True
-    bpy.ops.object.modifier_apply(modifier=mod.name)
+def is_watertight(obj):
+    """Quick boundary-edge check (True = watertight)."""
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.normal_update()
+    boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+    bm.free()
+    return len(boundary_edges) == 0
 
-def create_joined_cylinders_z(holes, shell_thickness, radius=0.0015875, embed_offset=0.0025):
-    cutters = []
-    depth = float(shell_thickness) + 2.0 * float(embed_offset)
+# ===========================
+# Cutters & boolean
+# ===========================
+
+def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
+    """Z-aligned cylinders centered at (x,y), extending down along -Z through the mold thickness."""
+    cylinders = []
     for h in holes:
         x,y,z = to_vec3(h)
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
-            continue
-        center_z = z - (depth * 0.5)
+        depth = float(thickness)
+        # top slightly above the surface, extending downward
+        center_z = z - (embed_offset + depth / 2.0)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
-        cutters.append(bpy.context.active_object)
-    if not cutters: return None
-    for obj in bpy.data.objects: obj.select_set(False)
-    cutters[0].select_set(True)
-    for c in cutters[1:]: c.select_set(True)
+        cyl = bpy.context.active_object
+        cylinders.append(cyl)
+    return cylinders
+
+def apply_boolean_difference_exact(target_obj, cutters):
+    """Join cutters and apply a single EXACT boolean for robustness."""
+    if not cutters:
+        return
+    # Join cutters into one mesh
+    bpy.ops.object.select_all(action='DESELECT')
+    for c in cutters:
+        c.select_set(True)
     bpy.context.view_layer.objects.active = cutters[0]
     bpy.ops.object.join()
-    cutters[0].name = "CuttersJoined"
-    return cutters[0]
+    cutter = cutters[0]
 
-def boolean_difference_exact(target, cutter):
-    bpy.context.view_layer.objects.active = target
-    mod = target.modifiers.new(name="Boolean", type='BOOLEAN')
+    # Apply EXACT boolean
+    bpy.ops.object.select_all(action='DESELECT')
+    target_obj.select_set(True)
+    bpy.context.view_layer.objects.active = target_obj
+    mod = target_obj.modifiers.new(name="HolesExact", type='BOOLEAN')
     mod.operation = 'DIFFERENCE'
-    mod.solver = 'EXACT'
-    mod.object = cutter
-    mod.use_hole_tolerant = True
+    mod.solver    = 'EXACT'
+    mod.object    = cutter
     bpy.ops.object.modifier_apply(modifier=mod.name)
 
-def recenter_to_origin(obj):
-    bpy.context.view_layer.objects.active = obj
-    for o in bpy.data.objects: o.select_set(False)
-    obj.select_set(True)
-    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
-    obj.location = (0.0, 0.0, 0.0)
+    # Cleanup
+    bpy.data.objects.remove(cutter, do_unlink=True)
+    target_obj.data.validate(verbose=False)
+    target_obj.data.update()
 
-def export_stl_selected(filepath):
-    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
+# ===========================
+# Build pipeline (surface-first)
+# ===========================
 
-# =========================
-# Main build (clean surface)
-# =========================
-
-def build_surface_tris(beardline, neckline, params):
+def build_triangles(beardline, neckline, params):
+    """
+    Build a single-sided surface (no per-triangle thickening).
+    Thickness is added later via Solidify for watertightness.
+    """
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    lip_segments   = int(params.get("lipSegments", 100))
-    arc_steps      = int(params.get("arcSteps", 24))
-    max_lip_radius = float(params.get("maxLipRadius", 0.008))
-    min_lip_radius = float(params.get("minLipRadius", 0.003))
-    taper_mult     = float(params.get("taperMult", 25.0))
-
-    enable_skin    = bool(params.get("enableNeckSkin", False))   # default OFF
-    skin_max_dist  = float(params.get("skinMaxDist", 0.008))
-    smooth_neck    = int(params.get("neckSmoothingPasses", 3))
-
-    if neckline and smooth_neck > 0:
-        neckline = smooth_vertices_open(neckline, passes=smooth_neck)
+    # Params (Swift-ish defaults)
+    lip_segments    = int(params.get("lipSegments", 100))
+    arc_steps       = int(params.get("arcSteps", 24))
+    max_lip_radius  = float(params.get("maxLipRadius", 0.008))
+    min_lip_radius  = float(params.get("minLipRadius", 0.003))
+    taper_mult      = float(params.get("taperMult", 25.0))
+    extrusion_depth = float(params.get("extrusionDepth", -0.008))  # Swift negative => back in +Z
+    thickness       = abs(extrusion_depth)
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
-    width_x = max(1e-6, maxX - minX)
-    max_edge_hint = 0.40 * width_x  # slightly relaxed from 0.35
 
     lip_vertices, ring_count = generate_lip_rings(
         base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
     )
 
-    tris = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
+    # Lip surface between rings
+    faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    if enable_skin and neckline:
-        tris.extend(skin_beardline_to_neckline_monotone(beardline, neckline, skin_max_dist))
+    # Skin beardline -> neckline (monotone to avoid crossings)
+    if neckline:
+        faces += skin_beardline_to_neckline_monotone(beardline, neckline)
 
-    # Compute cull scale from geometry we ACTUALLY use:
-    scale_pts = lip_vertices + beardline
-    if enable_skin and neckline:
-        scale_pts += neckline
-    scale = bb_diag(scale_pts)
+    # Stitch one side of the ring to base (other edge will be closed by Solidify rim)
+    faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
 
-    tris  = filter_tris(tris, scale, max_edge_hint=max_edge_hint)
-    return tris
+    # End caps across base index
+    faces += end_caps(lip_vertices, base_points, ring_count)
+
+    # Return surface triangles only; thickness handled later
+    return faces, thickness
+
+def export_stl_selected(filepath):
+    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
+
+# ===========================
+# Main
+# ===========================
 
 def main():
+    # CLI
     argv = sys.argv
     argv = argv[argv.index("--") + 1:] if "--" in argv else []
     if len(argv) != 2:
         raise ValueError("Expected input and output file paths after '--'")
     input_path, output_path = argv
 
+    # Reset scene for clean context
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
+    # Load payload
     with open(input_path, 'r') as f:
         data = json.load(f)
 
     beardline_in = data.get("beardline") or data.get("vertices")
-    if beardline_in is None or len(beardline_in) == 0:
+    if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
-    beardline = [to_vec3(v) for v in beardline_in if is_finite3(to_vec3(v))]
-    if not beardline:
-        raise ValueError("No valid beardline vertices (non-finite?).")
+    beardline = [to_vec3(v) for v in beardline_in]
 
-    neckline_in = data.get("neckline") or []
-    neckline = [to_vec3(v) for v in neckline_in if is_finite3(to_vec3(v))]
+    neckline_in = data.get("neckline")
+    neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
+    if neckline:
+        neckline = smooth_vertices_open(neckline, passes=3)
 
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    shell_thickness = float(params.get("shellThickness", 0.008))
-    laplace_iters   = int(params.get("laplaceIters", 0))
-    laplace_lambda  = float(params.get("laplaceLambda", 0.2))
+    # Build single-surface tris
+    tris, thickness = build_triangles(beardline, neckline, params)
 
-    surf_tris = build_surface_tris(beardline, neckline, params)
+    # Create mesh object
+    mold_obj = make_mesh_from_tris(tris, name="BeardMoldSurface")
 
-    mold_obj = make_object_from_tris("MoldSurface", surf_tris)
-    clean_mesh_bmesh(mold_obj, merge_eps=1e-5, laplace_iters=laplace_iters, laplace_lambda=laplace_lambda)
+    # Cleanup + Solidify (one manifold shell), then center to origin
+    make_manifold_and_solidify(mold_obj, thickness, merge_epsilon=1e-6, center=True)
 
-    solidify_apply(mold_obj, thickness=shell_thickness)
+    # Optional quick watertight check (post-solidify)
+    wt = is_watertight(mold_obj)
 
+    # Holes via a single EXACT boolean
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
-        cutters = create_joined_cylinders_z(holes_in, shell_thickness, radius=radius, embed_offset=embed_offset)
-        if cutters:
-            boolean_difference_exact(mold_obj, cutters)
-            try: bpy.data.objects.remove(cutters, do_unlink=True)
-            except Exception: pass
+        cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
+        apply_boolean_difference_exact(mold_obj, cutters)
+        wt = is_watertight(mold_obj)  # recheck after booleans
 
-    clean_mesh_bmesh(mold_obj, merge_eps=1e-5, laplace_iters=0, laplace_lambda=0.2)
-    recenter_to_origin(mold_obj)
-
-    for o in bpy.data.objects: o.select_set(False)
+    # Select for export
+    bpy.ops.object.select_all(action='DESELECT')
     mold_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mold_obj
+
+    # Export STL
     export_stl_selected(output_path)
 
     print(
-        f"STL export complete for job ID: {data.get('jobID','N/A')} "
-        f"overlay: {data.get('overlay','N/A')} "
-        f"verts(beardline)={len(beardline)} "
+        f"STL export complete for jobID={data.get('jobID','N/A')} "
+        f"overlay={data.get('overlay','N/A')} "
+        f"beardline={len(beardline)} "
         f"neckline={len(neckline)} "
-        f"holes={len(holes_in)}"
+        f"holes={len(holes_in)} "
+        f"watertight={wt}"
     )
 
 if __name__ == "__main__":
