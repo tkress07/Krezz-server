@@ -1,4 +1,4 @@
-# generate_stl.py (patched)
+# generate_stl.py (patched v2)
 import bpy
 import bmesh
 import json
@@ -21,7 +21,6 @@ def dist2(a, b):
     return dx*dx + dy*dy + dz*dz
 
 def tri_area(a, b, c):
-    # 0.5 * |(b-a) x (c-a)|
     ax,ay,az = a; bx,by,bz = b; cx,cy,cz = c
     ux,uy,uz = (bx-ax, by-ay, bz-az)
     vx,vy,vz = (cx-ax, cy-ay, cz-az)
@@ -29,14 +28,13 @@ def tri_area(a, b, c):
     return 0.5 * math.sqrt(cxp[0]**2 + cxp[1]**2 + cxp[2]**2)
 
 def bb_diag(pts):
+    if not pts: return 1.0
     xs = [p[0] for p in pts]; ys = [p[1] for p in pts]; zs = [p[2] for p in pts]
-    if not xs: return 1.0
     minx,maxx = min(xs),max(xs); miny,maxy = min(ys),max(ys); minz,maxz = min(zs),max(zs)
     dx = maxx-minx; dy = maxy-miny; dz = maxz-minz
     return max(1e-6, math.sqrt(dx*dx + dy*dy + dz*dz))
 
 def smooth_vertices_open(vertices, passes=1):
-    """Simple moving-average smoothing for an open polyline (preserve endpoints)."""
     if len(vertices) < 3 or passes <= 0:
         return vertices[:]
     V = vertices[:]
@@ -64,12 +62,8 @@ def sample_base_points_along_x(beardline, lip_segments):
     base = []
     for i in range(lip_segments):
         x = minX + i*seg_w
-        # closest by |Δx|
         top = min(beardline, key=lambda p: abs(p[0]-x)) if beardline else None
-        if top is not None:
-            base.append((x, top[1], top[2]))
-        else:
-            base.append((x, fallbackY, fallbackZ))
+        base.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
     return base, minX, maxX
 
 def tapered_radius(x, centerX, min_r, max_r, taper_mult):
@@ -77,10 +71,6 @@ def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     return min_r + taper * (max_r - min_r)
 
 def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
-    """
-    Build a semicircle ring at each base point in the YZ plane.
-    Returns (verts, ring_count). verts is list of 3-tuples.
-    """
     ring_count = arc_steps + 1
     verts = []
     for (bx, by, bz) in base_points:
@@ -94,7 +84,6 @@ def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult
 
 def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
     faces = []
-    # Triangulate the strips between consecutive rings (no end-caps here)
     for i in range(base_count - 1):
         for j in range(ring_count - 1):
             a = lip_vertices[i * ring_count + j]
@@ -106,56 +95,36 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
     return faces
 
 def skin_beardline_to_neckline_monotone(beardline, neckline, skin_max_dist):
-    """
-    Safer skinning: enforce monotone mapping along neckline indices to avoid crossings.
-    Skip spans that exceed skin_max_dist to avoid long kites.
-    Returns list of triangle faces.
-    """
     faces = []
     if len(beardline) < 2 or len(neckline) < 2:
         return faces
-
-    # Sort neckline by X for a consistent rank progression
     neck_sorted_idx = sorted(range(len(neckline)), key=lambda k: neckline[k][0])
     neck_pos_to_rank = {idx: rank for rank, idx in enumerate(neck_sorted_idx)}
-
-    # Nearest neckline for each beard point
-    nearest_idx = []
-    for b in beardline:
-        j = min(range(len(neckline)), key=lambda k: dist2(neckline[k], b))
-        nearest_idx.append(j)
-
-    # Enforce non-decreasing rank (monotone)
+    nearest_idx = [min(range(len(neckline)), key=lambda k: dist2(neckline[k], b)) for b in beardline]
     fixed_idx = [nearest_idx[0]]
     for j in nearest_idx[1:]:
         prev = fixed_idx[-1]
-        prev_r = neck_pos_to_rank[prev]
-        cur_r  = neck_pos_to_rank[j]
-        if cur_r < prev_r:
-            j = neck_sorted_idx[prev_r]
+        if neck_pos_to_rank[j] < neck_pos_to_rank[prev]:
+            j = neck_sorted_idx[neck_pos_to_rank[prev]]
         fixed_idx.append(j)
-
-    # Triangulate with distance cap
     for i in range(len(beardline) - 1):
         b0, b1 = beardline[i], beardline[i+1]
         n0, n1 = neckline[fixed_idx[i]], neckline[fixed_idx[i+1]]
-
         if math.sqrt(dist2(b0, n0)) > skin_max_dist or math.sqrt(dist2(b1, n1)) > skin_max_dist:
             continue
-
         faces.append((b0, n0, b1))
         faces.append((n0, n1, b1))
-
     return faces
 
 def filter_tris(tris, scale_diag, max_edge_hint=None):
-    """Remove degenerate/near-zero area or over-long-edge triangles (with optional clamp)."""
+    """Cull degenerate and over-long-edge triangles (robust floors)."""
     out = []
-    min_area = (1e-6 * scale_diag) ** 2     # scale-aware tiny
-    max_edge = 0.6 * scale_diag             # general guard
+    # hard floors so an outlier can't inflate the threshold
+    scale_diag = max(scale_diag, 1e-3)
+    min_area = max(1e-10, (1e-6 * scale_diag) ** 2)
+    max_edge = 0.6 * scale_diag
     if max_edge_hint is not None:
         max_edge = min(max_edge, max_edge_hint)
-
     for a,b,c in tris:
         area = tri_area(a,b,c)
         if area < min_area:
@@ -167,91 +136,63 @@ def filter_tris(tris, scale_diag, max_edge_hint=None):
     return out
 
 def make_object_from_tris(name, tris):
-    """Create a Blender object from list of triangle vertices (with dedup)."""
-    v2i = {}
-    verts = []
-    faces = []
-    def key(p):
-        return (round(p[0], 7), round(p[1], 7), round(p[2], 7))
+    v2i, verts, faces = {}, [], []
+    def key(p): return (round(p[0], 7), round(p[1], 7), round(p[2], 7))
     for (a,b,c) in tris:
         ids = []
         for p in (a,b,c):
             k = key(p)
             if k not in v2i:
-                v2i[k] = len(verts)
-                verts.append(k)
+                v2i[k] = len(verts); verts.append(k)
             ids.append(v2i[k])
         faces.append(tuple(ids))
     mesh = bpy.data.meshes.new(name + "Mesh")
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
-    mesh.validate(clean_customdata=True)
-    mesh.update()
-
+    mesh.validate(clean_customdata=True); mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
     return obj
 
 def clean_mesh_bmesh(obj, merge_eps=1e-5, laplace_iters=0, laplace_lambda=0.2):
-    """Do cleanup in BMesh: merge doubles, dissolve degenerate, recalc normals, optional smoothing."""
-    me = obj.data
-    bm = bmesh.new()
-    bm.from_mesh(me)
-
+    me = obj.data; bm = bmesh.new(); bm.from_mesh(me)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_eps)
     bmesh.ops.dissolve_degenerate(bm, dist=merge_eps)
-
     if laplace_iters > 0 and 0.0 < laplace_lambda < 1.0:
         try:
             bmesh.ops.smooth_laplacian(
-                bm,
-                verts=bm.verts,
-                lambda_factor=laplace_lambda,
-                repeat=laplace_iters,
-                preserve_volume=False,
-                use_x=True, use_y=True, use_z=True
-            )
+                bm, verts=bm.verts, lambda_factor=laplace_lambda,
+                repeat=laplace_iters, preserve_volume=False,
+                use_x=True, use_y=True, use_z=True)
         except Exception:
             pass
-
     bmesh.ops.triangulate(bm, faces=bm.faces)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-
-    bm.to_mesh(me)
-    me.validate(clean_customdata=True)
-    me.update()
-    bm.free()
+    bm.to_mesh(me); me.validate(clean_customdata=True); me.update(); bm.free()
 
 def solidify_apply(obj, thickness):
     bpy.context.view_layer.objects.active = obj
     mod = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
     mod.thickness = float(thickness)
-    mod.offset = -1.0                 # push thickness inward from the original surface
-    mod.use_rim = True                # close borders
+    mod.offset = -1.0
+    mod.use_rim = True
     mod.use_even_offset = True
     mod.use_quality_normals = True
     bpy.ops.object.modifier_apply(modifier=mod.name)
 
 def create_joined_cylinders_z(holes, shell_thickness, radius=0.0015875, embed_offset=0.0025):
-    """Create Z-aligned cylinders that fully traverse the shell; join into one object."""
     cutters = []
     depth = float(shell_thickness) + 2.0 * float(embed_offset)
     for h in holes:
         x,y,z = to_vec3(h)
         if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
             continue
-        center_z = z - (depth * 0.5)  # center so it spans above and below surface
+        center_z = z - (depth * 0.5)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
         cutters.append(bpy.context.active_object)
-
-    if not cutters:
-        return None
-
-    # Join into one
-    for obj in bpy.data.objects:
-        obj.select_set(False)
+    if not cutters: return None
+    for obj in bpy.data.objects: obj.select_set(False)
     cutters[0].select_set(True)
-    for c in cutters[1:]:
-        c.select_set(True)
+    for c in cutters[1:]: c.select_set(True)
     bpy.context.view_layer.objects.active = cutters[0]
     bpy.ops.object.join()
     cutters[0].name = "CuttersJoined"
@@ -268,8 +209,7 @@ def boolean_difference_exact(target, cutter):
 
 def recenter_to_origin(obj):
     bpy.context.view_layer.objects.active = obj
-    for o in bpy.data.objects:
-        o.select_set(False)
+    for o in bpy.data.objects: o.select_set(False)
     obj.select_set(True)
     bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
     obj.location = (0.0, 0.0, 0.0)
@@ -285,66 +225,57 @@ def build_surface_tris(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    # Params (safe defaults; tuneable from payload)
     lip_segments   = int(params.get("lipSegments", 100))
     arc_steps      = int(params.get("arcSteps", 24))
     max_lip_radius = float(params.get("maxLipRadius", 0.008))
     min_lip_radius = float(params.get("minLipRadius", 0.003))
     taper_mult     = float(params.get("taperMult", 25.0))
 
-    # NEW: gating + tighter default
-    enable_skin    = bool(params.get("enableNeckSkin", False))  # default OFF
-    skin_max_dist  = float(params.get("skinMaxDist", 0.008))    # 6–10mm typical face scale
-
+    enable_skin    = bool(params.get("enableNeckSkin", False))   # default OFF
+    skin_max_dist  = float(params.get("skinMaxDist", 0.008))
     smooth_neck    = int(params.get("neckSmoothingPasses", 3))
 
-    # Smoothing neckline only
     if neckline and smooth_neck > 0:
         neckline = smooth_vertices_open(neckline, passes=smooth_neck)
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
-
-    # NEW: clamp based on lip width to forbid long kites/needles
     width_x = max(1e-6, maxX - minX)
-    max_edge_hint = 0.35 * width_x  # ~35% of lip width
+    max_edge_hint = 0.40 * width_x  # slightly relaxed from 0.35
 
     lip_vertices, ring_count = generate_lip_rings(
         base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
     )
 
-    # Lip strips (no end-caps; rims will be closed by Solidify)
     tris = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # Optional beard->neck skin (monotone + capped), now gated
     if enable_skin and neckline:
         tris.extend(skin_beardline_to_neckline_monotone(beardline, neckline, skin_max_dist))
 
-    # Cull degenerates/overlong (with clamp)
-    scale = bb_diag(beardline + neckline + lip_vertices)
-    tris  = filter_tris(tris, scale, max_edge_hint=max_edge_hint)
+    # Compute cull scale from geometry we ACTUALLY use:
+    scale_pts = lip_vertices + beardline
+    if enable_skin and neckline:
+        scale_pts += neckline
+    scale = bb_diag(scale_pts)
 
+    tris  = filter_tris(tris, scale, max_edge_hint=max_edge_hint)
     return tris
 
 def main():
-    # Parse CLI
     argv = sys.argv
     argv = argv[argv.index("--") + 1:] if "--" in argv else []
     if len(argv) != 2:
         raise ValueError("Expected input and output file paths after '--'")
     input_path, output_path = argv
 
-    # Reset scene
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
     with open(input_path, 'r') as f:
         data = json.load(f)
 
-    # Input guards / backward-compat
     beardline_in = data.get("beardline") or data.get("vertices")
     if beardline_in is None or len(beardline_in) == 0:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
-
     beardline = [to_vec3(v) for v in beardline_in if is_finite3(to_vec3(v))]
     if not beardline:
         raise ValueError("No valid beardline vertices (non-finite?).")
@@ -355,41 +286,30 @@ def main():
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    # Thickness for solidify
-    shell_thickness = float(params.get("shellThickness", 0.008))  # ~8mm
-    laplace_iters = int(params.get("laplaceIters", 0))            # try 1-3 for subtle smoothing
-    laplace_lambda = float(params.get("laplaceLambda", 0.2))
+    shell_thickness = float(params.get("shellThickness", 0.008))
+    laplace_iters   = int(params.get("laplaceIters", 0))
+    laplace_lambda  = float(params.get("laplaceLambda", 0.2))
 
-    # 1) Build a single clean surface
     surf_tris = build_surface_tris(beardline, neckline, params)
 
-    # 2) Make object & clean
     mold_obj = make_object_from_tris("MoldSurface", surf_tris)
     clean_mesh_bmesh(mold_obj, merge_eps=1e-5, laplace_iters=laplace_iters, laplace_lambda=laplace_lambda)
 
-    # 3) Solidify once (closes rims → watertight shell)
     solidify_apply(mold_obj, thickness=shell_thickness)
 
-    # 4) Optional: add holes via a single EXACT boolean (join cutters first)
-    cutters = None
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
         cutters = create_joined_cylinders_z(holes_in, shell_thickness, radius=radius, embed_offset=embed_offset)
         if cutters:
             boolean_difference_exact(mold_obj, cutters)
-            try:
-                bpy.data.objects.remove(cutters, do_unlink=True)
-            except Exception:
-                pass
+            try: bpy.data.objects.remove(cutters, do_unlink=True)
+            except Exception: pass
 
-    # 5) Final tiny cleanup & recenter (nice bounds for SceneKit)
     clean_mesh_bmesh(mold_obj, merge_eps=1e-5, laplace_iters=0, laplace_lambda=0.2)
     recenter_to_origin(mold_obj)
 
-    # 6) Export selected
-    for o in bpy.data.objects:
-        o.select_set(False)
+    for o in bpy.data.objects: o.select_set(False)
     mold_obj.select_set(True)
     export_stl_selected(output_path)
 
