@@ -1,5 +1,3 @@
-Working created a mold 
-
 import bpy
 import bmesh
 import json
