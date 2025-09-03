@@ -58,17 +58,21 @@ def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     return min_r + taper * (max_r - min_r)
 
 def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
-    """Return (lip_vertices, ring_count). Each base point gets a semicircle ring in YZ plane."""
-    ring_count = arc_steps + 1  # number of verts around the semicircle
+    ring_count = arc_steps + 1
     verts = []
-    for (bx, by, bz) in base_points:
+    n = len(base_points)
+    for idx, (bx, by, bz) in enumerate(base_points):
         r = tapered_radius(bx, centerX, min_r, max_r, taper_mult)
+        # soften the two ends (avoid needle tips at boundaries)
+        end_soft = 0.85 if (idx == 0 or idx == n-1) else 1.0
+        r *= end_soft
         for j in range(ring_count):
             angle = math.pi * (j / float(arc_steps))
             y = by - r * (1.0 - math.sin(angle))
             z = bz + r * math.cos(angle)
             verts.append((bx, y, z))
     return verts, ring_count
+
 
 def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
     """Triangulate the lip surface between consecutive rings."""
@@ -140,16 +144,22 @@ def make_mesh_from_tris(tris, name="MoldSurface"):
     return obj
 
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
-    """Z-aligned cylinders, centered at (x,y), spanning down along -Z through the mold thickness."""
     cylinders = []
     for h in holes:
-        x,y,z = to_vec3(h)
-        depth = float(thickness) + embed_offset*2.0  # extra to guarantee full cut
-        center_z = z - (embed_offset + depth / 2.0)
+        x, y, z = to_vec3(h)
+        depth = float(thickness) + embed_offset * 4.0  # more overrun
+        center_z = z - depth * 0.5
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
         cyl = bpy.context.active_object
+        # Make sure cutter normals are sane
+        bpy.context.view_layer.objects.active = cyl
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+        bpy.ops.object.mode_set(mode='OBJECT')
         cylinders.append(cyl)
     return cylinders
+
 
 def apply_boolean_difference(target_obj, cutters):
     bpy.context.view_layer.objects.active = target_obj
@@ -168,34 +178,50 @@ def apply_boolean_difference(target_obj, cutters):
         bpy.data.objects.remove(cutter, do_unlink=True)
 
 def clean_topology(obj, merge_dist=1e-6):
-    """Merge by distance, fix normals, ensure manifold where possible."""
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
 
-    # Remove doubles
     bpy.ops.mesh.remove_doubles(threshold=merge_dist)
-
-    # Recalculate normals outside
     bpy.ops.mesh.normals_make_consistent(inside=False)
 
-    # Optionally find non-manifold (debug)
-    # bpy.ops.mesh.select_non_manifold()
-    # If anything got selected, you could try to fill:
-    # bpy.ops.mesh.fill_holes(sides=0)
+    # Triangulate (keeps booleans happy & SceneKit often renders triangles better)
+    bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
 
     bpy.ops.object.mode_set(mode='OBJECT')
 
-def apply_solidify(obj, thickness, offset=-1.0, use_even_offset=True):
-    """Turn an open surface into a solid, manifold volume."""
+    # Visual (SceneKit): avoid faceted look; also helps spot real spikes vs shading
+    try:
+        bpy.ops.object.shade_smooth()
+    except Exception:
+        pass
+
+
+def apply_solidify(obj, thickness, use_even_offset=True):
+    """Turn an open surface into a solid, manifold volume (with caps), but avoid self-intersections."""
     bpy.context.view_layer.objects.active = obj
+
+    # Solidify wants a sane thickness for tight radii. Clamp to avoid self-intersections.
+    # Many of your lips use radii ~0.003–0.008; keep wall <= ~60% of min radius.
+    max_safe = max(1e-5, min(0.6 * 0.003, thickness))  # 0.6 * min_lip_radius default
+    t = max_safe
+
     mod = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
-    mod.thickness = thickness
-    mod.offset = offset     # -1 pushes back relative to normals
+    mod.thickness = t
+    mod.offset = 0.0                 # centered around surface to reduce collisions
     mod.use_even_offset = use_even_offset
     mod.use_quality_normals = True
+    mod.use_rim = True               # CAP OPEN BORDERS
+    mod.use_rim_only = False
+    # Newer Blender fields (guarded)
+    if hasattr(mod, "nonmanifold_thickness_mode"):
+        mod.nonmanifold_thickness_mode = 'EVEN'
+    if hasattr(mod, "thickness_clamp"):
+        mod.thickness_clamp = 1.0
+
     bpy.ops.object.modifier_apply(modifier=mod.name)
+
 
 # ---------------------------
 # Main pipeline (robust solid)
