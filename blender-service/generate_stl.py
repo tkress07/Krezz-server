@@ -45,7 +45,6 @@ def sample_base_points_along_x(beardline, lip_segments):
     base = []
     for i in range(lip_segments):
         x = minX + i*seg_w
-        # closest by |Δx|
         top = min(beardline, key=lambda p: abs(p[0]-x)) if beardline else None
         if top is not None:
             base.append((x, top[1], top[2]))
@@ -58,14 +57,15 @@ def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     return min_r + taper * (max_r - min_r)
 
 def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
+    """Return (lip_vertices, ring_count). Each base point gets a semicircle ring in YZ plane."""
     ring_count = arc_steps + 1
     verts = []
     n = len(base_points)
     for idx, (bx, by, bz) in enumerate(base_points):
         r = tapered_radius(bx, centerX, min_r, max_r, taper_mult)
-        # soften the two ends (avoid needle tips at boundaries)
-        end_soft = 0.85 if (idx == 0 or idx == n-1) else 1.0
-        r *= end_soft
+        # soften the extreme ends to avoid needle-thin slivers
+        if idx == 0 or idx == n-1:
+            r *= 0.85
         for j in range(ring_count):
             angle = math.pi * (j / float(arc_steps))
             y = by - r * (1.0 - math.sin(angle))
@@ -73,9 +73,7 @@ def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult
             verts.append((bx, y, z))
     return verts, ring_count
 
-
 def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
-    """Triangulate the lip surface between consecutive rings."""
     faces = []
     for i in range(base_count - 1):
         for j in range(ring_count - 1):
@@ -88,7 +86,6 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
     return faces
 
 def skin_beardline_to_neckline(beardline, neckline):
-    """Triangulate between consecutive beardline points and their nearest neckline points (Swift parity)."""
     faces = []
     if len(beardline) < 2 or not neckline:
         return faces
@@ -104,7 +101,6 @@ def skin_beardline_to_neckline(beardline, neckline):
     return faces
 
 def stitch_first_column_to_base(base_points, lip_vertices, ring_count):
-    """Create a seam that ties the first ring column back to the base line."""
     faces = []
     for i in range(len(base_points) - 1):
         a = base_points[i]
@@ -115,17 +111,10 @@ def stitch_first_column_to_base(base_points, lip_vertices, ring_count):
         faces.append([b, c, d])
     return faces
 
-# NOTE: We intentionally remove the "fan" end caps (which often produced sliver triangles).
-# The Solidify modifier will create a robust, manifold back and side walls for us.
-
 def make_mesh_from_tris(tris, name="MoldSurface"):
-    """Create a Blender mesh object from triangle vertex positions."""
     # Deduplicate verts with rounding for stability
-    v2i = {}
-    verts = []
-    faces = []
-    def key(p):
-        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+    v2i, verts, faces = {}, [], []
+    def key(p): return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
     for (a,b,c) in tris:
         ids = []
         for p in (a,b,c):
@@ -143,15 +132,51 @@ def make_mesh_from_tris(tris, name="MoldSurface"):
     bpy.context.collection.objects.link(obj)
     return obj
 
+def clean_topology(obj, merge_dist=1e-6):
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(threshold=merge_dist)
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    # Triangulate (keeps booleans predictable; SceneKit likes tris)
+    bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    try:
+        bpy.ops.object.shade_smooth()
+    except Exception:
+        pass
+
+def apply_solidify(obj, thickness, min_lip_radius=0.003, use_even_offset=True):
+    """Centered, capped solid; clamp wall to avoid self-intersections on tight radii."""
+    bpy.context.view_layer.objects.active = obj
+    # Clamp to ~60% of the tightest lip radius (fallback to thickness if larger)
+    t = max(1e-5, min(0.6 * float(min_lip_radius), float(thickness)))
+
+    mod = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
+    mod.thickness = t
+    mod.offset = 0.0                 # centered around surface -> fewer foldovers
+    mod.use_even_offset = use_even_offset
+    mod.use_quality_normals = True
+    mod.use_rim = True               # cap open borders
+    mod.use_rim_only = False
+    # Guard newer fields for Blender 3.0.1
+    if hasattr(mod, "nonmanifold_thickness_mode"):
+        mod.nonmanifold_thickness_mode = 'EVEN'
+    if hasattr(mod, "thickness_clamp"):
+        mod.thickness_clamp = 1.0
+
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
     cylinders = []
     for h in holes:
         x, y, z = to_vec3(h)
-        depth = float(thickness) + embed_offset * 4.0  # more overrun
+        depth = float(thickness) + embed_offset * 4.0  # overrun both sides
         center_z = z - depth * 0.5
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
         cyl = bpy.context.active_object
-        # Make sure cutter normals are sane
+        # Ensure sane cutter normals
         bpy.context.view_layer.objects.active = cyl
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
@@ -160,68 +185,18 @@ def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=
         cylinders.append(cyl)
     return cylinders
 
-
 def apply_boolean_difference(target_obj, cutters):
     bpy.context.view_layer.objects.active = target_obj
     for cutter in cutters:
         mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
         mod.operation = 'DIFFERENCE'
         mod.solver = 'EXACT'
-        try:
-            # helps with nearly coplanar areas
+        # overlap_threshold may not exist on 3.0.1
+        if hasattr(mod, "overlap_threshold"):
             mod.overlap_threshold = 1e-6
-        except Exception:
-            pass
         mod.object = cutter
         bpy.ops.object.modifier_apply(modifier=mod.name)
-        # remove cutter
         bpy.data.objects.remove(cutter, do_unlink=True)
-
-def clean_topology(obj, merge_dist=1e-6):
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='SELECT')
-
-    bpy.ops.mesh.remove_doubles(threshold=merge_dist)
-    bpy.ops.mesh.normals_make_consistent(inside=False)
-
-    # Triangulate (keeps booleans happy & SceneKit often renders triangles better)
-    bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
-
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    # Visual (SceneKit): avoid faceted look; also helps spot real spikes vs shading
-    try:
-        bpy.ops.object.shade_smooth()
-    except Exception:
-        pass
-
-
-def apply_solidify(obj, thickness, use_even_offset=True):
-    """Turn an open surface into a solid, manifold volume (with caps), but avoid self-intersections."""
-    bpy.context.view_layer.objects.active = obj
-
-    # Solidify wants a sane thickness for tight radii. Clamp to avoid self-intersections.
-    # Many of your lips use radii ~0.003–0.008; keep wall <= ~60% of min radius.
-    max_safe = max(1e-5, min(0.6 * 0.003, thickness))  # 0.6 * min_lip_radius default
-    t = max_safe
-
-    mod = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
-    mod.thickness = t
-    mod.offset = 0.0                 # centered around surface to reduce collisions
-    mod.use_even_offset = use_even_offset
-    mod.use_quality_normals = True
-    mod.use_rim = True               # CAP OPEN BORDERS
-    mod.use_rim_only = False
-    # Newer Blender fields (guarded)
-    if hasattr(mod, "nonmanifold_thickness_mode"):
-        mod.nonmanifold_thickness_mode = 'EVEN'
-    if hasattr(mod, "thickness_clamp"):
-        mod.thickness_clamp = 1.0
-
-    bpy.ops.object.modifier_apply(modifier=mod.name)
-
 
 # ---------------------------
 # Main pipeline (robust solid)
@@ -231,13 +206,12 @@ def build_front_surface_tris(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    # params with Swift defaults
     lip_segments   = int(params.get("lipSegments", 100))
     arc_steps      = int(params.get("arcSteps", 24))
     max_lip_radius = float(params.get("maxLipRadius", 0.008))
     min_lip_radius = float(params.get("minLipRadius", 0.003))
     taper_mult     = float(params.get("taperMult", 25.0))
-    extrusion_depth= float(params.get("extrusionDepth", -0.008))  # used only for thickness value
+    extrusion_depth= float(params.get("extrusionDepth", -0.008))  # used for target thickness
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
@@ -247,20 +221,13 @@ def build_front_surface_tris(beardline, neckline, params):
     )
 
     faces = []
-    # Lip surface between rings
     faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
-
-    # Skin beardline -> neckline (if provided)
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
-
-    # Rim seam (first column of rings to base)
     faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
 
-    # No end caps here; solidify will produce robust back/sides
-
-    thickness = abs(extrusion_depth)  # how thick we want the final solid
-    return faces, thickness
+    thickness = abs(extrusion_depth)
+    return faces, thickness, min_lip_radius
 
 def export_stl_selected(filepath):
     bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
@@ -273,7 +240,7 @@ def main():
         raise ValueError("Expected input and output file paths after '--'")
     input_path, output_path = argv
 
-    # Reset scene to avoid leftovers
+    # Reset scene
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
     with open(input_path, 'r') as f:
@@ -287,30 +254,28 @@ def main():
 
     neckline_in = data.get("neckline")
     neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
-    # match Swift smoothing for neckline only
     if neckline:
         neckline = smooth_vertices_open(neckline, passes=3)
 
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    # 1) Build the FRONT SURFACE ONLY (no manual extrude)
-    tris, thickness = build_front_surface_tris(beardline, neckline, params)
+    # 1) Build front surface only
+    tris, thickness, min_lip_radius = build_front_surface_tris(beardline, neckline, params)
 
     # 2) Create mesh object
     mold_surface = make_mesh_from_tris(tris, name="BeardMoldSurface")
 
-    # 3) Clean topology (merge by distance & fix normals)
+    # 3) Clean topology before solidifying
     clean_topology(mold_surface, merge_dist=1e-6)
 
-    # 4) Convert surface to a TRUE SOLID using Solidify
-    #    offset=-1.0 pushes thickness "back" relative to surface normals
-    apply_solidify(mold_surface, thickness=thickness, offset=-1.0, use_even_offset=True)
+    # 4) Solidify (centered, capped, clamped)  <<< FIXED SIGNATURE
+    apply_solidify(mold_surface, thickness=thickness, min_lip_radius=min_lip_radius, use_even_offset=True)
 
-    # 5) Clean again post-solidify (normals/doubles)
+    # 5) Clean again post-solidify
     clean_topology(mold_surface, merge_dist=1e-6)
 
-    # 6) Optional holes via boolean DIFFERENCE (now Z-aligned & robust)
+    # 6) Optional holes via boolean DIFFERENCE
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
@@ -318,7 +283,7 @@ def main():
         apply_boolean_difference(mold_surface, cutters)
         clean_topology(mold_surface, merge_dist=1e-6)
 
-    # 7) Export STL (select object)
+    # 7) Export
     for obj in bpy.data.objects:
         obj.select_set(False)
     mold_surface.select_set(True)
@@ -330,7 +295,8 @@ def main():
         f"verts(beardline)={len(beardline)} "
         f"neckline={len(neckline)} "
         f"holes={len(holes_in)}  "
-        f"thickness={thickness:.6f}"
+        f"thickness={thickness:.6f}  "
+        f"minLipRadius={min_lip_radius:.6f}"
     )
 
 if __name__ == "__main__":
