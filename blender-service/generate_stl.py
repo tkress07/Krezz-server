@@ -6,7 +6,7 @@ import math
 from mathutils import Vector
 
 # ---------------------------
-# Helpers (geometry & math)
+# Helpers
 # ---------------------------
 
 def to_vec3(p):
@@ -28,9 +28,7 @@ def smooth_vertices_open(vertices, passes=1):
     return V
 
 def sample_base_points_along_x(beardline, lip_segments):
-    xs = [p[0] for p in beardline]
-    ys = [p[1] for p in beardline]
-    zs = [p[2] for p in beardline]
+    xs = [p[0] for p in beardline]; ys = [p[1] for p in beardline]; zs = [p[2] for p in beardline]
     minX = min(xs) if xs else -0.05
     maxX = max(xs) if xs else  0.05
     seg_w = (maxX - minX) / max(1, (lip_segments - 1))
@@ -40,11 +38,9 @@ def sample_base_points_along_x(beardline, lip_segments):
     base = []
     for i in range(lip_segments):
         x = minX + i*seg_w
+        # closest by |Δx|
         top = min(beardline, key=lambda p: abs(p[0]-x)) if beardline else None
-        if top is not None:
-            base.append((x, top[1], top[2]))
-        else:
-            base.append((x, fallbackY, fallbackZ))
+        base.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
     return base, minX, maxX
 
 def tapered_radius(x, centerX, min_r, max_r, taper_mult):
@@ -76,6 +72,59 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
             d = lip_vertices[(i + 1) * ring_count + j + 1]
             faces.append([a, c, b])
             faces.append([b, c, d])
+    return faces
+
+def tri_area(a, b, c):
+    # area of triangle using cross product
+    ax,ay,az = a; bx,by,bz = b; cx,cy,cz = c
+    ux,uy,uz = (bx-ax, by-ay, bz-az)
+    vx,vy,vz = (cx-ax, cy-ay, cz-az)
+    cx_, cy_, cz_ = (uy*vz - uz*vy, uz*vx - ux*vz, ux*vy - uy*vx)
+    return 0.5 * math.sqrt(cx_*cx_ + cy_*cy_ + cz_*cz_)
+
+def skin_with_shared_connections(beardline, neckline, shared_pairs, min_area=1e-10):
+    """
+    Bridge between beardline and neckline using explicit index pairs.
+    shared_pairs may be:
+      - [{'beardIndex': i, 'neckIndex': j}, ...]  OR
+      - [{'b': i, 'n': j}, ...]                   OR
+      - [[i, j], ...]
+    We sort by beardIndex to keep strips ordered and build quads → two tris.
+    """
+    faces = []
+    if not beardline or not neckline or not shared_pairs:
+        return faces
+
+    norm_pairs = []
+    for p in shared_pairs:
+        if isinstance(p, dict):
+            bi = p.get('beardIndex', p.get('b'))
+            ni = p.get('neckIndex',  p.get('n'))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            bi, ni = p[0], p[1]
+        else:
+            continue
+        if isinstance(bi, int) and isinstance(ni, int):
+            if 0 <= bi < len(beardline) and 0 <= ni < len(neckline):
+                norm_pairs.append((bi, ni))
+
+    if len(norm_pairs) < 2:
+        return faces
+
+    # sort by beard index to maintain order
+    norm_pairs.sort(key=lambda t: t[0])
+
+    for k in range(len(norm_pairs)-1):
+        b0, n0 = norm_pairs[k]
+        b1, n1 = norm_pairs[k+1]
+        A = beardline[b0]; B = neckline[n0]; C = beardline[b1]; D = neckline[n1]
+
+        # two tris: (A, B, C) and (B, D, C)
+        if tri_area(A, B, C) >= min_area:
+            faces.append([A, B, C])
+        if tri_area(B, D, C) >= min_area:
+            faces.append([B, D, C])
+
     return faces
 
 def make_mesh_from_tris(tris, name="MoldSurface"):
@@ -113,10 +162,11 @@ def clean_topology(obj, merge_dist=1e-6):
 
 def apply_solidify(obj, thickness, min_lip_radius=0.003, use_even_offset=True):
     bpy.context.view_layer.objects.active = obj
-    t = max(1e-5, min(0.6 * float(min_lip_radius), float(thickness)))  # clamp wall
+    # Clamp wall to avoid self-intersections on tight curvature
+    t = max(1e-5, min(0.6 * float(min_lip_radius), float(thickness)))
     mod = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
     mod.thickness = t
-    mod.offset = 0.0                 # centered -> fewer foldovers
+    mod.offset = 0.0                 # centered around surface
     mod.use_even_offset = use_even_offset
     mod.use_quality_normals = True
     mod.use_rim = True               # cap open borders
@@ -159,7 +209,7 @@ def apply_boolean_difference(target_obj, cutters):
 # Main pipeline
 # ---------------------------
 
-def build_front_surface_tris(beardline, params):
+def build_front_surface_tris(beardline, neckline, params, shared_pairs):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
     lip_segments   = int(params.get("lipSegments", 100))
@@ -176,8 +226,12 @@ def build_front_surface_tris(beardline, params):
         base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
     )
 
-    # *** ONLY the lofted lip sheet. No seam. No neckline skin. No fan caps. ***
+    # Lofted lip sheet
     faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
+
+    # If explicit shared connections are provided, bridge beardline↔neckline using them
+    if neckline and shared_pairs:
+        faces += skin_with_shared_connections(beardline, neckline, shared_pairs, min_area=1e-12)
 
     thickness = abs(extrusion_depth)
     return faces, thickness, min_lip_radius
@@ -197,30 +251,39 @@ def main():
     with open(input_path, 'r') as f:
         data = json.load(f)
 
+    # Inputs
     beardline_in = data.get("beardline") or data.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
     beardline = [to_vec3(v) for v in beardline_in]
 
+    neckline_in = data.get("neckline") or []
+    neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
+    if neckline:
+        neckline = smooth_vertices_open(neckline, passes=3)
+
+    # Shared connections may come as 'sharedConnections' or 'shared_connections'
+    shared_pairs = data.get("sharedConnections") or data.get("shared_connections") or []
+
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    # 1) Build front surface only (robust)
-    tris, thickness, min_lip_radius = build_front_surface_tris(beardline, params)
+    # 1) Build surface (loft + optional shared-connection skin)
+    tris, thickness, min_lip_radius = build_front_surface_tris(beardline, neckline, params, shared_pairs)
 
-    # 2) Create mesh object
+    # 2) Mesh object
     mold_surface = make_mesh_from_tris(tris, name="BeardMoldSurface")
 
-    # 3) Clean topology pre-solidify
+    # 3) Clean pre-solidify
     clean_topology(mold_surface, merge_dist=1e-6)
 
     # 4) Solidify (centered, capped, clamped)
     apply_solidify(mold_surface, thickness=thickness, min_lip_radius=min_lip_radius, use_even_offset=True)
 
-    # 5) Clean topology post-solidify
+    # 5) Clean post-solidify
     clean_topology(mold_surface, merge_dist=1e-6)
 
-    # 6) Holes (optional)
+    # 6) Holes
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
@@ -236,7 +299,8 @@ def main():
 
     print(
         f"STL export complete | overlay={data.get('overlay','N/A')} "
-        f"verts(beardline)={len(beardline)} holes={len(holes_in)} "
+        f"verts(beardline)={len(beardline)} neckline={len(neckline)} "
+        f"sharedPairs={len(shared_pairs)} holes={len(holes_in)} "
         f"thickness={thickness:.6f} minLipRadius={min_lip_radius:.6f}"
     )
 
