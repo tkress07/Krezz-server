@@ -355,7 +355,6 @@ def main():
 
     if outline_enabled:
         if outline_mode == "wireframe":
-            # Duplicate if keeping original solid
             target = duplicate_object(mold_obj, "BeardMold_OutlineWire") if keep_solid else mold_obj
             outline_obj = apply_wireframe_modifier(
                 target,
@@ -366,7 +365,6 @@ def main():
                 relative=False,
             )
         elif outline_mode == "boundary":
-            # Always duplicate for clarity; boundary tubes only
             outline_obj = build_boundary_outline(
                 mold_obj,
                 thickness=thickness,
@@ -374,12 +372,19 @@ def main():
                 curve_res=int(outline.get("curveRes", 12)),
             )
 
+    # Sanity: face counts and fallback if outline empty
+    solid_faces = len(mold_obj.data.polygons) if mold_obj and mold_obj.type == 'MESH' else 0
+    outline_faces = len(outline_obj.data.polygons) if outline_obj and outline_obj.type == 'MESH' else 0
+    if outline_enabled and export_which in {"outline", "both"} and outline_faces == 0:
+        print("[warn] Outline produced 0 faces. Falling back to export 'solid'. Consider increasing 'thickness'.")
+        export_which = "solid"
+
     # Select for export
     for obj in bpy.data.objects:
         obj.select_set(False)
 
     if export_which == "solid":
-        mold_obj.select_set(True)
+        if mold_obj: mold_obj.select_set(True)
     elif export_which == "both" and outline_obj is not None:
         mold_obj.select_set(True)
         outline_obj.select_set(True)
@@ -393,9 +398,11 @@ def main():
     print(
         f"STL export complete for job ID: {data.get('jobID','N/A')} "
         f"outline={outline_mode if outline_enabled else 'off'} thickness={thickness} keepSolid={keep_solid} "
-        f"verts(beardline)={len(beardline)} neckline={len(neckline)} holes={len(holes_in)}"
+        f"verts(beardline)={len(beardline)} neckline={len(neckline)} holes={len(holes_in)} "
+        f"faces_solid={solid_faces} faces_outline={outline_faces} export={export_which}"
     )
 
 
 if __name__ == "__main__":
     main()
+
