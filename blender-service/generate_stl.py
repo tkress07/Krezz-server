@@ -1,6 +1,3 @@
-# file: scripts/build_mold_outline.py
-# Blender 3.x — generates solid mold then optional outline (wireframe or boundary-only)
-
 import bpy
 import bmesh
 import json
@@ -48,6 +45,7 @@ def sample_base_points_along_x(beardline, lip_segments):
     base = []
     for i in range(lip_segments):
         x = minX + i*seg_w
+        # closest by |Δx|
         top = min(beardline, key=lambda p: abs(p[0]-x)) if beardline else None
         if top is not None:
             base.append((x, top[1], top[2]))
@@ -139,8 +137,10 @@ def extrude_faces_z(tri_faces, depth):
         back  = [(f0[0], f0[1], f0[2] + depth),
                  (f1[0], f1[1], f1[2] + depth),
                  (f2[0], f2[1], f2[2] + depth)]
+        # front + flipped back
         out.append(front)
         out.append([back[0], back[2], back[1]])
+        # sides
         for i in range(3):
             j = (i + 1) % 3
             out.append([front[i], front[j], back[j]])
@@ -149,13 +149,12 @@ def extrude_faces_z(tri_faces, depth):
 
 def make_mesh_from_tris(tris, name="MoldMesh"):
     """Create a Blender mesh object from triangle vertex positions."""
+    # Deduplicate verts with rounding for stability
     v2i = {}
     verts = []
     faces = []
-
     def key(p):
         return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
-
     for (a,b,c) in tris:
         ids = []
         for p in (a,b,c):
@@ -165,7 +164,6 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
                 verts.append(k)
             ids.append(v2i[k])
         faces.append(tuple(ids))
-
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
     mesh.validate(verbose=False)
@@ -180,6 +178,7 @@ def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=
     for h in holes:
         x,y,z = to_vec3(h)
         depth = float(thickness)
+        # place cylinder so its top is slightly above the surface, extending downwards
         center_z = z - (embed_offset + depth / 2.0)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
         cyl = bpy.context.active_object
@@ -193,85 +192,18 @@ def apply_boolean_difference(target_obj, cutters):
         mod.operation = 'DIFFERENCE'
         mod.object = cutter
         bpy.ops.object.modifier_apply(modifier=mod.name)
+        # remove cutter
         bpy.data.objects.remove(cutter, do_unlink=True)
 
 # ---------------------------
-# Outline generators (B & C)
-# ---------------------------
-
-def duplicate_object(obj, new_name):
-    """Full object + mesh copy to allow non-destructive variants."""
-    dup = obj.copy()
-    dup.data = obj.data.copy()
-    dup.name = new_name
-    dup.data.name = new_name + "_Mesh"
-    bpy.context.collection.objects.link(dup)
-    return dup
-
-def apply_wireframe_modifier(obj, thickness=0.0015, even=True, boundary=True, replace=True, relative=False):
-    """Use Blender's Wireframe modifier to create struts along all edges."""
-    bpy.context.view_layer.objects.active = obj
-    mod = obj.modifiers.new(name="Wireframe", type='WIREFRAME')
-    mod.thickness = float(thickness)
-    mod.use_even_offset = bool(even)
-    mod.use_boundary = bool(boundary)  # keep open edges connected
-    mod.use_replace = bool(replace)
-    mod.use_relative_offset = bool(relative)
-    bpy.ops.object.modifier_apply(modifier=mod.name)
-    return obj
-
-def build_boundary_outline(obj, thickness=0.0015, bevel_res=2, curve_res=12):
-    """Keep only boundary edges, convert to curve, bevel to tubes, convert back to mesh.
-    Why: Wireframe mod can't target only boundary; curve bevel gives even round tubes.
-    """
-    outline = duplicate_object(obj, obj.name + "_OutlineBoundary")
-
-    # Compute boundary edges while faces still present
-    me = outline.data
-    bm = bmesh.new()
-    bm.from_mesh(me)
-
-    # delete non-boundary edges
-    for e in list(bm.edges):
-        if not e.is_boundary:
-            bm.edges.remove(e)
-
-    # delete all faces but keep boundary edges
-    for f in list(bm.faces):
-        bm.faces.remove(f)
-
-    bm.verts.ensure_lookup_table()
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
-    bm.to_mesh(me)
-    bm.free()
-
-    # Convert to curve and bevel
-    for o in bpy.context.selected_objects:
-        o.select_set(False)
-    outline.select_set(True)
-    bpy.context.view_layer.objects.active = outline
-    bpy.ops.object.convert(target='CURVE')
-    curve_obj = bpy.context.active_object
-    cu = curve_obj.data
-    cu.dimensions = '3D'
-    cu.bevel_depth = float(thickness) * 0.5  # radius
-    cu.bevel_resolution = int(bevel_res)
-    cu.resolution_u = int(curve_res)
-
-    # Back to mesh for export
-    bpy.ops.object.convert(target='MESH')
-    mesh_obj = bpy.context.active_object
-    mesh_obj.name = outline.name  # keep name
-    return mesh_obj
-
-# ---------------------------
-# Main pipeline (Swift parity + outline)
+# Main pipeline (Swift parity)
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
+    # params with Swift defaults
     lip_segments   = int(params.get("lipSegments", 100))
     arc_steps      = int(params.get("arcSteps", 24))
     max_lip_radius = float(params.get("maxLipRadius", 0.008))
@@ -286,14 +218,20 @@ def build_triangles(beardline, neckline, params):
         base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
     )
 
+    # Lip surface between rings
     faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
+    # Skin beardline -> neckline (if provided)
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
 
+    # Rim seam (first column of rings to base)
     faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
+
+    # End caps
     faces += end_caps(lip_vertices, base_points, ring_count)
 
+    # Extrude whole shell along Z
     extruded = extrude_faces_z(faces, extrusion_depth)
 
     return extruded, abs(extrusion_depth)
@@ -301,8 +239,8 @@ def build_triangles(beardline, neckline, params):
 def export_stl_selected(filepath):
     bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
 
-
 def main():
+    # Parse CLI
     argv = sys.argv
     argv = argv[argv.index("--") + 1:] if "--" in argv else []
     if len(argv) != 2:
@@ -312,6 +250,7 @@ def main():
     with open(input_path, 'r') as f:
         data = json.load(f)
 
+    # Backward-compat for old payloads
     beardline_in = data.get("beardline") or data.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
@@ -319,90 +258,40 @@ def main():
 
     neckline_in = data.get("neckline")
     neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
+    # match Swift smoothing for neckline only
     if neckline:
         neckline = smooth_vertices_open(neckline, passes=3)
 
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    # Outline params (B default). Disabled if mode == 'off'.
-    outline = params.get("outline", {})
-    outline_mode = (outline.get("mode") or params.get("outlineMode") or "wireframe").lower()
-    outline_enabled = outline_mode in {"wireframe", "boundary"}
-    thickness = float(outline.get("thickness", 0.0015))
-    keep_solid = bool(outline.get("keepSolid", True))
-    even = bool(outline.get("evenThickness", True))
-    export_which = (outline.get("export") or "outline").lower()  # outline|solid|both
-
-    # Build triangles
-    tris, thickness_z = build_triangles(beardline, neckline, params)
+    # Build triangles with Swift-equivalent pipeline
+    tris, thickness = build_triangles(beardline, neckline, params)
 
     # Create mesh object
     mold_obj = make_mesh_from_tris(tris, name="BeardMold")
-
-    # Deselect all
+    # Deselect all, then select the mold for export
     for obj in bpy.data.objects:
         obj.select_set(False)
+    mold_obj.select_set(True)
 
-    # Optional holes on the base solid
+    # Optional holes via boolean DIFFERENCE (now Z-aligned & positioned like Swift)
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
-        cutters = create_cylinders_z_aligned(holes_in, thickness_z, radius=radius, embed_offset=embed_offset)
+        cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
 
-    outline_obj = None
-
-    if outline_enabled:
-        if outline_mode == "wireframe":
-            target = duplicate_object(mold_obj, "BeardMold_OutlineWire") if keep_solid else mold_obj
-            outline_obj = apply_wireframe_modifier(
-                target,
-                thickness=thickness,
-                even=even,
-                boundary=True,
-                replace=True,
-                relative=False,
-            )
-        elif outline_mode == "boundary":
-            outline_obj = build_boundary_outline(
-                mold_obj,
-                thickness=thickness,
-                bevel_res=int(outline.get("bevelRes", 2)),
-                curve_res=int(outline.get("curveRes", 12)),
-            )
-
-    # Sanity: face counts and fallback if outline empty
-    solid_faces = len(mold_obj.data.polygons) if mold_obj and mold_obj.type == 'MESH' else 0
-    outline_faces = len(outline_obj.data.polygons) if outline_obj and outline_obj.type == 'MESH' else 0
-    if outline_enabled and export_which in {"outline", "both"} and outline_faces == 0:
-        print("[warn] Outline produced 0 faces. Falling back to export 'solid'. Consider increasing 'thickness'.")
-        export_which = "solid"
-
-    # Select for export
-    for obj in bpy.data.objects:
-        obj.select_set(False)
-
-    if export_which == "solid":
-        if mold_obj: mold_obj.select_set(True)
-    elif export_which == "both" and outline_obj is not None:
-        mold_obj.select_set(True)
-        outline_obj.select_set(True)
-    elif outline_obj is not None:
-        outline_obj.select_set(True)
-    else:
-        mold_obj.select_set(True)
-
+    # Export
     export_stl_selected(output_path)
 
     print(
         f"STL export complete for job ID: {data.get('jobID','N/A')} "
-        f"outline={outline_mode if outline_enabled else 'off'} thickness={thickness} keepSolid={keep_solid} "
-        f"verts(beardline)={len(beardline)} neckline={len(neckline)} holes={len(holes_in)} "
-        f"faces_solid={solid_faces} faces_outline={outline_faces} export={export_which}"
+        f"overlay: {data.get('overlay','N/A')} "
+        f"verts(beardline)={len(beardline)} "
+        f"neckline={len(neckline)} "
+        f"holes={len(holes_in)}"
     )
-
 
 if __name__ == "__main__":
     main()
-
