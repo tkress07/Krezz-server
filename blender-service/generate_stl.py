@@ -7,6 +7,7 @@ import json
 import sys
 import math
 from mathutils import Vector
+import bisect
 
 # ---------------------------
 # Helpers (geometry & math)
@@ -41,23 +42,52 @@ def smooth_vertices_open(vertices, passes=1):
 
 
 def sample_base_points_along_x(beardline, lip_segments):
-    xs = [p[0] for p in beardline]
-    ys = [p[1] for p in beardline]
-    zs = [p[2] for p in beardline]
-    minX = min(xs) if xs else -0.05
-    maxX = max(xs) if xs else 0.05
+    """Monotonic-in-X resampling using linear interpolation to avoid jitter.
+    If multiple beardline points share the same X, they are averaged.
+    """
+    if not beardline:
+        return [], -0.05, 0.05
+
+    # group by X and average Y,Z for duplicates
+    by_x = {}
+    for x, y, z in beardline:
+        acc = by_x.get(x)
+        if acc is None:
+            by_x[x] = [y, z, 1]
+        else:
+            acc[0] += y
+            acc[1] += z
+            acc[2] += 1
+    uniq = []
+    for x, (sy, sz, c) in by_x.items():
+        uniq.append((x, sy / c, sz / c))
+
+    uniq.sort(key=lambda p: p[0])
+    if len(uniq) == 1:
+        x, y, z = uniq[0]
+        return [(x, y, z)] * lip_segments, x, x
+
+    xs = [p[0] for p in uniq]
+    minX, maxX = xs[0], xs[-1]
     seg_w = (maxX - minX) / max(1, (lip_segments - 1))
-    fallbackY = max(ys) if ys else 0.03
-    fallbackZ = (sum(zs) / len(zs)) if zs else 0.0
 
     base = []
     for i in range(lip_segments):
         x = minX + i * seg_w
-        top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
-        if top is not None:
-            base.append((x, top[1], top[2]))
-        else:
-            base.append((x, fallbackY, fallbackZ))
+        j = bisect.bisect_left(xs, x)
+        if j == 0:
+            base.append(uniq[0])
+            continue
+        if j >= len(uniq):
+            base.append(uniq[-1])
+            continue
+        x0, y0, z0 = uniq[j - 1]
+        x1, y1, z1 = uniq[j]
+        t = 0.0 if abs(x1 - x0) < 1e-9 else (x - x0) / (x1 - x0)
+        y = y0 * (1 - t) + y1 * t
+        z = z0 * (1 - t) + z1 * t
+        base.append((x, y, z))
+
     return base, minX, maxX
 
 
@@ -269,12 +299,67 @@ def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=
 def apply_boolean_difference(target_obj, cutters):
     bpy.context.view_layer.objects.active = target_obj
     for cutter in cutters:
-        mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
-        mod.operation = 'DIFFERENCE'
-        mod.object = cutter
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-        bpy.data.objects.remove(cutter, do_unlink=True)
+        try:
+            mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
+            mod.operation = 'DIFFERENCE'
+            mod.object = cutter
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception:
+            # Why: Boolean can fail on near-coplanar or zero-thickness—keep the rest.
+            pass
+        finally:
+            try:
+                bpy.data.objects.remove(cutter, do_unlink=True)
+            except Exception:
+                pass
 
+
+# ---------------------------
+# Main pipeline (Swift parity)
+# ---------------------------
+
+def sanitize_params(params):
+    lip_segments = max(2, int(params.get("lipSegments", 100)))
+    arc_steps = max(1, int(params.get("arcSteps", 24)))
+    max_lip_radius = abs(float(params.get("maxLipRadius", 0.008)))
+    min_lip_radius = abs(float(params.get("minLipRadius", 0.003)))
+    if min_lip_radius > max_lip_radius:
+        min_lip_radius, max_lip_radius = max_lip_radius, min_lip_radius
+    taper_mult = max(0.0, float(params.get("taperMult", 25.0)))
+    extrusion_depth = float(params.get("extrusionDepth", -0.008))
+    if abs(extrusion_depth) < 1e-6:
+        extrusion_depth = -0.002  # avoid zero-thickness
+    base_smooth = max(0, int(params.get("baseSmoothPasses", 1)))
+    return {
+        "lip_segments": lip_segments,
+        "arc_steps": arc_steps,
+        "max_lip_radius": max_lip_radius,
+        "min_lip_radius": min_lip_radius,
+        "taper_mult": taper_mult,
+        "extrusion_depth": extrusion_depth,
+        "base_smooth": base_smooth,
+    }
+
+
+def triangle_area2(a, b, c):
+    # 2x area via cross product magnitude
+    ax, ay, az = a
+    bx, by, bz = b
+    cx, cy, cz = c
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    cxp = (uy * vz - uz * vy)
+    cyp = (uz * vx - ux * vz)
+    czp = (ux * vy - uy * vx)
+    return cxp * cxp + cyp * cyp + czp * czp
+
+
+def remove_degenerate_tris(tris, eps=1e-18):
+    out = []
+    for a, b, c in tris:
+        if triangle_area2(a, b, c) > eps:
+            out.append((a, b, c))
+    return out
 
 # ---------------------------
 # Main pipeline (Swift parity)
@@ -284,38 +369,39 @@ def build_triangles(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    # params with Swift defaults
-    lip_segments = int(params.get("lipSegments", 100))
-    arc_steps = int(params.get("arcSteps", 24))
-    max_lip_radius = float(params.get("maxLipRadius", 0.008))
-    min_lip_radius = float(params.get("minLipRadius", 0.003))
-    taper_mult = float(params.get("taperMult", 25.0))
-    extrusion_depth = float(params.get("extrusionDepth", -0.008))  # negative to go back in +Z
+    P = sanitize_params(params)
 
-    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
+    base_points, minX, maxX = sample_base_points_along_x(beardline, P["lip_segments"])
+
+    # optional smoothing to damp jitter further
+    if P["base_smooth"] > 0:
+        base_points = smooth_vertices_open(base_points, passes=P["base_smooth"])
+
     centerX = 0.5 * (minX + maxX)
 
     lip_vertices, ring_count = generate_lip_rings(
-        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
+        base_points,
+        P["arc_steps"],
+        P["min_lip_radius"],
+        P["max_lip_radius"],
+        centerX,
+        P["taper_mult"],
     )
 
-    # Lip surface between rings
     faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # Skin beardline -> neckline (if provided)
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
 
-    # Rim seam (first column of rings to base)
     faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
-
-    # End caps
     faces += end_caps(lip_vertices, base_points, ring_count)
 
-    # Extrude the *surface* to a closed solid
-    extruded = extrude_surface_z_solid(faces, extrusion_depth)
+    # Drop zero-area triangles before extrusion (prevents solver hiccups)
+    faces = remove_degenerate_tris(faces)
 
-    return extruded, abs(extrusion_depth)
+    extruded = extrude_surface_z_solid(faces, P["extrusion_depth"])  # watertight
+
+    return extruded, abs(P["extrusion_depth"])
 
 
 def export_stl_selected(filepath):
