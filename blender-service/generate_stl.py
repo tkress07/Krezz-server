@@ -156,13 +156,11 @@ def end_caps(lip_vertices, base_points, ring_count):
     faces = []
     if not base_points:
         return faces
-    # first end
     first_base = base_points[0]
     for i in range(ring_count - 1):
         a = lip_vertices[i]
         b = lip_vertices[i + 1]
         faces.append([a, b, first_base])
-    # last end
     last_base = base_points[-1]
     start_idx = (len(base_points) - 1) * ring_count
     for i in range(ring_count - 1):
@@ -172,17 +170,16 @@ def end_caps(lip_vertices, base_points, ring_count):
     return faces
 
 # ----------------------------------------------------------------------
-# Solid, manifold extrusion (replaces per-triangle extrusion that caused gaps)
+# Solid, manifold extrusion
 # ----------------------------------------------------------------------
 
-def extrude_surface_z_solid(tri_faces, depth, weld_eps=1e-6):
-    """Extrude a triangle *surface* by `depth` along +Z and close only boundary edges.
-    Returns list of triangles (front, back, sides) forming a watertight solid.
-    """
-    # 1) Build a unique vertex pool for the front surface
-    key = lambda p: (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+def extrude_surface_z_solid(tri_faces, depth):
+    """Extrude a triangle surface by `depth` along +Z and close only boundary edges."""
+    def key(p):
+        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+
     v2i = {}
-    verts = []  # front verts
+    verts = []
     tris_idx = []
 
     def idx_of(p):
@@ -198,38 +195,32 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps=1e-6):
         ia = idx_of(a)
         ib = idx_of(b)
         ic = idx_of(c)
-        tris_idx.append((ia, ib, ic))
+        if len({ia, ib, ic}) == 3:
+            tris_idx.append((ia, ib, ic))
 
-    # 2) Count undirected edges to find boundary
     edge_count = {}
     edge_dir = {}
     for ia, ib, ic in tris_idx:
-        edges = [(ia, ib), (ib, ic), (ic, ia)]
-        for (u, v) in edges:
-            e = (u, v)
+        for (u, v) in ((ia, ib), (ib, ic), (ic, ia)):
             ue = (min(u, v), max(u, v))
             edge_count[ue] = edge_count.get(ue, 0) + 1
             if ue not in edge_dir:
-                edge_dir[ue] = e  # remember one oriented copy
+                edge_dir[ue] = (u, v)
 
     boundary = [ue for ue, c in edge_count.items() if c == 1]
 
-    # 3) Build back vertex pool (offset along Z)
     back_offset = len(verts)
     back_verts = [(x, y, z + depth) for (x, y, z) in verts]
 
-    # 4) Assemble triangles: front + flipped back
     out = []
     for ia, ib, ic in tris_idx:
         out.append((verts[ia], verts[ib], verts[ic]))
         ja, jb, jc = ia + back_offset, ib + back_offset, ic + back_offset
         out.append((back_verts[jc - back_offset], back_verts[jb - back_offset], back_verts[ja - back_offset]))
 
-    # 5) Side walls only along boundary edges
     for ue in boundary:
-        u, v = edge_dir[ue]  # oriented
+        u, v = edge_dir[ue]
         ju, jv = u + back_offset, v + back_offset
-        # two triangles forming quad (u->v) between front and back
         out.append((verts[u], verts[v], back_verts[jv - back_offset]))
         out.append((verts[u], back_verts[jv - back_offset], back_verts[ju - back_offset]))
 
@@ -237,14 +228,13 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps=1e-6):
 
 
 def make_mesh_from_tris(tris, name="MoldMesh"):
-    """Create a Blender mesh object from triangle vertex positions.
-    Ensures welded verts and consistent normals (avoid slicer gaps)."""
+    """Create a Blender mesh object from triangle vertex positions. Weld & recalc normals."""
     v2i = {}
     verts = []
     faces = []
 
     def key(p):
-        return (round(p[0], 5), round(p[1], 5), round(p[2], 5))  # slightly looser weld to eliminate cracks
+        return (round(p[0], 5), round(p[1], 5), round(p[2], 5))
 
     for (a, b, c) in tris:
         ids = []
@@ -254,7 +244,6 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
                 v2i[k] = len(verts)
                 verts.append(k)
             ids.append(v2i[k])
-        # skip degenerate index triplets
         if len({ids[0], ids[1], ids[2]}) == 3:
             faces.append(tuple(ids))
 
@@ -266,7 +255,6 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
 
-    # recalc normals
     try:
         bpy.context.view_layer.objects.active = obj
         for o in bpy.data.objects:
@@ -283,16 +271,13 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
 
 
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
-    """Z-aligned cylinders, centered at (x,y), spanning down along -Z through the mold thickness."""
     cylinders = []
     for h in holes:
         x, y, z = to_vec3(h)
         depth = float(thickness)
-        # top slightly above surface, extending downwards (boolean is more robust)
         center_z = z - (embed_offset + depth / 2.0)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
-        cyl = bpy.context.active_object
-        cylinders.append(cyl)
+        cylinders.append(bpy.context.active_object)
     return cylinders
 
 
@@ -305,7 +290,6 @@ def apply_boolean_difference(target_obj, cutters):
             mod.object = cutter
             bpy.ops.object.modifier_apply(modifier=mod.name)
         except Exception:
-            # Why: Boolean can fail on near-coplanar or zero-thickness—keep the rest.
             pass
         finally:
             try:
@@ -313,9 +297,8 @@ def apply_boolean_difference(target_obj, cutters):
             except Exception:
                 pass
 
-
 # ---------------------------
-# Main pipeline (Swift parity)
+# Pipeline helpers
 # ---------------------------
 
 def sanitize_params(params):
@@ -328,8 +311,9 @@ def sanitize_params(params):
     taper_mult = max(0.0, float(params.get("taperMult", 25.0)))
     extrusion_depth = float(params.get("extrusionDepth", -0.008))
     if abs(extrusion_depth) < 1e-6:
-        extrusion_depth = -0.002  # avoid zero-thickness
+        extrusion_depth = -0.002
     base_smooth = max(0, int(params.get("baseSmoothPasses", 1)))
+    voxel = float(params.get("voxelSize", 0.0) or 0.0)
     return {
         "lip_segments": lip_segments,
         "arc_steps": arc_steps,
@@ -338,11 +322,11 @@ def sanitize_params(params):
         "taper_mult": taper_mult,
         "extrusion_depth": extrusion_depth,
         "base_smooth": base_smooth,
+        "voxel": voxel,
     }
 
 
 def triangle_area2(a, b, c):
-    # 2x area via cross product magnitude
     ax, ay, az = a
     bx, by, bz = b
     cx, cy, cz = c
@@ -362,7 +346,7 @@ def remove_degenerate_tris(tris, eps=1e-18):
     return out
 
 # ---------------------------
-# Main pipeline (Swift parity)
+# Main pipeline
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
@@ -372,8 +356,6 @@ def build_triangles(beardline, neckline, params):
     P = sanitize_params(params)
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, P["lip_segments"])
-
-    # optional smoothing to damp jitter further
     if P["base_smooth"] > 0:
         base_points = smooth_vertices_open(base_points, passes=P["base_smooth"])
 
@@ -396,22 +378,35 @@ def build_triangles(beardline, neckline, params):
     faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
     faces += end_caps(lip_vertices, base_points, ring_count)
 
-    # Drop zero-area triangles before extrusion (prevents solver hiccups)
     faces = remove_degenerate_tris(faces)
-
     extruded = extrude_surface_z_solid(faces, P["extrusion_depth"])  # watertight
 
-    return extruded, abs(P["extrusion_depth"])
+    return extruded, abs(P["extrusion_depth"]), P
 
 
 def export_stl_selected(filepath):
     bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
 
 
+def safe_print_summary(data, beardline, neckline, holes, mesh_stats):
+    job = data.get('jobID', 'N/A')
+    overlay = data.get('overlay', 'N/A')
+    n_b = len(beardline)
+    n_n = len(neckline)
+    n_h = len(holes)
+    n_verts, n_faces, n_boundary = mesh_stats
+    msg = (
+        f"STL export complete for job ID: {job} "
+        f"overlay: {overlay} "
+        f"verts(beardline)={n_b} neckline={n_n} holes={n_h} "
+        f"meshVerts={n_verts} meshFaces={n_faces} boundaryEdges={n_boundary}"
+    )
+    print(msg)
+
+
 def main():
-    # Parse CLI
     argv = sys.argv
-    argv = argv[argv.index("--") + 1 :] if "--" in argv else []
+    argv = argv[argv.index("--") + 1:] if "--" in argv else []
     if len(argv) != 2:
         raise ValueError("Expected input and output file paths after '--'")
     input_path, output_path = argv
@@ -419,7 +414,6 @@ def main():
     with open(input_path, 'r') as f:
         data = json.load(f)
 
-    # Backward-compat for old payloads
     beardline_in = data.get("beardline") or data.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
@@ -433,71 +427,50 @@ def main():
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    # Build triangles with Swift-equivalent pipeline
-    tris, thickness = build_triangles(beardline, neckline, params)
+    tris, thickness, P = build_triangles(beardline, neckline, params)
 
-    # Create mesh object
     mold_obj = make_mesh_from_tris(tris, name="BeardMold")
 
-    # Deselect all, then select the mold for export
     for obj in bpy.data.objects:
         obj.select_set(False)
     mold_obj.select_set(True)
 
-    # Optional holes via boolean DIFFERENCE (now Z-aligned & positioned like Swift)
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
 
-    # Optional voxel remesh to seal micro-gaps into a single manifold (slight smoothing)
-    voxel = float(params.get("voxelSize", 0.0) or 0.0)
-    if voxel > 0.0:
+    # Optional voxel remesh to seal micro-gaps
+    if P["voxel"] > 0.0:
         try:
-            bpy.context.view_layer.objects.active = mold_obj
-            # Prefer operator for broad Blender version support
             bpy.ops.object.mode_set(mode='OBJECT')
             bpy.context.view_layer.objects.active = mold_obj
             mold_obj.select_set(True)
-            bpy.ops.object.voxel_remesh(voxel_size=voxel, adaptivity=0.0, half_res=False)
+            bpy.ops.object.voxel_remesh(voxel_size=P["voxel"], adaptivity=0.0, half_res=False)
         except Exception:
             pass
 
     export_stl_selected(output_path)
 
-    # quick diagnostics
+    # Diagnostics
+    n_verts = n_faces = n_boundary = -1
     try:
         mesh = mold_obj.data
         n_verts = len(mesh.vertices)
         n_faces = len(mesh.polygons)
-        # count boundary edges (manifold check: should be 0 after extrusion; voxel remesh will also fix)
-        import itertools
         edge_face_counts = {tuple(sorted(e.vertices)): 0 for e in mesh.edges}
         for poly in mesh.polygons:
-            idxs = poly.vertices
-            for i in range(3):
-                e = tuple(sorted((idxs[i], idxs[(i + 1) % 3])))
+            idxs = list(poly.vertices)
+            for i in range(len(idxs)):
+                e = tuple(sorted((idxs[i], idxs[(i + 1) % len(idxs)])))
                 if e in edge_face_counts:
                     edge_face_counts[e] += 1
         n_boundary = sum(1 for c in edge_face_counts.values() if c == 1)
     except Exception:
-        n_verts = n_faces = n_boundary = -1
+        pass
 
-    print(
-        f"STL export complete for job ID: {data.get('jobID','N/A')} "
-        f"overlay: {data.get('overlay','N/A')} "
-        f"verts(beardline)={len(beardline)} "
-        f"neckline={len(neckline)} "
-        f"holes={len(holes_in)} "
-        f"meshVerts={n_verts} meshFaces={n_faces} boundaryEdges={n_boundary}"
-    )
-        f"STL export complete for job ID: {data.get('jobID','N/A')} "
-        f"overlay: {data.get('overlay','N/A')} "
-        f"verts(beardline)={len(beardline)} "
-        f"neckline={len(neckline)} "
-        f"holes={len(holes_in)}"
-    )
+    safe_print_summary(data, beardline, neckline, holes_in, (n_verts, n_faces, n_boundary))
 
 
 if __name__ == "__main__":
