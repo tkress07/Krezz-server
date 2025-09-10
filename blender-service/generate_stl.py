@@ -239,13 +239,12 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps=1e-6):
 def make_mesh_from_tris(tris, name="MoldMesh"):
     """Create a Blender mesh object from triangle vertex positions.
     Ensures welded verts and consistent normals (avoid slicer gaps)."""
-    # Weld verts with rounding for stability
     v2i = {}
     verts = []
     faces = []
 
     def key(p):
-        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+        return (round(p[0], 5), round(p[1], 5), round(p[2], 5))  # slightly looser weld to eliminate cracks
 
     for (a, b, c) in tris:
         ids = []
@@ -255,7 +254,9 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
                 v2i[k] = len(verts)
                 verts.append(k)
             ids.append(v2i[k])
-        faces.append(tuple(ids))
+        # skip degenerate index triplets
+        if len({ids[0], ids[1], ids[2]}) == 3:
+            faces.append(tuple(ids))
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
@@ -265,10 +266,9 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
 
-    # Recalculate normals outside so all side faces are coherent
+    # recalc normals
     try:
-        view = bpy.context.view_layer
-        view.objects.active = obj
+        bpy.context.view_layer.objects.active = obj
         for o in bpy.data.objects:
             o.select_set(False)
         obj.select_set(True)
@@ -277,7 +277,7 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
         bpy.ops.mesh.normals_make_consistent(inside=False)
         bpy.ops.object.mode_set(mode='OBJECT')
     except Exception:
-        pass  # keep going even if running from background
+        pass
 
     return obj
 
@@ -451,9 +451,47 @@ def main():
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
 
+    # Optional voxel remesh to seal micro-gaps into a single manifold (slight smoothing)
+    voxel = float(params.get("voxelSize", 0.0) or 0.0)
+    if voxel > 0.0:
+        try:
+            bpy.context.view_layer.objects.active = mold_obj
+            # Prefer operator for broad Blender version support
+            bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.context.view_layer.objects.active = mold_obj
+            mold_obj.select_set(True)
+            bpy.ops.object.voxel_remesh(voxel_size=voxel, adaptivity=0.0, half_res=False)
+        except Exception:
+            pass
+
     export_stl_selected(output_path)
 
+    # quick diagnostics
+    try:
+        mesh = mold_obj.data
+        n_verts = len(mesh.vertices)
+        n_faces = len(mesh.polygons)
+        # count boundary edges (manifold check: should be 0 after extrusion; voxel remesh will also fix)
+        import itertools
+        edge_face_counts = {tuple(sorted(e.vertices)): 0 for e in mesh.edges}
+        for poly in mesh.polygons:
+            idxs = poly.vertices
+            for i in range(3):
+                e = tuple(sorted((idxs[i], idxs[(i + 1) % 3])))
+                if e in edge_face_counts:
+                    edge_face_counts[e] += 1
+        n_boundary = sum(1 for c in edge_face_counts.values() if c == 1)
+    except Exception:
+        n_verts = n_faces = n_boundary = -1
+
     print(
+        f"STL export complete for job ID: {data.get('jobID','N/A')} "
+        f"overlay: {data.get('overlay','N/A')} "
+        f"verts(beardline)={len(beardline)} "
+        f"neckline={len(neckline)} "
+        f"holes={len(holes_in)} "
+        f"meshVerts={n_verts} meshFaces={n_faces} boundaryEdges={n_boundary}"
+    )
         f"STL export complete for job ID: {data.get('jobID','N/A')} "
         f"overlay: {data.get('overlay','N/A')} "
         f"verts(beardline)={len(beardline)} "
