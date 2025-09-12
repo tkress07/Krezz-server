@@ -140,6 +140,42 @@ def skin_beardline_to_neckline(beardline, neckline):
     return faces
 
 
+def skin_polyline_to_neckline_monotone(poly, neckline):
+    """Like skin_beardline_to_neckline, but enforce monotone index progression on the neckline mapping
+    to avoid crossing quads and slicer artifacts. Uses the given order of `poly`.
+    """
+    faces = []
+    if len(poly) < 2 or not neckline:
+        return faces
+    # nearest index for each point
+    nearest = [min(range(len(neckline)), key=lambda k, p=p: dist2(neckline[k], p)) for p in poly]
+    # enforce non-decreasing sequence
+    for i in range(1, len(nearest)):
+        if nearest[i] < nearest[i - 1]:
+            nearest[i] = nearest[i - 1]
+    # clamp to last index
+    nearest = [min(i, len(neckline) - 1) for i in nearest]
+    # build faces
+    for i in range(len(poly) - 1):
+        b0 = poly[i]
+        b1 = poly[i + 1]
+        v0 = neckline[nearest[i]]
+        v1 = neckline[nearest[i + 1]]
+        faces.append([b0, v0, b1])
+        faces.append([v0, v1, b1])
+    return faces
+    for i in range(len(beardline) - 1):
+        b0 = beardline[i]
+        b1 = beardline[i + 1]
+        n0 = min(range(len(neckline)), key=lambda k: dist2(neckline[k], b0))
+        n1 = min(range(len(neckline)), key=lambda k: dist2(neckline[k], b1))
+        v0 = neckline[n0]
+        v1 = neckline[n1]
+        faces.append([b0, v0, b1])
+        faces.append([v0, v1, b1])
+    return faces
+
+
 def stitch_first_column_to_base(base_points, lip_vertices, ring_count):
     faces = []
     for i in range(len(base_points) - 1):
@@ -406,9 +442,9 @@ def sanitize_params(params):
     voxel = float(params.get("voxelSize", 0.0) or 0.0)
     weld_tol = float(params.get("weldTol", 1e-5))
     cap_holes = bool(params.get("capHoles", True))
-    bridge_mode = (params.get("bridgeMode") or "arclen").lower()
-    if bridge_mode not in ("x", "arclen"):
-        bridge_mode = "arclen"
+    bridge_mode = (params.get("bridgeMode") or "none").lower()
+    if bridge_mode not in ("none", "x", "arclen"):
+        bridge_mode = "none"
     return {
         "lip_segments": lip_segments,
         "arc_steps": arc_steps,
@@ -549,14 +585,12 @@ def build_triangles(beardline, neckline, params):
 
     faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # Bridge original beardline to resampled base (choose strategy)
-    if P.get("bridge_mode") == "x":
-        faces += bridge_polylines_mono_x(beardline, base_points)
-    else:
-        faces += bridge_polylines_arclen(beardline, base_points, steps=len(base_points))
+    # No bridging (was causing self-intersections). We instead skin the **base** to the neckline.
+    # faces += ... (disabled) 
+    pass
 
     if neckline:
-        faces += skin_beardline_to_neckline(beardline, neckline)
+        faces += skin_polyline_to_neckline_monotone(base_points, neckline)
 
     faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
     faces += end_caps(lip_vertices, base_points, ring_count)
