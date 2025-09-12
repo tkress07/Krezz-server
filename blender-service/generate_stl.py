@@ -348,6 +348,11 @@ def apply_boolean_difference(target_obj, cutters):
         try:
             mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
             mod.operation = 'DIFFERENCE'
+            # Using EXACT avoids thin-gap artifacts from 'FAST' on complex shells
+            try:
+                mod.solver = 'EXACT'
+            except Exception:
+                pass
             mod.object = cutter
             bpy.ops.object.modifier_apply(modifier=mod.name)
         except Exception:
@@ -411,6 +416,40 @@ def remove_degenerate_tris(tris, eps=1e-18):
     return out
 
 # ---------------------------
+# Main pipeline helpers (bridging)
+# ---------------------------
+
+def bridge_polylines_mono_x(poly_a, poly_b):
+    """Triangulate a zipper strip between two open polylines sorted by X.
+    Keeps surfaces connected to avoid T-junction gaps between base resample and original beardline.
+    """
+    if len(poly_a) < 2 or len(poly_b) < 2:
+        return []
+    A = sorted(poly_a, key=lambda p: p[0])
+    B = sorted(poly_b, key=lambda p: p[0])
+    i, j = 0, 0
+    faces = []
+    while i < len(A) - 1 and j < len(B) - 1:
+        ax0, *_ = A[i]
+        ax1, *_ = A[i + 1]
+        bx0, *_ = B[j]
+        bx1, *_ = B[j + 1]
+        if ax1 <= bx1:
+            faces.append([A[i], B[j], A[i + 1]])
+            i += 1
+        else:
+            faces.append([A[i], B[j], B[j + 1]])
+            j += 1
+    # fan out remainder
+    while i < len(A) - 1:
+        faces.append([A[i], B[-1], A[i + 1]])
+        i += 1
+    while j < len(B) - 1:
+        faces.append([A[-1], B[j], B[j + 1]])
+        j += 1
+    return faces
+
+# ---------------------------
 # Main pipeline
 # ---------------------------
 
@@ -436,6 +475,9 @@ def build_triangles(beardline, neckline, params):
     )
 
     faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
+
+    # Bridge original beardline to resampled base to avoid gaps between strips
+    faces += bridge_polylines_mono_x(beardline, base_points)
 
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
