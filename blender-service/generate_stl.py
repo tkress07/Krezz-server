@@ -170,13 +170,40 @@ def end_caps(lip_vertices, base_points, ring_count):
     return faces
 
 # ----------------------------------------------------------------------
-# Solid, manifold extrusion
+# Solid, manifold extrusion (reworked)
 # ----------------------------------------------------------------------
 
-def extrude_surface_z_solid(tri_faces, depth):
-    """Extrude a triangle surface by `depth` along +Z and close only boundary edges."""
+def _round_decimals_from_tol(tol: float) -> int:
+    if tol <= 0:
+        return 6
+    # clamp to a reasonable range to avoid huge round() work
+    dec = max(0, min(8, int(round(-math.log10(max(1e-9, tol))))))
+    return dec
+
+
+def extrude_surface_z_solid(tri_faces, depth, weld_tol=1e-5):
+    """Build a closed shell by offsetting along Z and stitching boundary edges.
+
+    * Welds input vertices within `weld_tol` during indexing.
+    * Drops degenerate input triangles.
+    * Adds front, back and side faces; side faces only on true boundary edges.
+    """
+
+    def area2(a, b, c):
+        ax, ay, az = a
+        bx, by, bz = b
+        cx, cy, cz = c
+        ux, uy, uz = bx - ax, by - ay, bz - az
+        vx, vy, vz = cx - ax, cy - ay, cz - az
+        cxp = (uy * vz - uz * vy)
+        cyp = (uz * vx - ux * vz)
+        czp = (ux * vy - uy * vx)
+        return cxp * cxp + cyp * cyp + czp * czp
+
+    decimals = _round_decimals_from_tol(weld_tol)
+
     def key(p):
-        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+        return (round(p[0], decimals), round(p[1], decimals), round(p[2], decimals))
 
     v2i = {}
     verts = []
@@ -192,11 +219,14 @@ def extrude_surface_z_solid(tri_faces, depth):
         return i
 
     for a, b, c in tri_faces:
-        ia = idx_of(a)
-        ib = idx_of(b)
-        ic = idx_of(c)
+        if area2(a, b, c) <= 1e-18:
+            continue
+        ia, ib, ic = idx_of(a), idx_of(b), idx_of(c)
         if len({ia, ib, ic}) == 3:
             tris_idx.append((ia, ib, ic))
+
+    if not tris_idx:
+        return []
 
     edge_count = {}
     edge_dir = {}
@@ -205,7 +235,7 @@ def extrude_surface_z_solid(tri_faces, depth):
             ue = (min(u, v), max(u, v))
             edge_count[ue] = edge_count.get(ue, 0) + 1
             if ue not in edge_dir:
-                edge_dir[ue] = (u, v)
+                edge_dir[ue] = (u, v)  # store a consistent direction
 
     boundary = [ue for ue, c in edge_count.items() if c == 1]
 
@@ -213,28 +243,41 @@ def extrude_surface_z_solid(tri_faces, depth):
     back_verts = [(x, y, z + depth) for (x, y, z) in verts]
 
     out = []
+    # front faces as-is
     for ia, ib, ic in tris_idx:
         out.append((verts[ia], verts[ib], verts[ic]))
+    # back faces reversed
+    for ia, ib, ic in tris_idx:
         ja, jb, jc = ia + back_offset, ib + back_offset, ic + back_offset
         out.append((back_verts[jc - back_offset], back_verts[jb - back_offset], back_verts[ja - back_offset]))
 
+    # side walls for each boundary edge
     for ue in boundary:
         u, v = edge_dir[ue]
         ju, jv = u + back_offset, v + back_offset
+        # Two tris forming the quad; winding keeps outward normal consistent
         out.append((verts[u], verts[v], back_verts[jv - back_offset]))
         out.append((verts[u], back_verts[jv - back_offset], back_verts[ju - back_offset]))
 
     return out
 
 
-def make_mesh_from_tris(tris, name="MoldMesh"):
-    """Create a Blender mesh object from triangle vertex positions. Weld & recalc normals."""
+def make_mesh_from_tris(tris, name="MoldMesh", weld_tol=1e-5, cap_holes=True):
+    """Create a Blender mesh from triangles and enforce manifoldness via bmesh.
+
+    `weld_tol` removes tiny gaps. `cap_holes` fills any remaining boundary loops.
+    """
+    if not tris:
+        raise ValueError("No triangles to build mesh.")
+
+    decimals = _round_decimals_from_tol(weld_tol)
+
+    def key(p):
+        return (round(p[0], decimals), round(p[1], decimals), round(p[2], decimals))
+
     v2i = {}
     verts = []
     faces = []
-
-    def key(p):
-        return (round(p[0], 5), round(p[1], 5), round(p[2], 5))
 
     for (a, b, c) in tris:
         ids = []
@@ -249,6 +292,24 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
+    mesh.validate(verbose=False)
+    mesh.update()
+
+    # Manifold enforcement
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    try:
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_tol)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        if cap_holes:
+            boundary_edges = [e for e in bm.edges if e.is_boundary]
+            if boundary_edges:
+                bmesh.ops.holes_fill(bm, edges=boundary_edges, sides=0)
+        bm.normal_update()
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+
     mesh.validate(verbose=False)
     mesh.update()
 
@@ -314,6 +375,8 @@ def sanitize_params(params):
         extrusion_depth = -0.002
     base_smooth = max(0, int(params.get("baseSmoothPasses", 1)))
     voxel = float(params.get("voxelSize", 0.0) or 0.0)
+    weld_tol = float(params.get("weldTol", 1e-5))
+    cap_holes = bool(params.get("capHoles", True))
     return {
         "lip_segments": lip_segments,
         "arc_steps": arc_steps,
@@ -323,6 +386,8 @@ def sanitize_params(params):
         "extrusion_depth": extrusion_depth,
         "base_smooth": base_smooth,
         "voxel": voxel,
+        "weld_tol": weld_tol,
+        "cap_holes": cap_holes,
     }
 
 
@@ -379,7 +444,7 @@ def build_triangles(beardline, neckline, params):
     faces += end_caps(lip_vertices, base_points, ring_count)
 
     faces = remove_degenerate_tris(faces)
-    extruded = extrude_surface_z_solid(faces, P["extrusion_depth"])  # watertight
+    extruded = extrude_surface_z_solid(faces, P["extrusion_depth"], weld_tol=P["weld_tol"])  # closed shell
 
     return extruded, abs(P["extrusion_depth"]), P
 
@@ -429,7 +494,7 @@ def main():
 
     tris, thickness, P = build_triangles(beardline, neckline, params)
 
-    mold_obj = make_mesh_from_tris(tris, name="BeardMold")
+    mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_tol=P["weld_tol"], cap_holes=P["cap_holes"])
 
     for obj in bpy.data.objects:
         obj.select_set(False)
