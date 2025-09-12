@@ -363,6 +363,30 @@ def apply_boolean_difference(target_obj, cutters):
             except Exception:
                 pass
 
+
+def final_manifold_pass(obj, weld_tol=1e-5, cap_holes=True):
+    """Post-boolean cleanup to guarantee watertightness.
+    - weld
+    - fill boundary loops
+    - recalc normals
+    """
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    try:
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_tol)
+        if cap_holes:
+            boundary_edges = [e for e in bm.edges if e.is_boundary]
+            if boundary_edges:
+                bmesh.ops.holes_fill(bm, edges=boundary_edges, sides=0)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        bm.normal_update()
+        bm.to_mesh(me)
+    finally:
+        bm.free()
+    me.validate(verbose=False)
+    me.update()
+
 # ---------------------------
 # Pipeline helpers
 # ---------------------------
@@ -382,6 +406,9 @@ def sanitize_params(params):
     voxel = float(params.get("voxelSize", 0.0) or 0.0)
     weld_tol = float(params.get("weldTol", 1e-5))
     cap_holes = bool(params.get("capHoles", True))
+    bridge_mode = (params.get("bridgeMode") or "arclen").lower()
+    if bridge_mode not in ("x", "arclen"):
+        bridge_mode = "arclen"
     return {
         "lip_segments": lip_segments,
         "arc_steps": arc_steps,
@@ -393,6 +420,7 @@ def sanitize_params(params):
         "voxel": voxel,
         "weld_tol": weld_tol,
         "cap_holes": cap_holes,
+        "bridge_mode": bridge_mode,
     }
 
 
@@ -430,23 +458,68 @@ def bridge_polylines_mono_x(poly_a, poly_b):
     i, j = 0, 0
     faces = []
     while i < len(A) - 1 and j < len(B) - 1:
-        ax0, *_ = A[i]
-        ax1, *_ = A[i + 1]
-        bx0, *_ = B[j]
-        bx1, *_ = B[j + 1]
+        ax1 = A[i + 1][0]
+        bx1 = B[j + 1][0]
         if ax1 <= bx1:
             faces.append([A[i], B[j], A[i + 1]])
             i += 1
         else:
             faces.append([A[i], B[j], B[j + 1]])
             j += 1
-    # fan out remainder
     while i < len(A) - 1:
         faces.append([A[i], B[-1], A[i + 1]])
         i += 1
     while j < len(B) - 1:
         faces.append([A[-1], B[j], B[j + 1]])
         j += 1
+    return faces
+
+
+def _cumlen(poly):
+    L = [0.0]
+    s = 0.0
+    for i in range(1, len(poly)):
+        a, b = poly[i - 1], poly[i]
+        dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+        s += math.sqrt(dx * dx + dy * dy + dz * dz)
+        L.append(s)
+    if s <= 0:
+        return [0.0 for _ in L]
+    return [x / s for x in L]
+
+
+def bridge_polylines_arclen(poly_a, poly_b, steps=None):
+    """Zipper two open polylines by normalized arc-length.
+    Prevents crossings where X is not monotone.
+    """
+    if len(poly_a) < 2 or len(poly_b) < 2:
+        return []
+    A, B = poly_a[:], poly_b[:]
+    ta, tb = _cumlen(A), _cumlen(B)
+    grid = sorted(set(ta + tb))
+    if steps and steps > 2:
+        grid = [i / (steps - 1) for i in range(steps)]
+    def lerp(P, T, t):
+        import bisect as _bis
+        j = _bis.bisect_left(T, t)
+        if j <= 0:
+            return P[0]
+        if j >= len(T):
+            return P[-1]
+        t0, t1 = T[j - 1], T[j]
+        p0, p1 = P[j - 1], P[j]
+        u = 0.0 if abs(t1 - t0) < 1e-12 else (t - t0) / (t1 - t0)
+        return (
+            p0[0] * (1 - u) + p1[0] * u,
+            p0[1] * (1 - u) + p1[1] * u,
+            p0[2] * (1 - u) + p1[2] * u,
+        )
+    A2 = [lerp(A, ta, t) for t in grid]
+    B2 = [lerp(B, tb, t) for t in grid]
+    faces = []
+    for i in range(len(grid) - 1):
+        faces.append([A2[i], B2[i], A2[i + 1]])
+        faces.append([A2[i + 1], B2[i], B2[i + 1]])
     return faces
 
 # ---------------------------
@@ -476,8 +549,11 @@ def build_triangles(beardline, neckline, params):
 
     faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # Bridge original beardline to resampled base to avoid gaps between strips
-    faces += bridge_polylines_mono_x(beardline, base_points)
+    # Bridge original beardline to resampled base (choose strategy)
+    if P.get("bridge_mode") == "x":
+        faces += bridge_polylines_mono_x(beardline, base_points)
+    else:
+        faces += bridge_polylines_arclen(beardline, base_points, steps=len(base_points))
 
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
@@ -557,6 +633,9 @@ def main():
             bpy.ops.object.voxel_remesh(voxel_size=P["voxel"], adaptivity=0.0, half_res=False)
         except Exception:
             pass
+
+    # Final manifold seal
+    final_manifold_pass(mold_obj, weld_tol=P["weld_tol"], cap_holes=P["cap_holes"]) 
 
     export_stl_selected(output_path)
 
