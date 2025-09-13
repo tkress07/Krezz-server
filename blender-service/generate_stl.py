@@ -75,20 +75,14 @@ def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     return min_r + taper * (max_r - min_r)
 
 
-# NOTE: anchored version – ring 0 is *exactly* the base polyline -> no seam
-# ring indices: 0 = base(beardline), 1..arc_steps+1 = lip arc
-
-def generate_lip_rings_anchored(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
-    ring_count = arc_steps + 2  # base + arc_steps+1 rings
+def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
+    """Return (lip_vertices, ring_count). Each base point gets a semicircle ring in YZ plane."""
+    ring_count = arc_steps + 1
     verts = []
-    # base ring (j=0)
-    for (bx, by, bz) in base_points:
-        verts.append((bx, by, bz))
-    # arc rings (j=1..arc_steps+1)
     for (bx, by, bz) in base_points:
         r = tapered_radius(bx, centerX, min_r, max_r, taper_mult)
-        for j in range(1, arc_steps + 2):
-            angle = math.pi * ((j - 1) / float(arc_steps))  # 0..pi
+        for j in range(ring_count):
+            angle = math.pi * (j / float(arc_steps))
             y = by - r * (1.0 - math.sin(angle))
             z = bz + r * math.cos(angle)
             verts.append((bx, y, z))
@@ -109,6 +103,7 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
 
 
 def first_ring_column(lip_vertices, base_count, ring_count):
+    """Column 0 of semicircle rings along X."""
     return [lip_vertices[i * ring_count + 0] for i in range(base_count)]
 
 # ----------------------------------------------------------------------
@@ -291,11 +286,8 @@ def apply_boolean_difference(target_obj, cutters):
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
-    """Build a single seamless sheet:
-    - Anchor lip base ring exactly to beardline (welded vertices → no seam)
-    - Lip arc grown outward from that base
-    - Then strap beardline → neckline using same X samples
-    """
+    """Build a single seamless sheet: lip → beardline(X-resampled) → neckline(X-resampled).
+    Using the *same* X samples avoids T-junction micro gaps seen in slicers."""
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
@@ -306,27 +298,25 @@ def build_triangles(beardline, neckline, params):
     taper_mult = float(params.get("taperMult", 25.0))
     extrusion_depth = float(params.get("extrusionDepth", -0.008))
 
-    # shared X samples
-    base_points_raw, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
-    xs = [bp[0] for bp in base_points_raw]
-    beard_X = resample_polyline_by_x(beardline, xs)
-
+    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
 
-    # lip with base ring anchored to beardline => welded
-    lip_vertices, ring_count = generate_lip_rings_anchored(
-        beard_X, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
+    lip_vertices, ring_count = generate_lip_rings(
+        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
     )
 
     faces = []
-    faces += quads_to_tris_between_rings(lip_vertices, len(beard_X), ring_count)
+    faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # continue to neckline with same X sampling
+    xs = [bp[0] for bp in base_points]
+    beard_X = resample_polyline_by_x(beardline, xs)
+    ring0 = first_ring_column(lip_vertices, len(base_points), ring_count)
+    faces += strap_tris_equal_counts(ring0, beard_X)
+
     if neckline:
         neck_X = resample_polyline_by_x(neckline, xs)
         faces += strap_tris_equal_counts(beard_X, neck_X)
 
-    # cull zero-area
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
 
     extruded = extrude_surface_z_solid(faces, extrusion_depth)
