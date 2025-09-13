@@ -1,6 +1,29 @@
 # path: tools/beard_mold_fix.py
 # Python 3.x • Blender 3.x API
 
+"""
+Reinforced lip seam generation for beard mold.
+Key changes:
+- Deeper weld: strap beardline to an inner lip ring (attach_idx ≥ 1), not ring 0.
+- Weld shelf: optional Y-offset band behind the seam to increase bonding area.
+- Safer solidify: always extrude by abs(depth); tighter vertex welding.
+Params (JSON → params):
+    lipSegments        : int    default 100
+    arcSteps           : int    default 24
+    maxLipRadius       : float  default 0.008
+    minLipRadius       : float  default 0.003
+    taperMult          : float  default 25.0
+    extrusionDepth     : float  default -0.008  (sign ignored; thickness = abs)
+    lipAttachIndex     : int    default 2      (attach to ring index k ≥ 1)
+    lipAttachFrac      : float  optional 0..1  (alternative to index)
+    weldShelf          : float  default 0.0015 (0 disables)
+    weldShelfSign      : int    default -1     (-1 → -Y, +1 → +Y)
+    lipBaseYOffset     : float  default 0.0    (seat lip base into body)
+    voxelRemesh        : float  default 0.0006 (0 disables)
+    holeRadius         : float  default 0.0015875
+    embedOffset        : float  default 0.0025
+"""
+
 import bpy
 import bmesh
 import json
@@ -32,6 +55,10 @@ def area2(a, b, c):
     return cx * cx + cy * cy + cz * cz
 
 
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 def smooth_vertices_open(vertices, passes=1):
     """Moving-average smoothing for an open polyline (preserve endpoints)."""
     if len(vertices) < 3 or passes <= 0:
@@ -49,7 +76,7 @@ def smooth_vertices_open(vertices, passes=1):
     return V
 
 
-def sample_base_points_along_x(beardline, lip_segments):
+def sample_base_points_along_x(beardline, lip_segments, y_offset=0.0):
     xs = [p[0] for p in beardline]
     ys = [p[1] for p in beardline]
     zs = [p[2] for p in beardline]
@@ -64,9 +91,9 @@ def sample_base_points_along_x(beardline, lip_segments):
         x = minX + i * seg_w
         top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
         if top is not None:
-            base.append((x, top[1], top[2]))
+            base.append((x, top[1] + y_offset, top[2]))
         else:
-            base.append((x, fallbackY, fallbackZ))
+            base.append((x, fallbackY + y_offset, fallbackZ))
     return base, minX, maxX
 
 
@@ -83,6 +110,7 @@ def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult
         r = tapered_radius(bx, centerX, min_r, max_r, taper_mult)
         for j in range(ring_count):
             angle = math.pi * (j / float(arc_steps))
+            # keep curvature in Z; slight dip in Y to create a hook profile
             y = by - r * (1.0 - math.sin(angle))
             z = bz + r * math.cos(angle)
             verts.append((bx, y, z))
@@ -102,12 +130,13 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
     return faces
 
 
-def first_ring_column(lip_vertices, base_count, ring_count):
-    """Column 0 of semicircle rings along X."""
-    return [lip_vertices[i * ring_count + 0] for i in range(base_count)]
+def ring_column_at(lip_vertices, base_count, ring_count, j_index):
+    j = clamp(j_index, 0, ring_count - 1)
+    return [lip_vertices[i * ring_count + j] for i in range(base_count)]
+
 
 # ----------------------------------------------------------------------
-# NEW: robust strap: resample both beardline *and* neckline to shared Xs
+# Robust strap: resample polylines *to the same Xs*
 # ----------------------------------------------------------------------
 
 def resample_polyline_by_x(points, xs):
@@ -142,13 +171,20 @@ def strap_tris_equal_counts(A, B):
         faces.append([A[i + 1], B[i], B[i + 1]])
     return faces
 
+
+def offset_polyline_y(points, dy):
+    return [(x, y + dy, z) for (x, y, z) in points]
+
+
 # ----------------------------------------------------------------------
 # Solid, manifold extrusion
 # ----------------------------------------------------------------------
 
 def extrude_surface_z_solid(tri_faces, depth):
-    """Extrude a triangle surface by `depth` along +Z and close only boundary edges.
-    Keeps a single welded vertex set up front to avoid T-junction pinholes."""
+    """Extrude a triangle surface by abs(depth) along +Z and close only boundary edges.
+    Why: consistent orientation avoids slicer pinholes when depth < 0 was passed."""
+    depth = abs(float(depth))
+
     key = lambda p: (round(p[0], 6), round(p[1], 6), round(p[2], 6))  # tighter weld
     v2i = {}
     verts = []
@@ -286,8 +322,9 @@ def apply_boolean_difference(target_obj, cutters):
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
-    """Build a single seamless sheet: lip → beardline(X-resampled) → neckline(X-resampled).
-    Using the *same* X samples avoids T-junction micro gaps seen in slicers."""
+    """Build one seamless sheet: lip → beardline(X-resampled) → (optional shelf) → neckline.
+    Using shared X samples avoids T-junction micro gaps; shelf thickens the weld.
+    """
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
@@ -298,7 +335,16 @@ def build_triangles(beardline, neckline, params):
     taper_mult = float(params.get("taperMult", 25.0))
     extrusion_depth = float(params.get("extrusionDepth", -0.008))
 
-    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
+    # NEW controls
+    lip_base_yoff = float(params.get("lipBaseYOffset", 0.0))
+    attach_idx = int(params.get("lipAttachIndex", 2))
+    if "lipAttachFrac" in params:
+        frac = float(params.get("lipAttachFrac", 0.25))
+        attach_idx = max(1, int(round(frac * arc_steps)))
+    weld_shelf = float(params.get("weldShelf", 0.0015))
+    weld_sign = -1 if int(params.get("weldShelfSign", -1)) < 0 else 1
+
+    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments, y_offset=lip_base_yoff)
     centerX = 0.5 * (minX + maxX)
 
     lip_vertices, ring_count = generate_lip_rings(
@@ -310,16 +356,25 @@ def build_triangles(beardline, neckline, params):
 
     xs = [bp[0] for bp in base_points]
     beard_X = resample_polyline_by_x(beardline, xs)
-    ring0 = first_ring_column(lip_vertices, len(base_points), ring_count)
-    faces += strap_tris_equal_counts(ring0, beard_X)
+
+    # Attach deeper into the lip for a stronger weld
+    attach_idx = clamp(attach_idx, 1, ring_count - 1)
+    ring_attach = ring_column_at(lip_vertices, len(base_points), ring_count, attach_idx)
+    faces += strap_tris_equal_counts(ring_attach, beard_X)
+
+    # Optional weld shelf behind the seam for more bonding area
+    shelf_X = None
+    if abs(weld_shelf) > 0.0:
+        shelf_X = offset_polyline_y(beard_X, weld_shelf * weld_sign)
+        faces += strap_tris_equal_counts(beard_X, shelf_X)
 
     if neckline:
         neck_X = resample_polyline_by_x(neckline, xs)
-        faces += strap_tris_equal_counts(beard_X, neck_X)
+        faces += strap_tris_equal_counts(shelf_X if shelf_X else beard_X, neck_X)
 
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
 
-    extruded = extrude_surface_z_solid(faces, extrusion_depth)
+    extruded = extrude_surface_z_solid(faces, extrusion_depth)  # abs() inside
 
     return extruded, abs(extrusion_depth)
 
