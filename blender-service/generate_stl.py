@@ -151,32 +151,39 @@ def end_caps(lip_vertices, base_points, ring_count):
     return faces
 
 # ----------------------------------------------------------------------
-# NEW: zipper (monotone strap) to close T-junctions between base & beardline
+# NEW: robust strap: resample beardline to base Xs, then 1:1 quad strip
 # ----------------------------------------------------------------------
 
-def zipper_between_polylines_x(a_pts, b_pts):
-    """Return triangles forming a strap between two open polylines.
-    Both lists are sorted by X to avoid crossings; produces manifold strip.
-    """
-    if not a_pts or not b_pts:
-        return []
-    A = sorted(a_pts, key=lambda p: p[0])
-    B = sorted(b_pts, key=lambda p: p[0])
-    i, j = 0, 0
+def resample_polyline_by_x(points, xs):
+    if not points:
+        return [(x, 0.0, 0.0) for x in xs]
+    P = sorted(points, key=lambda p: p[0])
+    out = []
+    k = 0
+    n = len(P)
+    for x in xs:
+        if x <= P[0][0]:
+            out.append((x, P[0][1], P[0][2]))
+            continue
+        if x >= P[-1][0]:
+            out.append((x, P[-1][1], P[-1][2]))
+            continue
+        while k < n - 2 and P[k + 1][0] < x:
+            k += 1
+        a, b = P[k], P[k + 1]
+        t = 0.0 if b[0] == a[0] else (x - a[0]) / (b[0] - a[0])
+        y = a[1] * (1 - t) + b[1] * t
+        z = a[2] * (1 - t) + b[2] * t
+        out.append((x, y, z))
+    return out
+
+
+def strap_tris_equal_counts(A, B):
     faces = []
-    while i < len(A) - 1 or j < len(B) - 1:
-        a0 = A[i]
-        b0 = B[j]
-        step_a = i < len(A) - 1
-        step_b = j < len(B) - 1
-        if step_a and (not step_b or A[i + 1][0] <= B[j + 1][0]):
-            a1 = A[i + 1]
-            faces.append([a0, b0, a1])
-            i += 1
-        else:
-            b1 = B[j + 1]
-            faces.append([a0, b0, b1])
-            j += 1
+    m = min(len(A), len(B))
+    for i in range(m - 1):
+        faces.append([A[i], B[i], A[i + 1]])
+        faces.append([A[i + 1], B[i], B[i + 1]])
     return faces
 
 # ----------------------------------------------------------------------
@@ -240,7 +247,6 @@ def extrude_surface_z_solid(tri_faces, depth):
 
 def make_mesh_from_tris(tris, name="MoldMesh"):
     """Create mesh, then clean to guarantee watertightness for slicing."""
-    # Weld by rounding first
     v2i = {}
     verts = []
     faces = []
@@ -267,13 +273,11 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
 
-    # Clean with bmesh for a manifold STL
     try:
         bm = bmesh.new()
         bm.from_mesh(mesh)
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
         bmesh.ops.dissolve_degenerate(bm, dist=1e-7)
-        # Fill small boundary holes if any remain after stitching
         boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
         if boundary_edges:
             bmesh.ops.holes_fill(bm, edges=boundary_edges)
@@ -286,7 +290,6 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     except Exception:
         pass
 
-    # Recalculate normals outside for consistency
     try:
         view = bpy.context.view_layer
         view.objects.active = obj
@@ -352,8 +355,9 @@ def build_triangles(beardline, neckline, params):
     faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
     faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
 
-    # NEW: close seam between base_points and beardline to avoid gaps
-    faces += zipper_between_polylines_x(base_points, beardline)
+    # NEW: resampled strap from base -> beardline (no T-junctions)
+    beardline_resampled = resample_polyline_by_x(beardline, [bp[0] for bp in base_points])
+    faces += strap_tris_equal_counts(base_points, beardline_resampled)
 
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
@@ -373,8 +377,34 @@ def export_stl_selected(filepath):
     bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
 
 
+def voxel_remesh_if_requested(obj, voxel_size):
+    if voxel_size <= 0:
+        return
+    try:
+        for o in bpy.data.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
+    except Exception:
+        # Older Blender versions: silently skip
+        pass
+
+
+def report_non_manifold(obj):
+    try:
+        mesh = obj.data
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
+        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
+        bm.free()
+    except Exception:
+        pass
+
+
 def main():
-    # Parse CLI
     argv = sys.argv
     argv = argv[argv.index("--") + 1 :] if "--" in argv else []
     if len(argv) != 2:
@@ -384,7 +414,6 @@ def main():
     with open(input_path, 'r') as f:
         data = json.load(f)
 
-    # Backward-compat for old payloads
     beardline_in = data.get("beardline") or data.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
@@ -398,18 +427,20 @@ def main():
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    # Build triangles
     tris, thickness = build_triangles(beardline, neckline, params)
 
-    # Create mesh object
     mold_obj = make_mesh_from_tris(tris, name="BeardMold")
 
-    # Deselect all, then select the mold for export
+    # Optional voxel remesh to guarantee watertightness (last-resort)
+    voxel_size = float(params.get("voxelRemesh", 0.0))
+    voxel_remesh_if_requested(mold_obj, voxel_size)
+
+    report_non_manifold(mold_obj)
+
     for obj in bpy.data.objects:
         obj.select_set(False)
     mold_obj.select_set(True)
 
-    # Optional holes via boolean DIFFERENCE
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
