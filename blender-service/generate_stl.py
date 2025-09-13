@@ -2,24 +2,33 @@
 # Python 3.x • Blender 3.x API
 
 """
-Reinforced lip seam generation for beard mold.
-Key changes:
-- Deeper weld: strap beardline to an inner lip ring (attach_idx ≥ 1), not ring 0.
-- Weld shelf: optional Y-offset band behind the seam to increase bonding area.
-- Safer solidify: always extrude by abs(depth); tighter vertex welding.
+Reinforced lip seam generation for beard mold + SafeMode diagnostics.
+
+Fixes weak tear seam by:
+- Deeper weld (attach to inner lip ring).
+- Weld shelf band behind seam.
+- Solidify with abs(depth) and tight vertex welding.
+
+New diagnostics (to prevent "chaos"):
+- Safe parameter clamping (enable with params.safeMode=true [default]).
+- Bounding box + scale printout.
+- NaN/Inf guard and degenerate tri filter.
+
 Params (JSON → params):
-    lipSegments        : int    default 100
-    arcSteps           : int    default 24
-    maxLipRadius       : float  default 0.008
-    minLipRadius       : float  default 0.003
-    taperMult          : float  default 25.0
-    extrusionDepth     : float  default -0.008  (sign ignored; thickness = abs)
-    lipAttachIndex     : int    default 2      (attach to ring index k ≥ 1)
-    lipAttachFrac      : float  optional 0..1  (alternative to index)
-    weldShelf          : float  default 0.0015 (0 disables)
-    weldShelfSign      : int    default -1     (-1 → -Y, +1 → +Y)
-    lipBaseYOffset     : float  default 0.0    (seat lip base into body)
-    voxelRemesh        : float  default 0.0006 (0 disables)
+    lipSegments        : int    default 100     (clamped 20..400 in SafeMode)
+    arcSteps           : int    default 24      (clamped 8..128)
+    maxLipRadius       : float  default 0.008   (0..0.05)
+    minLipRadius       : float  default 0.003   (0..maxLipRadius)
+    taperMult          : float  default 25.0    (0..200)
+    extrusionDepth     : float  default -0.008  (thickness = abs)
+    lipAttachIndex     : int    default 2       (≥1)
+    lipAttachFrac      : float  optional 0..1   (alternative to index)
+    weldShelf          : float  default 0.0015  (0 disables; 0..0.01)
+    weldShelfSign      : int    default -1      (-1 or +1)
+    lipBaseYOffset     : float  default 0.0     (-0.01..0.01)
+    voxelRemesh        : float  default 0.0006  (0 disables)
+    safeMode           : bool   default true
+    verbose            : bool   default true
     holeRadius         : float  default 0.0015875
     embedOffset        : float  default 0.0025
 """
@@ -60,7 +69,6 @@ def clamp(v, lo, hi):
 
 
 def smooth_vertices_open(vertices, passes=1):
-    """Moving-average smoothing for an open polyline (preserve endpoints)."""
     if len(vertices) < 3 or passes <= 0:
         return vertices[:]
     V = vertices[:]
@@ -103,14 +111,12 @@ def tapered_radius(x, centerX, min_r, max_r, taper_mult):
 
 
 def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
-    """Return (lip_vertices, ring_count). Each base point gets a semicircle ring in YZ plane."""
     ring_count = arc_steps + 1
     verts = []
     for (bx, by, bz) in base_points:
         r = tapered_radius(bx, centerX, min_r, max_r, taper_mult)
         for j in range(ring_count):
             angle = math.pi * (j / float(arc_steps))
-            # keep curvature in Z; slight dip in Y to create a hook profile
             y = by - r * (1.0 - math.sin(angle))
             z = bz + r * math.cos(angle)
             verts.append((bx, y, z))
@@ -133,7 +139,6 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
 def ring_column_at(lip_vertices, base_count, ring_count, j_index):
     j = clamp(j_index, 0, ring_count - 1)
     return [lip_vertices[i * ring_count + j] for i in range(base_count)]
-
 
 # ----------------------------------------------------------------------
 # Robust strap: resample polylines *to the same Xs*
@@ -175,17 +180,54 @@ def strap_tris_equal_counts(A, B):
 def offset_polyline_y(points, dy):
     return [(x, y + dy, z) for (x, y, z) in points]
 
+# ----------------------------------------------------------------------
+# Diagnostics
+# ----------------------------------------------------------------------
+
+def bbox_from_tris(tris):
+    mn = [float('inf')] * 3
+    mx = [float('-inf')] * 3
+    nan_found = False
+    for a, b, c in tris:
+        for p in (a, b, c):
+            if any(math.isnan(v) or math.isinf(v) for v in p):
+                nan_found = True
+                continue
+            for k in range(3):
+                mn[k] = min(mn[k], p[k])
+                mx[k] = max(mx[k], p[k])
+    return tuple(mn), tuple(mx), nan_found
+
+
+def validate_and_fix_params(params):
+    sm = bool(params.get("safeMode", True))
+    out = dict(params)
+    def setc(key, val):
+        out[key] = val
+    if sm:
+        setc("lipSegments", int(clamp(int(out.get("lipSegments", 100)), 20, 400)))
+        setc("arcSteps", int(clamp(int(out.get("arcSteps", 24)), 8, 128)))
+        maxR = float(out.get("maxLipRadius", 0.008))
+        minR = float(out.get("minLipRadius", 0.003))
+        maxR = clamp(maxR, 0.0, 0.05)
+        minR = clamp(minR, 0.0, maxR)
+        setc("maxLipRadius", maxR)
+        setc("minLipRadius", minR)
+        setc("taperMult", float(clamp(float(out.get("taperMult", 25.0)), 0.0, 200.0)))
+        setc("weldShelf", float(clamp(float(out.get("weldShelf", 0.0015)), 0.0, 0.01)))
+        setc("weldShelfSign", -1 if int(out.get("weldShelfSign", -1)) < 0 else 1)
+        setc("lipBaseYOffset", float(clamp(float(out.get("lipBaseYOffset", 0.0)), -0.01, 0.01)))
+        # Attachment index will be clamped against ring_count later
+    return out
 
 # ----------------------------------------------------------------------
 # Solid, manifold extrusion
 # ----------------------------------------------------------------------
 
 def extrude_surface_z_solid(tri_faces, depth):
-    """Extrude a triangle surface by abs(depth) along +Z and close only boundary edges.
-    Why: consistent orientation avoids slicer pinholes when depth < 0 was passed."""
     depth = abs(float(depth))
 
-    key = lambda p: (round(p[0], 6), round(p[1], 6), round(p[2], 6))  # tighter weld
+    key = lambda p: (round(p[0], 6), round(p[1], 6), round(p[2], 6))
     v2i = {}
     verts = []
     tris_idx = []
@@ -200,12 +242,16 @@ def extrude_surface_z_solid(tri_faces, depth):
         return i
 
     for a, b, c in tri_faces:
+        # skip degenerate/NaN
+        if (any(math.isnan(v) or math.isinf(v) for v in a+b+c)):
+            continue
+        if area2(a, b, c) <= 1e-18:
+            continue
         ia = idx_of(a)
         ib = idx_of(b)
         ic = idx_of(c)
         tris_idx.append((ia, ib, ic))
 
-    # boundary edges on the front sheet
     edge_count = {}
     edge_dir = {}
     for ia, ib, ic in tris_idx:
@@ -222,28 +268,27 @@ def extrude_surface_z_solid(tri_faces, depth):
     out = []
     for ia, ib, ic in tris_idx:
         out.append((verts[ia], verts[ib], verts[ic]))
-        ja, jb, jc = ia + back_offset, ib + back_offset, ic + back_offset
-        out.append((back_verts[jc - back_offset], back_verts[jb - back_offset], back_verts[ja - back_offset]))
+        out.append((back_verts[ic], back_verts[ib], back_verts[ia]))
 
     for ue in boundary:
         u, v = edge_dir[ue]
-        ju, jv = u + back_offset, v + back_offset
-        out.append((verts[u], verts[v], back_verts[jv - back_offset]))
-        out.append((verts[u], back_verts[jv - back_offset], back_verts[ju - back_offset]))
+        out.append((verts[u], verts[v], back_verts[v]))
+        out.append((verts[u], back_verts[v], back_verts[u]))
 
     return out
 
 
 def make_mesh_from_tris(tris, name="MoldMesh"):
-    """Create mesh, then clean to guarantee watertightness for slicing."""
     v2i = {}
     verts = []
     faces = []
 
     def key(p):
-        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))  # consistent with extruder weld
+        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
 
     for (a, b, c) in tris:
+        if area2(a, b, c) <= 1e-18:
+            continue
         ids = []
         for p in (a, b, c):
             k = key(p)
@@ -251,8 +296,7 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
                 v2i[k] = len(verts)
                 verts.append(k)
             ids.append(v2i[k])
-        if area2(verts[ids[0]], verts[ids[1]], verts[ids[2]]) > 1e-18:
-            faces.append(tuple(ids))
+        faces.append(tuple(ids))
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
@@ -296,15 +340,13 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
 
 
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
-    """Z-aligned cylinders centered at (x,y), extending through thickness."""
     cylinders = []
     for h in holes:
         x, y, z = to_vec3(h)
         depth = float(thickness)
         center_z = z - (embed_offset + depth / 2.0)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
-        cyl = bpy.context.active_object
-        cylinders.append(cyl)
+        cylinders.append(bpy.context.active_object)
     return cylinders
 
 
@@ -322,27 +364,25 @@ def apply_boolean_difference(target_obj, cutters):
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
-    """Build one seamless sheet: lip → beardline(X-resampled) → (optional shelf) → neckline.
-    Using shared X samples avoids T-junction micro gaps; shelf thickens the weld.
-    """
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    lip_segments = int(params.get("lipSegments", 100))
-    arc_steps = int(params.get("arcSteps", 24))
-    max_lip_radius = float(params.get("maxLipRadius", 0.008))
-    min_lip_radius = float(params.get("minLipRadius", 0.003))
-    taper_mult = float(params.get("taperMult", 25.0))
-    extrusion_depth = float(params.get("extrusionDepth", -0.008))
+    P = validate_and_fix_params(params)
 
-    # NEW controls
-    lip_base_yoff = float(params.get("lipBaseYOffset", 0.0))
-    attach_idx = int(params.get("lipAttachIndex", 2))
-    if "lipAttachFrac" in params:
-        frac = float(params.get("lipAttachFrac", 0.25))
+    lip_segments = int(P.get("lipSegments", 100))
+    arc_steps = int(P.get("arcSteps", 24))
+    max_lip_radius = float(P.get("maxLipRadius", 0.008))
+    min_lip_radius = float(P.get("minLipRadius", 0.003))
+    taper_mult = float(P.get("taperMult", 25.0))
+    extrusion_depth = float(P.get("extrusionDepth", -0.008))
+
+    lip_base_yoff = float(P.get("lipBaseYOffset", 0.0))
+    attach_idx = int(P.get("lipAttachIndex", 2))
+    if "lipAttachFrac" in P:
+        frac = float(P.get("lipAttachFrac", 0.25))
         attach_idx = max(1, int(round(frac * arc_steps)))
-    weld_shelf = float(params.get("weldShelf", 0.0015))
-    weld_sign = -1 if int(params.get("weldShelfSign", -1)) < 0 else 1
+    weld_shelf = float(P.get("weldShelf", 0.0015))
+    weld_sign = -1 if int(P.get("weldShelfSign", -1)) < 0 else 1
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments, y_offset=lip_base_yoff)
     centerX = 0.5 * (minX + maxX)
@@ -357,12 +397,10 @@ def build_triangles(beardline, neckline, params):
     xs = [bp[0] for bp in base_points]
     beard_X = resample_polyline_by_x(beardline, xs)
 
-    # Attach deeper into the lip for a stronger weld
     attach_idx = clamp(attach_idx, 1, ring_count - 1)
     ring_attach = ring_column_at(lip_vertices, len(base_points), ring_count, attach_idx)
     faces += strap_tris_equal_counts(ring_attach, beard_X)
 
-    # Optional weld shelf behind the seam for more bonding area
     shelf_X = None
     if abs(weld_shelf) > 0.0:
         shelf_X = offset_polyline_y(beard_X, weld_shelf * weld_sign)
@@ -372,11 +410,12 @@ def build_triangles(beardline, neckline, params):
         neck_X = resample_polyline_by_x(neckline, xs)
         faces += strap_tris_equal_counts(shelf_X if shelf_X else beard_X, neck_X)
 
-    faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
+    # drop tiny/invalid
+    faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18 and not any(math.isnan(v) or math.isinf(v) for p in tri for v in p)]
 
-    extruded = extrude_surface_z_solid(faces, extrusion_depth)  # abs() inside
+    extruded = extrude_surface_z_solid(faces, extrusion_depth)
 
-    return extruded, abs(extrusion_depth)
+    return extruded, abs(extrusion_depth), P
 
 
 def export_stl_selected(filepath):
@@ -394,7 +433,6 @@ def voxel_remesh_if_requested(obj, voxel_size):
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
     except Exception:
-        # Older Blender versions: silently skip
         pass
 
 
@@ -434,11 +472,17 @@ def main():
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    tris, thickness = build_triangles(beardline, neckline, params)
+    tris, thickness, P = build_triangles(beardline, neckline, params)
+
+    mn, mx, has_nan = bbox_from_tris(tris)
+    dx, dy, dz = (mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2])
+    print(f"BBox (m): X={dx:.4f} Y={dy:.4f} Z={dz:.4f}  minZ={mn[2]:.4f} maxZ={mx[2]:.4f}  NaN? {has_nan}")
+    if P.get("verbose", True) and (dx>0.5 or dy>0.5 or dz>0.5):
+        print("WARNING: Unusually large model extents (>0.5 m). Check input units.")
 
     mold_obj = make_mesh_from_tris(tris, name="BeardMold")
 
-    voxel_size = float(params.get("voxelRemesh", 0.0006))
+    voxel_size = float(P.get("voxelRemesh", 0.0006))
     voxel_remesh_if_requested(mold_obj, voxel_size)
 
     report_non_manifold(mold_obj)
@@ -448,8 +492,8 @@ def main():
     mold_obj.select_set(True)
 
     if holes_in:
-        radius = float(params.get("holeRadius", 0.0015875))
-        embed_offset = float(params.get("embedOffset", 0.0025))
+        radius = float(P.get("holeRadius", 0.0015875))
+        embed_offset = float(P.get("embedOffset", 0.0025))
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
 
