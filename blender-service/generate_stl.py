@@ -119,22 +119,8 @@ def skin_beardline_to_neckline(beardline, neckline):
     return faces
 
 
-def stitch_first_column_to_base(base_points, lip_vertices, ring_count):
-    faces = []
-    for i in range(len(base_points) - 1):
-        a = base_points[i]
-        b = base_points[i + 1]
-        c = lip_vertices[i * ring_count + 0]
-        d = lip_vertices[(i + 1) * ring_count + 0]
-        faces.append([a, c, b])
-        faces.append([b, c, d])
-    return faces
-
-
-def end_caps(lip_vertices, base_points, ring_count):
-    faces = []
-    if not base_points:
-        return faces
+def first_ring_column(lip_vertices, base_count, ring_count):
+    return [lip_vertices[i * ring_count + 0] for i in range(base_count)]
     # first end
     first_base = base_points[0]
     for i in range(ring_count - 1):
@@ -353,16 +339,16 @@ def build_triangles(beardline, neckline, params):
 
     faces = []
     faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
-    faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
 
-    # NEW: resampled strap from base -> beardline (no T-junctions)
+    # Resample beardline to base Xs and stitch **beardline ↔ first ring** (not to base)
     beardline_resampled = resample_polyline_by_x(beardline, [bp[0] for bp in base_points])
-    faces += strap_tris_equal_counts(base_points, beardline_resampled)
+    ring0 = first_ring_column(lip_vertices, len(base_points), ring_count)
+    faces += strap_tris_equal_counts(ring0, beardline_resampled)
 
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
 
-    faces += end_caps(lip_vertices, base_points, ring_count)
+    # End-caps not needed; extrude will close boundaries with side walls.
 
     # Filter degenerates early to reduce bad geometry propagation
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
@@ -385,6 +371,8 @@ def voxel_remesh_if_requested(obj, voxel_size):
             o.select_set(False)
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
+        # apply scale for consistent voxel size
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
     except Exception:
         # Older Blender versions: silently skip
@@ -432,7 +420,7 @@ def main():
     mold_obj = make_mesh_from_tris(tris, name="BeardMold")
 
     # Optional voxel remesh to guarantee watertightness (last-resort)
-    voxel_size = float(params.get("voxelRemesh", 0.0))
+    voxel_size = float(params.get("voxelRemesh", 0.0006))  # ~0.6mm default safety
     voxel_remesh_if_requested(mold_obj, voxel_size)
 
     report_non_manifold(mold_obj)
