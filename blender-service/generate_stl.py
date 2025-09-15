@@ -75,16 +75,28 @@ def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     return min_r + taper * (max_r - min_r)
 
 
-def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult):
-    """Return (lip_vertices, ring_count). Each base point gets a semicircle ring in YZ plane."""
+# ---------------------------
+# KEY CHANGE 1: steeper lip profile near start using bias + optional pre-lift
+# ---------------------------
+
+def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult, *, profile_bias=1.0, prelift=0.0):
+    """Return (lip_vertices, ring_count).
+
+    "profile_bias" > 1.0 concentrates angles near 0, making the initial slope
+    steeper (reduces long shallow overhangs that cause slicer gaps).
+    "prelift" (meters) lifts the ring start slightly in +Z before the arc
+    begins, forcing a short near-vertical segment.
+    """
     ring_count = arc_steps + 1
     verts = []
     for (bx, by, bz) in base_points:
         r = tapered_radius(bx, centerX, min_r, max_r, taper_mult)
         for j in range(ring_count):
-            angle = math.pi * (j / float(arc_steps))
+            t = j / float(arc_steps)
+            t = pow(t, max(1.0, float(profile_bias)))
+            angle = math.pi * t
             y = by - r * (1.0 - math.sin(angle))
-            z = bz + r * math.cos(angle)
+            z = bz + prelift + r * math.cos(angle)
             verts.append((bx, y, z))
     return verts, ring_count
 
@@ -149,7 +161,7 @@ def strap_tris_equal_counts(A, B):
 def extrude_surface_z_solid(tri_faces, depth):
     """Extrude a triangle surface by `depth` along +Z and close only boundary edges.
     Keeps a single welded vertex set up front to avoid T-junction pinholes."""
-    key = lambda p: (round(p[0], 6), round(p[1], 6), round(p[2], 6))  # tighter weld
+    key = lambda p: (round(p[0], 6), round(p[1], 6), round(p[2], 6))
     v2i = {}
     verts = []
     tris_idx = []
@@ -169,7 +181,6 @@ def extrude_surface_z_solid(tri_faces, depth):
         ic = idx_of(c)
         tris_idx.append((ia, ib, ic))
 
-    # boundary edges on the front sheet
     edge_count = {}
     edge_dir = {}
     for ia, ib, ic in tris_idx:
@@ -205,7 +216,7 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     faces = []
 
     def key(p):
-        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))  # consistent with extruder weld
+        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
 
     for (a, b, c) in tris:
         ids = []
@@ -259,6 +270,151 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     return obj
 
 
+# ---------------------------
+# NEW: anchor ribs to support shallow overhang skin from inside
+# ---------------------------
+
+def apply_boolean_union(target_obj, cutters):
+    bpy.context.view_layer.objects.active = target_obj
+    for cutter in cutters:
+        mod = target_obj.modifiers.new(name="Union", type='BOOLEAN')
+        mod.operation = 'UNION'
+        mod.solver = 'EXACT'
+        mod.object = cutter
+        try:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception:
+            # Fallback: leave modifier unapplied if apply fails
+            pass
+        try:
+            bpy.data.objects.remove(cutter, do_unlink=True)
+        except Exception:
+            pass
+
+
+def add_anchor_ribs(mold_obj, xs, params, thickness, lip_band_y):
+    """Add thin internal ribs just under the top skin along X to anchor top lines.
+    "why": anchors eliminate slicer gap-fill misses over long shallow overhangs.
+    """
+    if not bool(params.get("enableAnchorRibs", False)):
+        return
+
+    rib_spacing = float(params.get("ribSpacing", 0.006))          # 6 mm
+    rib_thickness = float(params.get("ribThickness", 0.0006))      # 0.6 mm
+    rib_depth = float(params.get("ribDepth", 0.0012))              # 1.2 mm
+    rib_z_offset = float(params.get("ribZOffset", 0.0004))         # 0.4 mm below top
+    rib_band_y = float(params.get("ribBandY", 0.004))              # band width in Y (4 mm)
+    rib_y_shift = float(params.get("ribYShift", 0.0))              # shift band center
+
+    # Bounds and top Z
+    co = [mold_obj.matrix_world @ v.co for v in mold_obj.data.vertices]
+    minx = min(c.x for c in co)
+    maxx = max(c.x for c in co)
+    miny = min(c.y for c in co)
+    maxy = max(c.y for c in co)
+    topz = max(c.z for c in co)
+
+    # Center band near the lip's first column
+    band_y_center = lip_band_y + rib_y_shift
+
+    # Create ribs as thin cubes and UNION them into the mold
+    cutters = []
+    x = minx + rib_spacing * 0.5
+    while x < maxx:
+        cx = x
+        cy = band_y_center
+        cz = topz - rib_z_offset - rib_depth * 0.5
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(cx, cy, cz))
+        rib = bpy.context.active_object
+        rib.scale = (rib_thickness * 0.5, rib_band_y * 0.5, rib_depth * 0.5)
+        cutters.append(rib)
+        x += rib_spacing
+
+    apply_boolean_union(mold_obj, cutters)
+
+
+# ---------------------------
+# Main pipeline
+# ---------------------------
+
+def build_triangles(beardline, neckline, params):
+    """Build a single seamless sheet: lip → beardline(X-resampled) → neckline(X-resampled).
+    Using the *same* X samples avoids T-junction micro gaps seen in slicers."""
+    if not beardline:
+        raise ValueError("Empty beardline supplied.")
+
+    lip_segments = int(params.get("lipSegments", 100))
+    arc_steps = int(params.get("arcSteps", 24))
+    max_lip_radius = float(params.get("maxLipRadius", 0.008))
+    min_lip_radius = float(params.get("minLipRadius", 0.003))
+    taper_mult = float(params.get("taperMult", 25.0))
+    extrusion_depth = float(params.get("extrusionDepth", -0.008))
+
+    # NEW controllables for overhang behavior
+    profile_bias = float(params.get("profileBias", 1.35))  # >1 ⇒ steeper start
+    prelift = float(params.get("prelift", 0.0))            # meters
+
+    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
+    centerX = 0.5 * (minX + maxX)
+
+    lip_vertices, ring_count = generate_lip_rings(
+        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult,
+        profile_bias=profile_bias, prelift=prelift
+    )
+
+    faces = []
+    faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
+
+    xs = [bp[0] for bp in base_points]
+    beard_X = resample_polyline_by_x(beardline, xs)
+    ring0 = first_ring_column(lip_vertices, len(base_points), ring_count)
+    faces += strap_tris_equal_counts(ring0, beard_X)
+
+    if neckline:
+        neck_X = resample_polyline_by_x(neckline, xs)
+        faces += strap_tris_equal_counts(beard_X, neck_X)
+
+    faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
+
+    extruded = extrude_surface_z_solid(faces, extrusion_depth)
+
+    # For ribs placement we want a representative Y of the lip start column
+    lip_band_y = sum(p[1] for p in ring0) / max(1, len(ring0))
+
+    return extruded, abs(extrusion_depth), xs, lip_band_y
+
+
+def export_stl_selected(filepath):
+    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
+
+
+def voxel_remesh_if_requested(obj, voxel_size):
+    if voxel_size <= 0:
+        return
+    try:
+        for o in bpy.data.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
+    except Exception:
+        pass
+
+
+def report_non_manifold(obj):
+    try:
+        mesh = obj.data
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
+        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
+        bm.free()
+    except Exception:
+        pass
+
+
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
     """Z-aligned cylinders centered at (x,y), extending through thickness."""
     cylinders = []
@@ -278,82 +434,14 @@ def apply_boolean_difference(target_obj, cutters):
         mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
         mod.operation = 'DIFFERENCE'
         mod.object = cutter
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-        bpy.data.objects.remove(cutter, do_unlink=True)
-
-# ---------------------------
-# Main pipeline
-# ---------------------------
-
-def build_triangles(beardline, neckline, params):
-    """Build a single seamless sheet: lip → beardline(X-resampled) → neckline(X-resampled).
-    Using the *same* X samples avoids T-junction micro gaps seen in slicers."""
-    if not beardline:
-        raise ValueError("Empty beardline supplied.")
-
-    lip_segments = int(params.get("lipSegments", 100))
-    arc_steps = int(params.get("arcSteps", 24))
-    max_lip_radius = float(params.get("maxLipRadius", 0.008))
-    min_lip_radius = float(params.get("minLipRadius", 0.003))
-    taper_mult = float(params.get("taperMult", 25.0))
-    extrusion_depth = float(params.get("extrusionDepth", -0.008))
-
-    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
-    centerX = 0.5 * (minX + maxX)
-
-    lip_vertices, ring_count = generate_lip_rings(
-        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
-    )
-
-    faces = []
-    faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
-
-    xs = [bp[0] for bp in base_points]
-    beard_X = resample_polyline_by_x(beardline, xs)
-    ring0 = first_ring_column(lip_vertices, len(base_points), ring_count)
-    faces += strap_tris_equal_counts(ring0, beard_X)
-
-    if neckline:
-        neck_X = resample_polyline_by_x(neckline, xs)
-        faces += strap_tris_equal_counts(beard_X, neck_X)
-
-    faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
-
-    extruded = extrude_surface_z_solid(faces, extrusion_depth)
-
-    return extruded, abs(extrusion_depth)
-
-
-def export_stl_selected(filepath):
-    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
-
-
-def voxel_remesh_if_requested(obj, voxel_size):
-    if voxel_size <= 0:
-        return
-    try:
-        for o in bpy.data.objects:
-            o.select_set(False)
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
-    except Exception:
-        # Older Blender versions: silently skip
-        pass
-
-
-def report_non_manifold(obj):
-    try:
-        mesh = obj.data
-        bm = bmesh.new()
-        bm.from_mesh(mesh)
-        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
-        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
-        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
-        bm.free()
-    except Exception:
-        pass
+        try:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception:
+            pass
+        try:
+            bpy.data.objects.remove(cutter, do_unlink=True)
+        except Exception:
+            pass
 
 
 def main():
@@ -379,9 +467,12 @@ def main():
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    tris, thickness = build_triangles(beardline, neckline, params)
+    tris, thickness, xs, lip_band_y = build_triangles(beardline, neckline, params)
 
     mold_obj = make_mesh_from_tris(tris, name="BeardMold")
+
+    # NEW: optional internal anchor ribs before remesh (then remesh bakes them in)
+    add_anchor_ribs(mold_obj, xs, params, thickness, lip_band_y)
 
     voxel_size = float(params.get("voxelRemesh", 0.0006))
     voxel_remesh_if_requested(mold_obj, voxel_size)
