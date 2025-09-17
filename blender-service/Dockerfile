@@ -10,29 +10,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libegl1 libdrm2 libgbm1 libglu1-mesa \
  && rm -rf /var/lib/apt/lists/*
 
-# Optional sanity check (ok to keep)
+# Optional sanity check
 RUN blender -v
 
 # 2) App
 WORKDIR /app
 
-# If you have a .dockerignore that might exclude /tools, copy explicitly.
-COPY app.py /app/
-COPY generate_stl.py /app/
-COPY tools/ /app/tools/        # <-- ensure beard_mold_fix.py is here
-COPY requirements.txt /app/
+# Copy your whole repo (fine)…
+COPY . /app/
+# …but ensure /tools is present even if .dockerignore excludes it.
+COPY tools/ /app/tools/
 
-# 3) Python deps
-RUN pip3 install --no-cache-dir -r requirements.txt || \
-    pip3 install --no-cache-dir flask gunicorn
+# Python deps
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# 4) Environment for the Flask app & Blender call
+# 3) Environment for the Flask app & Blender call
 ENV PORT=8000
 ENV BLENDER_BIN=blender
-ENV BLENDER_SCRIPT=/app/tools/beard_mold_fix.py   # <-- use the new generator
+ENV BLENDER_SCRIPT=/app/tools/beard_mold_fix.py
 ENV BLENDER_TIMEOUT=180
 
 EXPOSE 8000
 
-# 5) Run server
+# 4) Run server
 CMD ["gunicorn","-b","0.0.0.0:8000","app:app","--timeout","180"]
