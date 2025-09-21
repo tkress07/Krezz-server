@@ -415,24 +415,32 @@ def report_non_manifold(obj):
         pass
 
 
-def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
-    """Z-aligned cylinders centered at (x,y), extending through thickness."""
+def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025, through_margin=0.0008):
+    """Z-aligned cylinders that guaranteed pass through the shell."""
     cylinders = []
+    depth = float(thickness) + 2.0 * float(through_margin)   # extra to fully pierce
     for h in holes:
         x, y, z = to_vec3(h)
-        depth = float(thickness)
-        center_z = z - (embed_offset + depth / 2.0)
+        # center so the TOP sits just below the outer skin by embed_offset
+        center_z = (z - embed_offset) - (depth * 0.5)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
         cyl = bpy.context.active_object
+        # freeze transforms (avoids scaled operands confusing boolean)
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         cylinders.append(cyl)
     return cylinders
 
 
+
 def apply_boolean_difference(target_obj, cutters):
+    # make sure target has no pending scale/rot
     bpy.context.view_layer.objects.active = target_obj
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
     for cutter in cutters:
         mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
         mod.operation = 'DIFFERENCE'
+        mod.solver = 'FAST'              # <- more robust on non-GMP builds
         mod.object = cutter
         try:
             bpy.ops.object.modifier_apply(modifier=mod.name)
@@ -486,7 +494,9 @@ def main():
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
-        cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
+        through_margin = float(params.get("holeThroughMargin", 0.0008))
+        cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius,
+                                         embed_offset=embed_offset, through_margin=through_margin)
         apply_boolean_difference(mold_obj, cutters)
 
     export_stl_selected(output_path)
