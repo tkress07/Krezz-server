@@ -1,4 +1,3 @@
-# path: tools/beard_mold_fix.py
 # Python 3.x • Blender 3.x API
 
 import bpy
