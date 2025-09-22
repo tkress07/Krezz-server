@@ -271,12 +271,21 @@ def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=
 
 def apply_boolean_difference(target_obj, cutters):
     bpy.context.view_layer.objects.active = target_obj
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     for cutter in cutters:
         mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
-        mod.operation = 'DIFFERENCE'
         mod.object = cutter
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-        bpy.data.objects.remove(cutter, do_unlink=True)
+        mod.operation = 'DIFFERENCE'
+        mod.solver = 'EXACT'           # <- try EXACT first
+        try:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception:
+            mod.solver = 'FAST'        # fallback
+            try: bpy.ops.object.modifier_apply(modifier=mod.name)
+            except Exception: pass
+        try: bpy.data.objects.remove(cutter, do_unlink=True)
+        except Exception: pass
+
 
 # ---------------------------
 # Main pipeline
