@@ -20,6 +20,15 @@ def dist2(a, b):
     return dx * dx + dy * dy + dz * dz
 
 
+def area2(a, b, c):
+    ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+    cx = ab[1] * ac[2] - ab[2] * ac[1]
+    cy = ab[2] * ac[0] - ab[0] * ac[2]
+    cz = ab[0] * ac[1] - ab[1] * ac[0]
+    return cx * cx + cy * cy + cz * cz
+
+
 def smooth_vertices_open(vertices, passes=1):
     """Moving-average smoothing for an open polyline (preserve endpoints)."""
     if len(vertices) < 3 or passes <= 0:
@@ -91,7 +100,7 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
 
 
 def skin_beardline_to_neckline(beardline, neckline):
-    """Triangulate between consecutive beardline points and their nearest neckline points (Swift parity)."""
+    """Triangulate between consecutive beardline points and their nearest neckline points."""
     faces = []
     if len(beardline) < 2 or not neckline:
         return faces
@@ -107,22 +116,8 @@ def skin_beardline_to_neckline(beardline, neckline):
     return faces
 
 
-def stitch_first_column_to_base(base_points, lip_vertices, ring_count):
-    faces = []
-    for i in range(len(base_points) - 1):
-        a = base_points[i]
-        b = base_points[i + 1]
-        c = lip_vertices[i * ring_count + 0]
-        d = lip_vertices[(i + 1) * ring_count + 0]
-        faces.append([a, c, b])
-        faces.append([b, c, d])
-    return faces
-
-
-def end_caps(lip_vertices, base_points, ring_count):
-    faces = []
-    if not base_points:
-        return faces
+def first_ring_column(lip_vertices, base_count, ring_count):
+    return [lip_vertices[i * ring_count + 0] for i in range(base_count)]
     # first end
     first_base = base_points[0]
     for i in range(ring_count - 1):
@@ -139,17 +134,51 @@ def end_caps(lip_vertices, base_points, ring_count):
     return faces
 
 # ----------------------------------------------------------------------
-# Solid, manifold extrusion (replaces per-triangle extrusion that caused gaps)
+# NEW: robust strap: resample beardline to base Xs, then 1:1 quad strip
 # ----------------------------------------------------------------------
 
-def extrude_surface_z_solid(tri_faces, depth, weld_eps=1e-6):
-    """Extrude a triangle *surface* by `depth` along +Z and close only boundary edges.
-    Returns list of triangles (front, back, sides) forming a watertight solid.
-    """
-    # 1) Build a unique vertex pool for the front surface
-    key = lambda p: (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+def resample_polyline_by_x(points, xs):
+    if not points:
+        return [(x, 0.0, 0.0) for x in xs]
+    P = sorted(points, key=lambda p: p[0])
+    out = []
+    k = 0
+    n = len(P)
+    for x in xs:
+        if x <= P[0][0]:
+            out.append((x, P[0][1], P[0][2]))
+            continue
+        if x >= P[-1][0]:
+            out.append((x, P[-1][1], P[-1][2]))
+            continue
+        while k < n - 2 and P[k + 1][0] < x:
+            k += 1
+        a, b = P[k], P[k + 1]
+        t = 0.0 if b[0] == a[0] else (x - a[0]) / (b[0] - a[0])
+        y = a[1] * (1 - t) + b[1] * t
+        z = a[2] * (1 - t) + b[2] * t
+        out.append((x, y, z))
+    return out
+
+
+def strap_tris_equal_counts(A, B):
+    faces = []
+    m = min(len(A), len(B))
+    for i in range(m - 1):
+        faces.append([A[i], B[i], A[i + 1]])
+        faces.append([A[i + 1], B[i], B[i + 1]])
+    return faces
+
+# ----------------------------------------------------------------------
+# Solid, manifold extrusion
+# ----------------------------------------------------------------------
+
+def extrude_surface_z_solid(tri_faces, depth):
+    """Extrude a triangle *surface* by `depth` along +Z and close only boundary edges."""
+    # 1) Weld front vertices
+    key = lambda p: (round(p[0], 5), round(p[1], 5), round(p[2], 5))
     v2i = {}
-    verts = []  # front verts
+    verts = []
     tris_idx = []
 
     def idx_of(p):
@@ -167,36 +196,32 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps=1e-6):
         ic = idx_of(c)
         tris_idx.append((ia, ib, ic))
 
-    # 2) Count undirected edges to find boundary
+    # 2) Boundary edges
     edge_count = {}
     edge_dir = {}
     for ia, ib, ic in tris_idx:
-        edges = [(ia, ib), (ib, ic), (ic, ia)]
-        for (u, v) in edges:
-            e = (u, v)
+        for (u, v) in ((ia, ib), (ib, ic), (ic, ia)):
             ue = (min(u, v), max(u, v))
             edge_count[ue] = edge_count.get(ue, 0) + 1
             if ue not in edge_dir:
-                edge_dir[ue] = e  # remember one oriented copy
-
+                edge_dir[ue] = (u, v)
     boundary = [ue for ue, c in edge_count.items() if c == 1]
 
-    # 3) Build back vertex pool (offset along Z)
+    # 3) Back verts (offset Z)
     back_offset = len(verts)
     back_verts = [(x, y, z + depth) for (x, y, z) in verts]
 
-    # 4) Assemble triangles: front + flipped back
+    # 4) Triangles: front + flipped back
     out = []
     for ia, ib, ic in tris_idx:
         out.append((verts[ia], verts[ib], verts[ic]))
         ja, jb, jc = ia + back_offset, ib + back_offset, ic + back_offset
         out.append((back_verts[jc - back_offset], back_verts[jb - back_offset], back_verts[ja - back_offset]))
 
-    # 5) Side walls only along boundary edges
+    # 5) Side walls along boundary only
     for ue in boundary:
-        u, v = edge_dir[ue]  # oriented
+        u, v = edge_dir[ue]
         ju, jv = u + back_offset, v + back_offset
-        # two triangles forming quad (u->v) between front and back
         out.append((verts[u], verts[v], back_verts[jv - back_offset]))
         out.append((verts[u], back_verts[jv - back_offset], back_verts[ju - back_offset]))
 
@@ -204,15 +229,13 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps=1e-6):
 
 
 def make_mesh_from_tris(tris, name="MoldMesh"):
-    """Create a Blender mesh object from triangle vertex positions.
-    Ensures welded verts and consistent normals (avoid slicer gaps)."""
-    # Weld verts with rounding for stability
+    """Create mesh, then clean to guarantee watertightness for slicing."""
     v2i = {}
     verts = []
     faces = []
 
     def key(p):
-        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+        return (round(p[0], 5), round(p[1], 5), round(p[2], 5))
 
     for (a, b, c) in tris:
         ids = []
@@ -222,7 +245,8 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
                 v2i[k] = len(verts)
                 verts.append(k)
             ids.append(v2i[k])
-        faces.append(tuple(ids))
+        if area2(verts[ids[0]], verts[ids[1]], verts[ids[2]]) > 1e-18:
+            faces.append(tuple(ids))
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
@@ -232,7 +256,23 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
 
-    # Recalculate normals outside so all side faces are coherent
+    try:
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+        bmesh.ops.dissolve_degenerate(bm, dist=1e-7)
+        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+        if boundary_edges:
+            bmesh.ops.holes_fill(bm, edges=boundary_edges)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        bmesh.ops.triangulate(bm, faces=bm.faces)
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.validate(verbose=False)
+        mesh.update()
+    except Exception:
+        pass
+
     try:
         view = bpy.context.view_layer
         view.objects.active = obj
@@ -244,18 +284,17 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
         bpy.ops.mesh.normals_make_consistent(inside=False)
         bpy.ops.object.mode_set(mode='OBJECT')
     except Exception:
-        pass  # keep going even if running from background
+        pass
 
     return obj
 
 
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
-    """Z-aligned cylinders, centered at (x,y), spanning down along -Z through the mold thickness."""
+    """Z-aligned cylinders centered at (x,y), extending through thickness."""
     cylinders = []
     for h in holes:
         x, y, z = to_vec3(h)
         depth = float(thickness)
-        # top slightly above surface, extending downwards (boolean is more robust)
         center_z = z - (embed_offset + depth / 2.0)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
         cyl = bpy.context.active_object
@@ -272,22 +311,21 @@ def apply_boolean_difference(target_obj, cutters):
         bpy.ops.object.modifier_apply(modifier=mod.name)
         bpy.data.objects.remove(cutter, do_unlink=True)
 
-
 # ---------------------------
-# Main pipeline (Swift parity)
+# Main pipeline
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    # params with Swift defaults
+    # params
     lip_segments = int(params.get("lipSegments", 100))
     arc_steps = int(params.get("arcSteps", 24))
     max_lip_radius = float(params.get("maxLipRadius", 0.008))
     min_lip_radius = float(params.get("minLipRadius", 0.003))
     taper_mult = float(params.get("taperMult", 25.0))
-    extrusion_depth = float(params.get("extrusionDepth", -0.008))  # negative to go back in +Z
+    extrusion_depth = float(params.get("extrusionDepth", -0.008))  # negative keeps backward compatibility
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
@@ -296,18 +334,21 @@ def build_triangles(beardline, neckline, params):
         base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
     )
 
-    # Lip surface between rings
-    faces = quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
+    faces = []
+    faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # Skin beardline -> neckline (if provided)
+    # Resample beardline to base Xs and stitch **beardline ↔ first ring** (not to base)
+    beardline_resampled = resample_polyline_by_x(beardline, [bp[0] for bp in base_points])
+    ring0 = first_ring_column(lip_vertices, len(base_points), ring_count)
+    faces += strap_tris_equal_counts(ring0, beardline_resampled)
+
     if neckline:
         faces += skin_beardline_to_neckline(beardline, neckline)
 
-    # Rim seam (first column of rings to base)
-    faces += stitch_first_column_to_base(base_points, lip_vertices, ring_count)
+    # End-caps not needed; extrude will close boundaries with side walls.
 
-    # End caps
-    faces += end_caps(lip_vertices, base_points, ring_count)
+    # Filter degenerates early to reduce bad geometry propagation
+    faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
 
     # Extrude the *surface* to a closed solid
     extruded = extrude_surface_z_solid(faces, extrusion_depth)
@@ -319,8 +360,36 @@ def export_stl_selected(filepath):
     bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
 
 
+def voxel_remesh_if_requested(obj, voxel_size):
+    if voxel_size <= 0:
+        return
+    try:
+        for o in bpy.data.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        # apply scale for consistent voxel size
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
+    except Exception:
+        # Older Blender versions: silently skip
+        pass
+
+
+def report_non_manifold(obj):
+    try:
+        mesh = obj.data
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
+        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
+        bm.free()
+    except Exception:
+        pass
+
+
 def main():
-    # Parse CLI
     argv = sys.argv
     argv = argv[argv.index("--") + 1 :] if "--" in argv else []
     if len(argv) != 2:
@@ -330,7 +399,6 @@ def main():
     with open(input_path, 'r') as f:
         data = json.load(f)
 
-    # Backward-compat for old payloads
     beardline_in = data.get("beardline") or data.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
@@ -344,18 +412,20 @@ def main():
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    # Build triangles with Swift-equivalent pipeline
     tris, thickness = build_triangles(beardline, neckline, params)
 
-    # Create mesh object
     mold_obj = make_mesh_from_tris(tris, name="BeardMold")
 
-    # Deselect all, then select the mold for export
+    # Optional voxel remesh to guarantee watertightness (last-resort)
+    voxel_size = float(params.get("voxelRemesh", 0.0006))  # ~0.6mm default safety
+    voxel_remesh_if_requested(mold_obj, voxel_size)
+
+    report_non_manifold(mold_obj)
+
     for obj in bpy.data.objects:
         obj.select_set(False)
     mold_obj.select_set(True)
 
-    # Optional holes via boolean DIFFERENCE (now Z-aligned & positioned like Swift)
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
