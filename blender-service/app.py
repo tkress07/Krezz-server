@@ -1,73 +1,77 @@
-# file: app.py
-import os, json, tempfile, subprocess, uuid, sys
-from flask import Flask, request, send_file, abort, Response
-
-BLENDER = os.environ.get("BLENDER_BIN", "/usr/bin/blender")
-SCRIPT  = os.environ.get("BLENDER_SCRIPT", "/app/blender_mold_maker.py")
-TIMEOUT_SEC = int(os.environ.get("BLENDER_TIMEOUT", "300"))
+import subprocess
+from flask import Flask, jsonify, request, send_file
+import tempfile
+import uuid
+import os
+import json
 
 app = Flask(__name__)
 
-@app.get("/")
-def root():
-    # Render's default health probe usually hits "/"
-    return Response("ok", mimetype="text/plain")
+# ✅ Health check for Render
+@app.route("/")
+def health():
+    return "OK", 200
 
-@app.get("/healthz")
-def healthz():
-    return Response("ok", mimetype="text/plain")
+@app.route("/blender-version")
+def blender_version():
+    try:
+        out = subprocess.check_output(["blender", "-v"], text=True).strip()
+        return jsonify({"blender_version": out})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-def run_blender(input_json_path: str, output_stl_path: str) -> None:
-    # why: capture logs to server, never to client; enforce timeout so worker won't hang
-    cmd = [BLENDER, "-b", "--python", SCRIPT, "--", input_json_path, output_stl_path]
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=TIMEOUT_SEC,
-    )
-    # Log to server only
-    sys.stdout.write(proc.stdout.decode("utf-8", errors="ignore"))
-    sys.stderr.write(proc.stderr.decode("utf-8", errors="ignore"))
-    if proc.returncode != 0:
-        raise RuntimeError(f"Blender exit code={proc.returncode}")
-    if not os.path.exists(output_stl_path) or os.path.getsize(output_stl_path) == 0:
-        raise RuntimeError("Blender produced no STL")
-
-@app.post("/generate-stl")
+@app.route("/generate-stl", methods=["POST"])
 def generate_stl():
     try:
-        payload = request.get_json(force=True, silent=False)
-    except Exception:
-        return abort(400, "Invalid JSON")
+        data = request.get_json()
+        print("🛬 Received JSON:", data)
 
-    job_id = (payload.get("job_id") or payload.get("jobID") or str(uuid.uuid4())[:8])
+        vertices = data.get("vertices", [])
+        neckline = data.get("neckline", [])
+        overlay = data.get("overlay", "default")
+        job_id = data.get("job_id", uuid.uuid4().hex[:8])  # fallback UUID if not provided
 
-    with tempfile.TemporaryDirectory() as td:
-        in_path  = os.path.join(td, f"input_{job_id}.json")
-        out_path = os.path.join(td, f"output_{job_id}.stl")
+        if not vertices:
+            return jsonify({"error": "No vertices provided"}), 400
 
-        # Compact JSON to reduce IO; no reordering side effects for our use
-        with open(in_path, "w") as f:
-            json.dump(payload, f, separators=(",", ":"))
+        temp_id = uuid.uuid4().hex[:8]
+        input_path = f"/tmp/input_{temp_id}.json"
+        output_path = f"/tmp/output_{temp_id}.stl"
 
-        try:
-            run_blender(in_path, out_path)
-        except subprocess.TimeoutExpired:
-            return abort(504, "Blender timed out")
-        except Exception as e:
-            return abort(500, f"Blender error: {e}")
+        # Write full payload with overlay & job_id
+        with open(input_path, "w") as f:
+            json.dump({
+                "vertices": vertices,
+                "neckline": neckline,
+                "overlay": overlay,
+                "job_id": job_id
+            }, f)
 
-        return send_file(
-            out_path,
-            mimetype="application/octet-stream",
-            as_attachment=True,
-            download_name=f"mold_{job_id}.stl",
-            max_age=0,
-        )
+        print(f"📦 Calling Blender with input: {input_path}, output: {output_path}")
 
-# Local dev only: on Render use Gunicorn (see Procfile)
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+        result = subprocess.run([
+            "blender", "--background", "--python", "generate_stl.py", "--",
+            input_path, output_path
+        ], capture_output=True, text=True, timeout=60)
+
+        print("✅ Blender STDOUT:\n", result.stdout)
+        print("⚠️ Blender STDERR:\n", result.stderr)
+
+        if result.returncode != 0:
+            return jsonify({
+                "error": "Blender failed",
+                "stderr": result.stderr,
+                "stdout": result.stdout
+            }), 500
+
+        if not os.path.exists(output_path):
+            return jsonify({"error": "STL not created", "stderr": result.stderr}), 500
+
+        return send_file(output_path, mimetype="application/octet-stream", as_attachment=True, download_name="mold.stl")
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Blender timed out"}), 504
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": f"Blender crashed", "details": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
