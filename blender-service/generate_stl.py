@@ -168,12 +168,61 @@ def make_mesh_from_tris(tris, name="MoldMesh"):
     return obj
 
 def voxel_remesh_if_requested(obj, voxel_size):
-    if voxel_size <= 0: return
-    for o in bpy.data.objects: o.select_set(False)
+    """
+    Robust voxel remesh that uses the Remesh modifier in VOXEL mode.
+    Works on Blender 3.0.x where object.voxel_remesh kwargs may be unsupported.
+    """
+    try:
+        vs = float(voxel_size)
+    except Exception:
+        return
+    if vs <= 0:
+        return
+
+    # Make obj active & selected
+    for o in bpy.data.objects:
+        o.select_set(False)
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-    bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
+
+    # Apply transforms to avoid scale-dependent voxel size
+    try:
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    except Exception:
+        pass
+
+    # Remove any existing REMESH modifiers so we don't stack them
+    for m in list(obj.modifiers):
+        if m.type == "REMESH":
+            try:
+                bpy.ops.object.modifier_remove(modifier=m.name)
+            except Exception:
+                pass
+
+    # Add & configure Remesh modifier (VOXEL mode)
+    mod = obj.modifiers.new(name="VoxelRemesh", type="REMESH")
+    # VOXEL mode is implicit in 3.0+ when setting 'mode' if available:
+    if hasattr(mod, "mode"):
+        mod.mode = "VOXEL"
+    # Set voxel size (meters)
+    if hasattr(mod, "voxel_size"):
+        mod.voxel_size = vs
+    # Keep sharp features as much as possible
+    if hasattr(mod, "use_remove_disconnected"):
+        mod.use_remove_disconnected = False
+    if hasattr(mod, "use_smooth_shade"):
+        mod.use_smooth_shade = False
+
+    # Apply the modifier
+    bpy.context.view_layer.objects.active = obj
+    try:
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+    except Exception:
+        # Fallback: if applying fails, just leave the mesh as-is
+        try:
+            obj.modifiers.remove(mod)
+        except Exception:
+            pass
 
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
     cutters=[]
