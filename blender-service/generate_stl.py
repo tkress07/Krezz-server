@@ -14,12 +14,17 @@ def to_vec3(p):
     return (float(p['x']), float(p['y']), float(p['z']))
 
 def area2(a, b, c):
-    ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
-    ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
-    cx = ab[1] * ac[2] - ab[2] * ac[1]
-    cy = ab[2] * ac[0] - ab[0] * ac[2]
-    cz = ab[0] * ac[1] - ab[1] * ac[0]
-    return cx * cx + cy * cy + cz * cz
+    ab = (b[0]-a[0], b[1]-a[1], b[2]-a[2])
+    ac = (c[0]-a[0], c[1]-a[1], c[2]-a[2])
+    cx = ab[1]*ac[2] - ab[2]*ac[1]
+    cy = ab[2]*ac[0] - ab[0]*ac[2]
+    cz = ab[0]*ac[1] - ab[1]*ac[0]
+    return cx*cx + cy*cy + cz*cz
+
+def tri_min_edge_len2(a, b, c):
+    # Why: drop micro-sliver faces that slicers can't fill
+    def d2(p, q): return (p[0]-q[0])**2 + (p[1]-q[1])**2 + (p[2]-q[2])**2
+    return min(d2(a,b), d2(b,c), d2(c,a))
 
 def smooth_vertices_open(vertices, passes=1):
     if len(vertices) < 3 or passes <= 0:
@@ -41,7 +46,7 @@ def sample_base_points_along_x(beardline, lip_segments):
     ys = [p[1] for p in beardline]
     zs = [p[2] for p in beardline]
     minX = min(xs) if xs else -0.05
-    maxX = max(xs) if xs else 0.05
+    maxX = max(xs) if xs else  0.05
     seg_w = (maxX - minX) / max(1, (lip_segments - 1))
     fallbackY = max(ys) if ys else 0.03
     fallbackZ = (sum(zs) / len(zs)) if zs else 0.0
@@ -50,10 +55,7 @@ def sample_base_points_along_x(beardline, lip_segments):
     for i in range(lip_segments):
         x = minX + i * seg_w
         top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
-        if top is not None:
-            base.append((x, top[1], top[2]))
-        else:
-            base.append((x, fallbackY, fallbackZ))
+        base.append((x, top[1], top[2]) if top is not None else (x, fallbackY, fallbackZ))
     return base, minX, maxX
 
 def tapered_radius(x, centerX, min_r, max_r, taper_mult):
@@ -117,16 +119,14 @@ def strap_tris_equal_counts(A, B):
     return faces
 
 # ---------------------------
-# Solid, manifold extrusion (with configurable weld)
+# Solid, manifold extrusion (with unified weld)
 # ---------------------------
 
 def _rounded_key(p, eps):
-    # Crucial: unify vertices across separately-built regions
+    # Why: unify vertices across separately-built regions
     return (round(p[0] / eps) * eps, round(p[1] / eps) * eps, round(p[2] / eps) * eps)
 
 def extrude_surface_z_solid(tri_faces, depth, weld_eps):
-    """Extrude a triangle surface by `depth` along +Z and close boundary edges.
-    Uses a shared vertex map with configurable welding epsilon."""
     v2i = {}
     verts = []
     tris_idx = []
@@ -135,67 +135,65 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps):
         k = _rounded_key(p, weld_eps)
         i = v2i.get(k)
         if i is None:
-            i = len(verts)
-            v2i[k] = i
-            verts.append(k)
+            i = len(verts); v2i[k] = i; verts.append(k)
         return i
 
     for a, b, c in tri_faces:
         ia = idx_of(a); ib = idx_of(b); ic = idx_of(c)
         tris_idx.append((ia, ib, ic))
 
-    # boundary edges on the front sheet
+    # boundary edges
     edge_count = {}
     edge_dir = {}
     for ia, ib, ic in tris_idx:
         for (u, v) in ((ia, ib), (ib, ic), (ic, ia)):
             ue = (min(u, v), max(u, v))
             edge_count[ue] = edge_count.get(ue, 0) + 1
-            if ue not in edge_dir:
-                edge_dir[ue] = (u, v)
+            if ue not in edge_dir: edge_dir[ue] = (u, v)
     boundary = [ue for ue, c in edge_count.items() if c == 1]
 
     back_offset = len(verts)
     back_verts = [(x, y, z + depth) for (x, y, z) in verts]
 
     out = []
+    # front + back
     for ia, ib, ic in tris_idx:
         out.append((verts[ia], verts[ib], verts[ic]))
         ja, jb, jc = ia + back_offset, ib + back_offset, ic + back_offset
         out.append((back_verts[jc - back_offset], back_verts[jb - back_offset], back_verts[ja - back_offset]))
-
+    # sides
     for ue in boundary:
         u, v = edge_dir[ue]
         ju, jv = u + back_offset, v + back_offset
         out.append((verts[u], verts[v], back_verts[jv - back_offset]))
         out.append((verts[u], back_verts[jv - back_offset], back_verts[ju - back_offset]))
-
     return out
 
-def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=5e-5):
-    """Create mesh, then clean to guarantee watertightness for slicing."""
+def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4):
+    """Create mesh, then clean to guarantee watertightness for slicing.
+    weld_eps default ~0.2mm. min_feature ~0.3mm (≈ 70% of 0.42mm nozzle)."""
     v2i = {}
     verts = []
     faces = []
+    min_edge2 = min_feature * min_feature
 
-    def key(p):
-        return _rounded_key(p, weld_eps)
+    def key(p): return _rounded_key(p, weld_eps)
 
     for (a, b, c) in tris:
+        if tri_min_edge_len2(a, b, c) < min_edge2:
+            continue  # drop slivers → prevents slicer micro-gaps
         ids = []
         for p in (a, b, c):
             k = key(p)
             if k not in v2i:
-                v2i[k] = len(verts)
-                verts.append(k)
+                v2i[k] = len(verts); verts.append(k)
             ids.append(v2i[k])
         if area2(verts[ids[0]], verts[ids[1]], verts[ids[2]]) > 1e-18:
             faces.append(tuple(ids))
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
-    mesh.validate(verbose=False)
-    mesh.update()
+    mesh.validate(verbose=False); mesh.update()
 
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
@@ -203,25 +201,22 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=5e-5):
     try:
         bm = bmesh.new()
         bm.from_mesh(mesh)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps)  # ↑ looser, slicer-safe
-        bmesh.ops.dissolve_degenerate(bm, dist=weld_eps * 0.2)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps)
+        bmesh.ops.dissolve_degenerate(bm, dist=weld_eps * 0.25)
         boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
         if boundary_edges:
             bmesh.ops.holes_fill(bm, edges=boundary_edges)
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
         bmesh.ops.triangulate(bm, faces=bm.faces)
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.validate(verbose=False)
-        mesh.update()
+        bm.to_mesh(mesh); bm.free()
+        mesh.validate(verbose=False); mesh.update()
     except Exception:
         pass
 
     try:
         view = bpy.context.view_layer
         view.objects.active = obj
-        for o in bpy.data.objects:
-            o.select_set(False)
+        for o in bpy.data.objects: o.select_set(False)
         obj.select_set(True)
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
@@ -239,18 +234,46 @@ def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=
         depth = float(thickness)
         center_z = z - (embed_offset + depth / 2.0)
         bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
-        cyl = bpy.context.active_object
-        cylinders.append(cyl)
+        cylinders.append(bpy.context.active_object)
     return cylinders
 
 def apply_boolean_difference(target_obj, cutters):
+    # Why: EXACT solver avoids paper-thin residuals on near-coincident faces
     bpy.context.view_layer.objects.active = target_obj
     for cutter in cutters:
         mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
         mod.operation = 'DIFFERENCE'
         mod.object = cutter
+        mod.solver = 'EXACT'
+        mod.double_threshold = 1e-6
         bpy.ops.object.modifier_apply(modifier=mod.name)
         bpy.data.objects.remove(cutter, do_unlink=True)
+
+def export_stl_selected(filepath):
+    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
+
+def voxel_remesh_if_requested(obj, voxel_size):
+    if voxel_size <= 0:
+        return
+    try:
+        for o in bpy.data.objects: o.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
+    except Exception:
+        pass  # older Blender versions
+
+def report_non_manifold(obj):
+    try:
+        mesh = obj.data
+        bm = bmesh.new(); bm.from_mesh(mesh)
+        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
+        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
+        bm.free()
+    except Exception:
+        pass
 
 # ---------------------------
 # Main pipeline
@@ -260,12 +283,12 @@ def build_triangles(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    lip_segments = int(params.get("lipSegments", 100))
-    arc_steps = int(params.get("arcSteps", 24))
-    max_lip_radius = float(params.get("maxLipRadius", 0.008))
-    min_lip_radius = float(params.get("minLipRadius", 0.003))
-    taper_mult = float(params.get("taperMult", 25.0))
-    extrusion_depth = float(params.get("extrusionDepth", -0.008))
+    lip_segments     = int(params.get("lipSegments", 100))
+    arc_steps        = int(params.get("arcSteps", 24))
+    max_lip_radius   = float(params.get("maxLipRadius", 0.008))
+    min_lip_radius   = float(params.get("minLipRadius", 0.003))
+    taper_mult       = float(params.get("taperMult", 25.0))
+    extrusion_depth  = float(params.get("extrusionDepth", -0.008))
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
@@ -287,40 +310,9 @@ def build_triangles(beardline, neckline, params):
         faces += strap_tris_equal_counts(beard_X, neck_X)
 
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
-
-    # NOTE: weld_eps used inside extrusion to guarantee shared verts across regions
-    weld_eps = float(params.get("weldEps", 5e-5))
+    weld_eps = float(params.get("weldEps", 2e-4))  # ↑ 0.2mm default (slicer-safe)
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
-
     return extruded, abs(extrusion_depth)
-
-def export_stl_selected(filepath):
-    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
-
-def voxel_remesh_if_requested(obj, voxel_size):
-    if voxel_size <= 0:
-        return
-    try:
-        for o in bpy.data.objects:
-            o.select_set(False)
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
-    except Exception:
-        pass  # older Blender versions
-
-def report_non_manifold(obj):
-    try:
-        mesh = obj.data
-        bm = bmesh.new()
-        bm.from_mesh(mesh)
-        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
-        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
-        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
-        bm.free()
-    except Exception:
-        pass
 
 def main():
     argv = sys.argv
@@ -345,18 +337,20 @@ def main():
     holes_in = data.get("holeCenters") or data.get("holes") or []
     params = data.get("params", {})
 
-    tris, thickness = build_triangles(beardline, neckline, params)
+    # unify key manufacturing parameters (sane defaults for 0.4mm nozzle)
+    nozzle = float(params.get("nozzle", 0.0004))      # meters
+    weld_eps = float(params.get("weldEps", 2e-4))     # 0.2mm
+    min_feature = float(params.get("minFeature", 3e-4))  # 0.3mm
 
-    weld_eps = float(params.get("weldEps", 5e-5))
-    mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_eps=weld_eps)
+    tris, thickness = build_triangles(beardline, neckline, {
+        **params, "weldEps": weld_eps
+    })
 
-    voxel_size = float(params.get("voxelRemesh", 0.0006))
-    voxel_remesh_if_requested(mold_obj, voxel_size)
+    mold_obj = make_mesh_from_tris(tris, name="BeardMold",
+                                   weld_eps=weld_eps,
+                                   min_feature=min_feature)
 
-    report_non_manifold(mold_obj)
-
-    for obj in bpy.data.objects:
-        obj.select_set(False)
+    for obj in bpy.data.objects: obj.select_set(False)
     mold_obj.select_set(True)
 
     if holes_in:
@@ -365,15 +359,23 @@ def main():
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
 
+    # Remesh AFTER booleans at ≥ nozzle width
+    voxel_size = float(params.get("voxelRemesh", max(nozzle, 0.0005)))
+    voxel_remesh_if_requested(mold_obj, voxel_size)
+
+    report_non_manifold(mold_obj)
+
+    for obj in bpy.data.objects: obj.select_set(False)
+    mold_obj.select_set(True)
     export_stl_selected(output_path)
 
     print(
-        f"STL export complete for job ID: {data.get('jobID','N/A')} "
+        f"STL export complete for job ID: {data.get('job_id','N/A')} "
         f"overlay: {data.get('overlay','N/A')} "
         f"verts(beardline)={len(beardline)} "
         f"neckline={len(neckline)} "
         f"holes={len(holes_in)} "
-        f"weld_eps={weld_eps}"
+        f"weld_eps={weld_eps} voxel={voxel_size} min_feature={min_feature}"
     )
 
 if __name__ == "__main__":
