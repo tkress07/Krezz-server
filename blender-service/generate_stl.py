@@ -1,4 +1,6 @@
 # file: blender_service_fixed_weld.py
+# Python 3.x • Blender 3.x API
+
 import bpy
 import bmesh
 import json
@@ -118,58 +120,15 @@ def strap_tris_equal_counts(A, B):
     return faces
 
 # ---------------------------
-# Solid, manifold extrusion (with unified weld)
+# Mesh building & cleanup
 # ---------------------------
 
 def _rounded_key(p, eps):
     return (round(p[0] / eps) * eps, round(p[1] / eps) * eps, round(p[2] / eps) * eps)
 
-def extrude_surface_z_solid(tri_faces, depth, weld_eps):
-    v2i = {}
-    verts = []
-    tris_idx = []
-
-    def idx_of(p):
-        k = _rounded_key(p, weld_eps)
-        i = v2i.get(k)
-        if i is None:
-            i = len(verts); v2i[k] = i; verts.append(k)
-        return i
-
-    for a, b, c in tri_faces:
-        ia = idx_of(a); ib = idx_of(b); ic = idx_of(c)
-        tris_idx.append((ia, ib, ic))
-
-    # boundary edges
-    edge_count = {}
-    edge_dir = {}
-    for ia, ib, ic in tris_idx:
-        for (u, v) in ((ia, ib), (ib, ic), (ic, ia)):
-            ue = (min(u, v), max(u, v))
-            edge_count[ue] = edge_count.get(ue, 0) + 1
-            if ue not in edge_dir: edge_dir[ue] = (u, v)
-    boundary = [ue for ue, c in edge_count.items() if c == 1]
-
-    back_offset = len(verts)
-    back_verts = [(x, y, z + depth) for (x, y, z) in verts]
-
-    out = []
-    # front + back
-    for ia, ib, ic in tris_idx:
-        out.append((verts[ia], verts[ib], verts[ic]))
-        ja, jb, jc = ia + back_offset, ib + back_offset, ic + back_offset
-        out.append((back_verts[jc - back_offset], back_verts[jb - back_offset], back_verts[ja - back_offset]))
-    # sides
-    for ue in boundary:
-        u, v = edge_dir[ue]
-        ju, jv = u + back_offset, v + back_offset
-        out.append((verts[u], verts[v], back_verts[jv - back_offset]))
-        out.append((verts[u], back_verts[jv - back_offset], back_verts[ju - back_offset]))
-    return out
-
 def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4):
-    """Create mesh, then clean to guarantee watertightness for slicing.
-    weld_eps default ~0.2mm. min_feature ~0.3mm (≈ 70% of 0.42mm nozzle)."""
+    """Create a surface mesh and clean it to prep for Solidify.
+    weld_eps ~0.2–0.5 mm; min_feature ~0.3–0.6 mm."""
     v2i = {}
     verts = []
     faces = []
@@ -196,6 +155,7 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
 
+    # Light geometry cleanup on the surface
     try:
         bm = bmesh.new()
         bm.from_mesh(mesh)
@@ -204,6 +164,8 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4
         boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
         if boundary_edges:
             bmesh.ops.holes_fill(bm, edges=boundary_edges)
+        # Optional: clean slivers
+        bmesh.ops.dissolve_limit(bm, angle_limit=0.005, use_dissolve_boundaries=False, verts=bm.verts)
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
         bmesh.ops.triangulate(bm, faces=bm.faces)
         bm.to_mesh(mesh); bm.free()
@@ -211,6 +173,7 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4
     except Exception:
         pass
 
+    # Ensure outward normals
     try:
         view = bpy.context.view_layer
         view.objects.active = obj
@@ -225,8 +188,33 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4
 
     return obj
 
-def export_stl_selected(filepath):
-    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
+def apply_weld(obj, merge_dist):
+    try:
+        mod = obj.modifiers.new(name="Weld", type='WELD')
+        mod.merge_threshold = float(merge_dist)
+        bpy.context.view_layer.objects.active = obj
+        for o in bpy.data.objects: o.select_set(False)
+        obj.select_set(True)
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+    except Exception:
+        pass
+
+def solidify_and_seal(obj, thickness, merge_thresh):
+    try:
+        mod = obj.modifiers.new(name="Solid", type='SOLIDIFY')
+        mod.thickness = float(thickness)
+        mod.offset = -1.0              # thicken “down” into the mold
+        mod.use_rim = True             # close open borders
+        mod.use_quality_normals = True
+        mod.use_even_offset = True
+        mod.use_merge_vertices = True  # MERGE while creating thickness
+        mod.merge_threshold = float(merge_thresh)
+        bpy.context.view_layer.objects.active = obj
+        for o in bpy.data.objects: o.select_set(False)
+        obj.select_set(True)
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+    except Exception:
+        pass
 
 def voxel_remesh_if_requested(obj, voxel_size):
     if voxel_size <= 0:
@@ -251,8 +239,11 @@ def report_non_manifold(obj):
     except Exception:
         pass
 
+def export_stl_selected(filepath):
+    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
+
 # ---------------------------
-# Main pipeline
+# Build triangles (SURFACE ONLY)
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
@@ -264,7 +255,7 @@ def build_triangles(beardline, neckline, params):
     max_lip_radius   = float(params.get("maxLipRadius", 0.008))
     min_lip_radius   = float(params.get("minLipRadius", 0.003))
     taper_mult       = float(params.get("taperMult", 25.0))
-    extrusion_depth  = float(params.get("extrusionDepth", -0.008))
+    extrusion_depth  = float(params.get("extrusionDepth", -0.008))  # thickness magnitude
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
@@ -286,9 +277,12 @@ def build_triangles(beardline, neckline, params):
         faces += strap_tris_equal_counts(beard_X, neck_X)
 
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
-    weld_eps = float(params.get("weldEps", 2e-4))
-    extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
-    return extruded, abs(extrusion_depth)
+    thickness = abs(extrusion_depth)  # we’ll add thickness later via Solidify
+    return faces, thickness
+
+# ---------------------------
+# Main pipeline
+# ---------------------------
 
 def main():
     argv = sys.argv
@@ -310,28 +304,30 @@ def main():
     if neckline:
         neckline = smooth_vertices_open(neckline, passes=3)
 
-    # NOTE: holeCenters (if present) are intentionally ignored to avoid booleans
+    # NOTE: holeCenters (if present) are intentionally ignored (no booleans)
     _holes_ignored = data.get("holeCenters") or data.get("holes") or []
 
     params = data.get("params", {})
 
-    nozzle = float(params.get("nozzle", 0.0004))          # meters
-    weld_eps = float(params.get("weldEps", 2e-4))         # 0.2mm
-    min_feature = float(params.get("minFeature", 3e-4))   # 0.3mm
+    nozzle       = float(params.get("nozzle", 0.0004))          # meters
+    weld_eps     = float(params.get("weldEps", 4e-4))           # 0.4 mm default here
+    min_feature  = float(params.get("minFeature", 4.5e-4))      # ≥ ~nozzle size
+    voxel_size   = float(params.get("voxelRemesh", max(nozzle*1.5, 0.0006)))
 
-    tris, thickness = build_triangles(beardline, neckline, {
-        **params, "weldEps": weld_eps
-    })
+    tris, thickness = build_triangles(beardline, neckline, params)
 
-    mold_obj = make_mesh_from_tris(tris, name="BeardMold",
+    # 1) Make surface and clean
+    mold_obj = make_mesh_from_tris(tris, name="BeardMoldSurf",
                                    weld_eps=weld_eps,
                                    min_feature=min_feature)
 
-    for obj in bpy.data.objects: obj.select_set(False)
-    mold_obj.select_set(True)
+    # 2) Weld on surface to eliminate near-duplicate borders
+    apply_weld(mold_obj, merge_dist=max(weld_eps, 0.00035))
 
-    # Remesh at ≥ nozzle width (no booleans involved anymore)
-    voxel_size = float(params.get("voxelRemesh", max(nozzle, 0.0005)))
+    # 3) Solidify with vertex merge at rims (creates ONE closed shell)
+    solidify_and_seal(mold_obj, thickness, merge_thresh=max(weld_eps, 0.0005))
+
+    # 4) Voxel remesh at ≥ 1.5× nozzle to erase micro seams
     voxel_remesh_if_requested(mold_obj, voxel_size)
 
     report_non_manifold(mold_obj)
@@ -346,7 +342,7 @@ def main():
         f"verts(beardline)={len(beardline)} "
         f"neckline={len(neckline)} "
         f"holes_ignored={len(_holes_ignored)} "
-        f"weld_eps={weld_eps} voxel={voxel_size} min_feature={min_feature}"
+        f"weld_eps={weld_eps} voxel={voxel_size} min_feature={min_feature} thickness={thickness}"
     )
 
 if __name__ == "__main__":
