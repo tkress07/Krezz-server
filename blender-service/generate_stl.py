@@ -227,7 +227,7 @@ def clean_mesh(obj, weld_eps):
     bmesh.ops.triangulate(bm, faces=bm.faces)
 
     bm.to_mesh(mesh); bm.free()
-    mesh.validate(False); mesh.update()
+    mesh.validate(verbose=False); mesh.update()
 
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
     cylinders = []
@@ -310,7 +310,6 @@ def voxel_remesh_if_requested(obj, voxel_size):
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
     except Exception:
-        # older Blender versions or unavailable operator
         pass
 
 def report_non_manifold(obj):
@@ -367,7 +366,6 @@ def main():
 
     report_non_manifold(mold_obj)
 
-    # select and export
     for obj in bpy.data.objects:
         obj.select_set(False)
     mold_obj.select_set(True)
