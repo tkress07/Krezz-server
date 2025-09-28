@@ -1,4 +1,4 @@
-# file: blender_service_watertight.py
+# file: blender_service_watertight_swiftmatch.py
 import bpy
 import bmesh
 import json
@@ -7,10 +7,9 @@ import math
 from mathutils import Vector
 
 # ========= Tunables (good defaults for 0.4 mm nozzle) =========
-SLICE_NOZZLE      = 0.0004        # 0.40 mm (meters)
 WELD_EPS_DEFAULT  = 0.0002        # 0.20 mm shared-vertex tolerance
 AREA_MIN          = 1e-14         # drop ultra-skinny sliver tris early
-VOXEL_DEFAULT     = 0.0           # OFF by default; use 0.0008-0.001 if needed
+VOXEL_DEFAULT     = 0.0           # OFF by default; use 0.0008–0.001 if needed
 # ===============================================================
 
 # ---------------------------
@@ -90,9 +89,6 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
             faces.append([a, c, b])
             faces.append([b, c, d])
     return faces
-
-def first_ring_column(lip_vertices, base_count, ring_count):
-    return [lip_vertices[i * ring_count + 0] for i in range(base_count)]
 
 def resample_polyline_by_x(points, xs):
     if not points:
@@ -180,7 +176,6 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps):
     return out
 
 def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
-    """Create mesh, then initial clean to ensure watertightness."""
     v2i, verts, faces = {}, [], []
 
     def key(p): return _rounded_key(p, weld_eps)
@@ -198,15 +193,13 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([Vector(v) for v in verts], [], faces)
-    mesh.validate(verbose=False); mesh.update()
+    mesh.validate(verbose=True); mesh.update()
 
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
-
     return obj
 
 def clean_mesh(obj, weld_eps):
-    """Two-stage merge + dissolve + fill any boundary holes, retriangulate."""
     mesh = obj.data
     bm = bmesh.new()
     bm.from_mesh(mesh)
@@ -227,7 +220,7 @@ def clean_mesh(obj, weld_eps):
     bmesh.ops.triangulate(bm, faces=bm.faces)
 
     bm.to_mesh(mesh); bm.free()
-    mesh.validate(verbose=False); mesh.update()
+    mesh.validate(verbose=True); mesh.update()
 
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
     cylinders = []
@@ -250,7 +243,7 @@ def apply_boolean_difference(target_obj, cutters):
         bpy.data.objects.remove(cutter, do_unlink=True)
 
 # ---------------------------
-# Build triangles from polylines
+# Build triangles (Swift-parity)
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
@@ -264,29 +257,39 @@ def build_triangles(beardline, neckline, params):
     taper_mult      = float(params.get("taperMult", 25.0))
     extrusion_depth = float(params.get("extrusionDepth", -0.008))
 
+    # 1) Base points sampled by X (Swift: basePoints ~ beardline “tops”)
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
 
+    # 2) Lip rings from base points
     lip_vertices, ring_count = generate_lip_rings(
         base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
     )
 
     faces = []
+    # 2a) Quads between lip rings (ring0↔ring1, ring1↔ring2, ...)
     faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    xs = [bp[0] for bp in base_points]
-    beard_X = resample_polyline_by_x(beardline, xs)
-    ring0 = first_ring_column(lip_vertices, len(base_points), ring_count)
-    faces += strap_tris_equal_counts(ring0, beard_X)
+    # 2b) **Cap basePoints ↔ ring0** (this matches your Swift faces)
+    for i in range(len(base_points) - 1):
+        a = base_points[i]
+        b = base_points[i + 1]
+        c = lip_vertices[i * ring_count + 0]
+        d = lip_vertices[(i + 1) * ring_count + 0]
+        faces.append([a, c, b])
+        faces.append([b, c, d])
 
+    # 3) Separate strap: beardline ↔ neckline (no join to lip)
     if neckline:
-        neck_X = resample_polyline_by_x(neckline, xs)
+        xs = [bp[0] for bp in base_points]
+        beard_X = resample_polyline_by_x(beardline, xs)
+        neck_X  = resample_polyline_by_x(neckline, xs)
         faces += strap_tris_equal_counts(beard_X, neck_X)
 
-    # drop ultra-skinny slivers early
+    # Clean out razor-thin slivers
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
 
-    # consistent weld for the whole sheet prior to extrusion
+    # Consistent weld for the whole sheet prior to extrusion
     weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
 
