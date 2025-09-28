@@ -1,14 +1,13 @@
-# file: blender_service_watertight_swiftparity.py
+# file: blender_service_unionized.py
 import bpy, bmesh, json, sys, math
 from mathutils import Vector
 
-# ===== Good defaults for 0.4 mm nozzle =====
-WELD_EPS_DEFAULT = 0.00025   # 0.25 mm shared-vertex tolerance
-AREA_MIN         = 1e-14     # drop ultra-skinny sliver tris early
-VOXEL_DEFAULT    = 0.0       # OFF by default; if needed use 0.0008–0.0010
-# ===========================================
+# ===== Robust, slicer-safe defaults =====
+WELD_EPS_DEFAULT = 0.0004    # 0.40 mm shared-vertex tolerance
+AREA_MIN         = 1e-12     # cull ultra-thin slivers earlier
+VOXEL_DEFAULT    = 0.0010    # 1.0 mm voxel union (OFF if you set 0.0 in params)
+# =======================================
 
-# ----------------- helpers -----------------
 def to_vec3(p): return (float(p['x']), float(p['y']), float(p['z']))
 
 def area2(a, b, c):
@@ -55,7 +54,7 @@ def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult
         for j in range(ring_count):
             angle = math.pi * (j/float(arc_steps))
             y = by - r*(1.0 - math.sin(angle))
-            z = bz + r*math.cos(angle) + prelift  # <— tiny lift to avoid coplanar z
+            z = bz + r*math.cos(angle) + prelift
             verts.append((bx, y, z))
     return verts, ring_count
 
@@ -70,28 +69,22 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
             faces.append([a, c, b]); faces.append([b, c, d])
     return faces
 
-def _rounded_key(p, eps):
-    return (round(p[0]/eps)*eps, round(p[1]/eps)*eps, round(p[2]/eps)*eps)
-
-# ---------- Swift-style nearest-neighbor strap ----------
 def strap_beardline_to_neckline_swift(beard, neck):
-    """Mirror Swift: for each consecutive pair in beardline, find nearest
-    indices in neckline for each endpoint and make two tris."""
     if len(beard) < 2 or len(neck) < 2: return []
     faces = []
-    # precompute for speed
-    import math
-    def dist2(a,b): dx=a[0]-b[0]; dy=a[1]-b[1]; dz=a[2]-b[2]; return dx*dx+dy*dy+dz*dz
+    def d2(a,b): dx=a[0]-b[0]; dy=a[1]-b[1]; dz=a[2]-b[2]; return dx*dx+dy*dy+dz*dz
     for i in range(len(beard)-1):
         b0, b1 = beard[i], beard[i+1]
-        n0i = min(range(len(neck)), key=lambda k: dist2(neck[k], b0))
-        n1i = min(range(len(neck)), key=lambda k: dist2(neck[k], b1))
+        n0i = min(range(len(neck)), key=lambda k: d2(neck[k], b0))
+        n1i = min(range(len(neck)), key=lambda k: d2(neck[k], b1))
         n0, n1 = neck[n0i], neck[n1i]
         faces.append([b0, n0, b1])
         faces.append([n0, n1, b1])
     return faces
 
-# --------------- extrusion & mesh build ---------------
+def _rounded_key(p, eps):
+    return (round(p[0]/eps)*eps, round(p[1]/eps)*eps, round(p[2]/eps)*eps)
+
 def extrude_surface_z_solid(tri_faces, depth, weld_eps):
     v2i, verts, tris_idx = {}, [], []
     def idx_of(p):
@@ -101,14 +94,12 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps):
         return i
     for a,b,c in tri_faces:
         ia=idx_of(a); ib=idx_of(b); ic=idx_of(c); tris_idx.append((ia,ib,ic))
-
     edge_count, edge_dir = {}, {}
     for ia,ib,ic in tris_idx:
         for (u,v) in ((ia,ib),(ib,ic),(ic,ia)):
             ue=(min(u,v),max(u,v)); edge_count[ue]=edge_count.get(ue,0)+1
             if ue not in edge_dir: edge_dir[ue]=(u,v)
     boundary=[ue for ue,c in edge_count.items() if c==1]
-
     back_offset=len(verts)
     back_verts=[(x,y,z+depth) for (x,y,z) in verts]
     out=[]
@@ -171,7 +162,6 @@ def apply_boolean_difference(target_obj, cutters):
         bpy.ops.object.modifier_apply(modifier=mod.name)
         bpy.data.objects.remove(cutter, do_unlink=True)
 
-# --------------- build triangles (Swift parity) ---------------
 def build_triangles(beardline, neckline, params):
     if not beardline: raise ValueError("Empty beardline supplied.")
     lip_segments    = int(params.get("lipSegments", 100))
@@ -180,7 +170,7 @@ def build_triangles(beardline, neckline, params):
     min_lip_radius  = float(params.get("minLipRadius", 0.003))
     taper_mult      = float(params.get("taperMult", 25.0))
     extrusion_depth = float(params.get("extrusionDepth", -0.008))
-    prelift         = float(params.get("prelift", 0.0003))  # tiny raise to avoid coplanar z
+    prelift         = float(params.get("prelift", 0.0005))  # a hair more prelift
 
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5*(minX+maxX)
@@ -190,15 +180,12 @@ def build_triangles(beardline, neckline, params):
     )
 
     faces=[]
-    # lip ring quads
     faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
-
-    # basePoints ↔ first ring cap (Swift: faces.append([a,c,b]); faces.append([b,c,d]))
-    for i in range(len(base_points)-1):
-        a = base_points[i]; b = base_points[i+1]
-        c = lip_vertices[i*ring_count + 0]
-        d = lip_vertices[(i+1)*ring_count + 0]
-        faces.append([a, c, b]); faces.append([b, c, d])
+    for i in range(len(base_points)-1):  # base ↔ ring0 cap
+        a=base_points[i]; b=base_points[i+1]
+        c=lip_vertices[i*ring_count + 0]
+        d=lip_vertices[(i+1)*ring_count + 0]
+        faces.append([a,c,b]); faces.append([b,c,d])
 
     # end fans (Swift end-caps)
     if base_points:
@@ -212,7 +199,6 @@ def build_triangles(beardline, neckline, params):
             a = lip_vertices[start_idx + j]; b = lip_vertices[start_idx + j + 1]
             faces.append([a, b, last_base])
 
-    # beardline ↔ neckline (Swift nearest-neighbor method)
     if neckline:
         faces += strap_beardline_to_neckline_swift(beardline, neckline)
 
@@ -221,7 +207,6 @@ def build_triangles(beardline, neckline, params):
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
     return extruded, abs(extrusion_depth), weld_eps
 
-# -------------------- main pipeline --------------------
 def export_stl_selected(filepath):
     bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
 
@@ -237,8 +222,8 @@ def voxel_remesh_if_requested(obj, voxel_size):
 def report_non_manifold(obj):
     try:
         mesh=obj.data; bm=bmesh.new(); bm.from_mesh(mesh)
-        nonman = [e for e in bm.edges if len(e.link_faces) not in (1,2)]
-        bound  = [e for e in bm.edges if len(e.link_faces)==1]
+        nonman=[e for e in bm.edges if len(e.link_faces) not in (1,2)]
+        bound=[e for e in bm.edges if len(e.link_faces)==1]
         print(f"Non-manifold edges: {len(nonman)} | Boundary edges: {len(bound)}")
         bm.free()
     except Exception: pass
@@ -261,10 +246,10 @@ def main():
     params = data.get("params", {})
 
     tris, thickness, weld_eps = build_triangles(beardline, neckline, params)
-
     mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_eps=weld_eps)
     clean_mesh(mold_obj, weld_eps)
 
+    # *** Unionize topology at slicer-visible scale ***
     voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))
     voxel_remesh_if_requested(mold_obj, voxel_size)
     if voxel_size > 0: clean_mesh(mold_obj, weld_eps)
@@ -283,9 +268,8 @@ def main():
 
     print(
         f"STL export complete for job ID: {data.get('job_id', data.get('jobID','N/A'))} "
-        f"overlay: {data.get('overlay','N/A')} "
-        f"verts(beardline)={len(beardline)} neckline={len(neckline)} "
-        f"holes={len(holes_in)} weld_eps={weld_eps} voxel={voxel_size}"
+        f"overlay: {data.get('overlay','N/A')} verts(beardline)={len(beardline)} "
+        f"neckline={len(neckline)} holes={len(holes_in)} weld_eps={weld_eps} voxel={voxel_size}"
     )
 
 if __name__ == "__main__":
