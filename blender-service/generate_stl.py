@@ -22,7 +22,6 @@ def area2(a, b, c):
     return cx*cx + cy*cy + cz*cz
 
 def tri_min_edge_len2(a, b, c):
-    # Why: drop micro-sliver faces that slicers can't fill
     def d2(p, q): return (p[0]-q[0])**2 + (p[1]-q[1])**2 + (p[2]-q[2])**2
     return min(d2(a,b), d2(b,c), d2(c,a))
 
@@ -123,7 +122,6 @@ def strap_tris_equal_counts(A, B):
 # ---------------------------
 
 def _rounded_key(p, eps):
-    # Why: unify vertices across separately-built regions
     return (round(p[0] / eps) * eps, round(p[1] / eps) * eps, round(p[2] / eps) * eps)
 
 def extrude_surface_z_solid(tri_faces, depth, weld_eps):
@@ -181,7 +179,7 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4
 
     for (a, b, c) in tris:
         if tri_min_edge_len2(a, b, c) < min_edge2:
-            continue  # drop slivers → prevents slicer micro-gaps
+            continue
         ids = []
         for p in (a, b, c):
             k = key(p)
@@ -226,28 +224,6 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=2e-4, min_feature=3.0e-4
         pass
 
     return obj
-
-def create_cylinders_z_aligned(holes, thickness, radius=0.0015875, embed_offset=0.0025):
-    cylinders = []
-    for h in holes:
-        x, y, z = to_vec3(h)
-        depth = float(thickness)
-        center_z = z - (embed_offset + depth / 2.0)
-        bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=(x, y, center_z))
-        cylinders.append(bpy.context.active_object)
-    return cylinders
-
-def apply_boolean_difference(target_obj, cutters):
-    # Why: EXACT solver avoids paper-thin residuals on near-coincident faces
-    bpy.context.view_layer.objects.active = target_obj
-    for cutter in cutters:
-        mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
-        mod.operation = 'DIFFERENCE'
-        mod.object = cutter
-        mod.solver = 'EXACT'
-        mod.double_threshold = 1e-6
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-        bpy.data.objects.remove(cutter, do_unlink=True)
 
 def export_stl_selected(filepath):
     bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
@@ -310,7 +286,7 @@ def build_triangles(beardline, neckline, params):
         faces += strap_tris_equal_counts(beard_X, neck_X)
 
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > 1e-18]
-    weld_eps = float(params.get("weldEps", 2e-4))  # ↑ 0.2mm default (slicer-safe)
+    weld_eps = float(params.get("weldEps", 2e-4))
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
     return extruded, abs(extrusion_depth)
 
@@ -334,13 +310,14 @@ def main():
     if neckline:
         neckline = smooth_vertices_open(neckline, passes=3)
 
-    holes_in = data.get("holeCenters") or data.get("holes") or []
+    # NOTE: holeCenters (if present) are intentionally ignored to avoid booleans
+    _holes_ignored = data.get("holeCenters") or data.get("holes") or []
+
     params = data.get("params", {})
 
-    # unify key manufacturing parameters (sane defaults for 0.4mm nozzle)
-    nozzle = float(params.get("nozzle", 0.0004))      # meters
-    weld_eps = float(params.get("weldEps", 2e-4))     # 0.2mm
-    min_feature = float(params.get("minFeature", 3e-4))  # 0.3mm
+    nozzle = float(params.get("nozzle", 0.0004))          # meters
+    weld_eps = float(params.get("weldEps", 2e-4))         # 0.2mm
+    min_feature = float(params.get("minFeature", 3e-4))   # 0.3mm
 
     tris, thickness = build_triangles(beardline, neckline, {
         **params, "weldEps": weld_eps
@@ -353,13 +330,7 @@ def main():
     for obj in bpy.data.objects: obj.select_set(False)
     mold_obj.select_set(True)
 
-    if holes_in:
-        radius = float(params.get("holeRadius", 0.0015875))
-        embed_offset = float(params.get("embedOffset", 0.0025))
-        cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
-        apply_boolean_difference(mold_obj, cutters)
-
-    # Remesh AFTER booleans at ≥ nozzle width
+    # Remesh at ≥ nozzle width (no booleans involved anymore)
     voxel_size = float(params.get("voxelRemesh", max(nozzle, 0.0005)))
     voxel_remesh_if_requested(mold_obj, voxel_size)
 
@@ -374,7 +345,7 @@ def main():
         f"overlay: {data.get('overlay','N/A')} "
         f"verts(beardline)={len(beardline)} "
         f"neckline={len(neckline)} "
-        f"holes={len(holes_in)} "
+        f"holes_ignored={len(_holes_ignored)} "
         f"weld_eps={weld_eps} voxel={voxel_size} min_feature={min_feature}"
     )
 
