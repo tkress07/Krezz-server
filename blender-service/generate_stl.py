@@ -45,10 +45,8 @@ def smooth_vertices_open(vertices, passes=1):
 def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
     """
     Sample along X with strictly increasing X (no duplicate columns).
-    If multiple samples quantize to the same column, keep the first.
     """
     if not beardline:
-        # 16mm span fallback
         return [(-0.008 + 0.016 * i / max(1, lip_segments - 1), 0.03, 0.0)
                 for i in range(lip_segments)], -0.008, 0.008
 
@@ -66,7 +64,7 @@ def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
     for i in range(lip_segments):
         x = minX + i * seg_w
         if last_x is not None and abs(x - last_x) < eps:
-            x = last_x + eps  # force strictly increasing
+            x = last_x + eps
         last_x = x
         top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
         cols.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
@@ -211,23 +209,30 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
     bpy.context.collection.objects.link(obj)
     return obj
 
-def clean_mesh(obj, weld_eps, min_feature=None):
-    mesh = obj.data
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-
-    mf = float(min_feature) if (min_feature is not None) else weld_eps * 0.8
-
+def _do_clean(bm, weld_dist, degenerate_dist):
     # micro + main weld & dissolve
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps * 0.25)
-    bmesh.ops.dissolve_degenerate(bm, dist=mf * 0.25)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps)
-    bmesh.ops.dissolve_degenerate(bm, dist=mf * 0.5)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_dist * 0.25)
+    bmesh.ops.dissolve_degenerate(bm, dist=degenerate_dist * 0.25)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_dist)
+    bmesh.ops.dissolve_degenerate(bm, dist=degenerate_dist * 0.5)
 
     # fill any open perimeters
     boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
     if boundary_edges:
         bmesh.ops.holes_fill(bm, edges=boundary_edges)
+
+def clean_mesh(obj, weld_eps, min_feature=None, strong=False):
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    # adapt weld: if minFeature is larger than weld, use it to force fusing
+    mf = float(min_feature) if (min_feature is not None) else weld_eps * 0.8
+    weld_dist = max(weld_eps, 0.8 * mf)
+    if strong:
+        weld_dist *= 1.25
+
+    _do_clean(bm, weld_dist, mf)
 
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
     bmesh.ops.triangulate(bm, faces=bm.faces)
@@ -371,19 +376,23 @@ def main():
 
     mf_param = params.get("minFeature")
     mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_eps=weld_eps)
-    clean_mesh(mold_obj, weld_eps, min_feature=mf_param)
 
+    # First clean
+    clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=False)
+
+    # Optional remesh + clean again
     voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))
     voxel_remesh_if_requested(mold_obj, voxel_size)
     if voxel_size > 0:
-        clean_mesh(mold_obj, weld_eps, min_feature=mf_param)
+        clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
+    # Holes → boolean → clean again
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
-        clean_mesh(mold_obj, weld_eps, min_feature=mf_param)
+        clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
     report_non_manifold(mold_obj)
 
