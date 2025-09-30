@@ -5,11 +5,12 @@ import sys
 import math
 from mathutils import Vector
 
-# ========= Tunables (good defaults for 0.4 mm nozzle) =========
-WELD_EPS_DEFAULT  = 0.0002        # 0.20 mm shared-vertex tolerance
+# ========= Tunables (good defaults for ~0.4 mm nozzle) =========
+WELD_EPS_DEFAULT  = 0.0002        # shared-vertex tolerance (meters)
 AREA_MIN          = 1e-14         # drop ultra-skinny sliver tris early
-VOXEL_DEFAULT     = 0.0           # OFF by default; use 0.0008–0.001 if needed
+VOXEL_DEFAULT     = 0.0           # OFF by default; try 0.0008–0.001 if needed
 # ===============================================================
+
 
 # ---------------------------
 # Helpers (geometry & math)
@@ -41,25 +42,36 @@ def smooth_vertices_open(vertices, passes=1):
         V = NV
     return V
 
-def sample_base_points_along_x(beardline, lip_segments):
+def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
+    """
+    Sample along X with strictly increasing X (no duplicate columns).
+    If multiple samples quantize to the same column, keep the first.
+    """
+    if not beardline:
+        # 16mm span fallback
+        return [(-0.008 + 0.016 * i / max(1, lip_segments - 1), 0.03, 0.0)
+                for i in range(lip_segments)], -0.008, 0.008
+
     xs = [p[0] for p in beardline]
     ys = [p[1] for p in beardline]
     zs = [p[2] for p in beardline]
-    minX = min(xs) if xs else -0.05
-    maxX = max(xs) if xs else  0.05
-    seg_w = (maxX - minX) / max(1, (lip_segments - 1))
-    fallbackY = max(ys) if ys else 0.03
-    fallbackZ = (sum(zs) / len(zs)) if zs else 0.0
 
-    base = []
+    minX, maxX = min(xs), max(xs)
+    seg_w = (maxX - minX) / max(1, (lip_segments - 1))
+    fallbackY = max(ys)
+    fallbackZ = sum(zs) / len(zs)
+
+    cols = []
+    last_x = None
     for i in range(lip_segments):
         x = minX + i * seg_w
+        if last_x is not None and abs(x - last_x) < eps:
+            x = last_x + eps  # force strictly increasing
+        last_x = x
         top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
-        if top is not None:
-            base.append((x, top[1], top[2]))
-        else:
-            base.append((x, fallbackY, fallbackZ))
-    return base, minX, maxX
+        cols.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
+
+    return cols, minX, maxX
 
 def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     taper = max(0.0, 1.0 - abs(x - centerX) * taper_mult)
@@ -117,6 +129,7 @@ def strap_tris_equal_counts(A, B):
         faces.append([A[i], B[i], A[i + 1]])
         faces.append([A[i + 1], B[i], B[i + 1]])
     return faces
+
 
 # ---------------------------
 # Solid, manifold extrusion (shared welding)
@@ -198,19 +211,20 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
     bpy.context.collection.objects.link(obj)
     return obj
 
-def clean_mesh(obj, weld_eps):
+def clean_mesh(obj, weld_eps, min_feature=None):
     mesh = obj.data
     bm = bmesh.new()
     bm.from_mesh(mesh)
 
-    # micro pass
+    mf = float(min_feature) if (min_feature is not None) else weld_eps * 0.8
+
+    # micro + main weld & dissolve
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps * 0.25)
-    bmesh.ops.dissolve_degenerate(bm, dist=weld_eps * 0.20)
-
-    # main pass
+    bmesh.ops.dissolve_degenerate(bm, dist=mf * 0.25)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps)
-    bmesh.ops.dissolve_degenerate(bm, dist=weld_eps * 0.20)
+    bmesh.ops.dissolve_degenerate(bm, dist=mf * 0.5)
 
+    # fill any open perimeters
     boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
     if boundary_edges:
         bmesh.ops.holes_fill(bm, edges=boundary_edges)
@@ -241,8 +255,9 @@ def apply_boolean_difference(target_obj, cutters):
         bpy.ops.object.modifier_apply(modifier=mod.name)
         bpy.data.objects.remove(cutter, do_unlink=True)
 
+
 # ---------------------------
-# Build triangles (Swift-parity)
+# Build triangles (Swift-parity, with seam fixes)
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
@@ -256,7 +271,7 @@ def build_triangles(beardline, neckline, params):
     taper_mult      = float(params.get("taperMult", 25.0))
     extrusion_depth = float(params.get("extrusionDepth", -0.008))
 
-    # 1) Base points sampled by X (Swift: basePoints ~ beardline “tops”)
+    # 1) Base points sampled by X (strictly increasing columns)
     base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
     centerX = 0.5 * (minX + maxX)
 
@@ -269,23 +284,25 @@ def build_triangles(beardline, neckline, params):
     # 2a) Quads between lip rings (ring0↔ring1, ring1↔ring2, ...)
     faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
-    # 2b) **Cap basePoints ↔ ring0** (this matches your Swift faces)
+    # 2b) Cap basePoints ↔ ring0, skipping near-zero-width columns
     for i in range(len(base_points) - 1):
         a = base_points[i]
         b = base_points[i + 1]
+        if abs(b[0] - a[0]) < 1e-7:
+            continue  # avoid slot down the middle
         c = lip_vertices[i * ring_count + 0]
         d = lip_vertices[(i + 1) * ring_count + 0]
         faces.append([a, c, b])
         faces.append([b, c, d])
 
-    # 3) Separate strap: beardline ↔ neckline (no join to lip)
+    # 3) Separate strap: make TOP of strap exactly our base grid to guarantee weld
     if neckline:
         xs = [bp[0] for bp in base_points]
-        beard_X = resample_polyline_by_x(beardline, xs)
+        beard_X = base_points[:]  # share exact columns with lip/base
         neck_X  = resample_polyline_by_x(neckline, xs)
         faces += strap_tris_equal_counts(beard_X, neck_X)
 
-    # Clean out razor-thin slivers
+    # Clean out razor-thin slivers before extrusion
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
 
     # Consistent weld for the whole sheet prior to extrusion
@@ -293,6 +310,7 @@ def build_triangles(beardline, neckline, params):
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
 
     return extruded, abs(extrusion_depth), weld_eps
+
 
 # ---------------------------
 # IO / main pipeline
@@ -351,20 +369,21 @@ def main():
 
     tris, thickness, weld_eps = build_triangles(beardline, neckline, params)
 
+    mf_param = params.get("minFeature")
     mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_eps=weld_eps)
-    clean_mesh(mold_obj, weld_eps)
+    clean_mesh(mold_obj, weld_eps, min_feature=mf_param)
 
     voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))
     voxel_remesh_if_requested(mold_obj, voxel_size)
     if voxel_size > 0:
-        clean_mesh(mold_obj, weld_eps)
+        clean_mesh(mold_obj, weld_eps, min_feature=mf_param)
 
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
-        clean_mesh(mold_obj, weld_eps)
+        clean_mesh(mold_obj, weld_eps, min_feature=mf_param)
 
     report_non_manifold(mold_obj)
 
