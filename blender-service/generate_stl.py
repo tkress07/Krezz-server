@@ -1,5 +1,5 @@
 # ============================================
-# Beard Mold Generator (gap-proof, Swift-parity)
+# Beard Mold Generator (gap-proof v2)
 # Drop-in Blender script
 # ============================================
 
@@ -13,7 +13,7 @@ from mathutils import Vector
 # ========= Tunables (safe defaults for ~0.4 mm nozzle) =========
 WELD_EPS_DEFAULT  = 0.0002       # shared-vertex tolerance (meters)
 AREA_MIN          = 1e-14        # drop ultra-skinny sliver tris early
-VOXEL_DEFAULT     = 0.0          # OFF by default; try 0.0006–0.001 if needed
+VOXEL_DEFAULT     = 0.0          # OFF by default; try 0.0005–0.001 if needed
 # ===============================================================
 
 
@@ -48,9 +48,7 @@ def smooth_vertices_open(vertices, passes=1):
     return V
 
 def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
-    """
-    Sample along X with strictly increasing X (no duplicate columns).
-    """
+    """Sample along X with strictly increasing X (no duplicate columns)."""
     if not beardline:
         return [(-0.008 + 0.016 * i / max(1, lip_segments - 1), 0.03, 0.0)
                 for i in range(lip_segments)], -0.008, 0.008
@@ -71,7 +69,6 @@ def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
         if last_x is not None and abs(x - last_x) < eps:
             x = last_x + eps
         last_x = x
-        # nearest-by-x sample
         top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
         cols.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
 
@@ -90,8 +87,7 @@ def _bias_t(t, profile_bias):
 
 def generate_lip_rings(base_points, arc_steps, min_r, max_r, centerX, taper_mult,
                        prelift=0.0, profile_bias=1.0):
-    """Create a half-round 'lip' around the beardline samples.
-       prelift raises base_points a hair in +Y before the lip (avoids self-intersect)."""
+    """Create a half-round 'lip' around the beardline samples."""
     ring_count = arc_steps + 1
     verts = []
     for (bx, by, bz) in base_points:
@@ -226,12 +222,28 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
     bpy.context.collection.objects.link(obj)
     return obj
 
+
+# ---------------------------
+# Mesh cleaning & manifold repair
+# ---------------------------
+
 def _do_clean(bm, weld_dist, degenerate_dist):
     # micro + main weld & dissolve
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_dist * 0.25)
     bmesh.ops.dissolve_degenerate(bm, dist=degenerate_dist * 0.25)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_dist)
     bmesh.ops.dissolve_degenerate(bm, dist=degenerate_dist * 0.5)
+
+    # remove loose verts/edges
+    loose_verts = [v for v in bm.verts if not v.link_edges]
+    if loose_verts:
+        bmesh.ops.delete(bm, geom=loose_verts, context='VERTS')
+
+    # tiny angle slivers
+    try:
+        bmesh.ops.dissolve_limit(bm, angle_limit=math.radians(1.0), use_dissolve_boundaries=True, verts=bm.verts, edges=bm.edges)
+    except Exception:
+        pass
 
     # fill any open perimeters
     boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
@@ -243,7 +255,6 @@ def clean_mesh(obj, weld_eps, min_feature=None, strong=False):
     bm = bmesh.new()
     bm.from_mesh(mesh)
 
-    # adapt weld: if minFeature is larger than weld, use it to force fusing
     mf = float(min_feature) if (min_feature is not None) else weld_eps * 0.8
     weld_dist = max(weld_eps, 0.8 * mf)
     if strong:
@@ -257,9 +268,26 @@ def clean_mesh(obj, weld_eps, min_feature=None, strong=False):
     bm.to_mesh(mesh); bm.free()
     mesh.validate(verbose=True); mesh.update()
 
+def ensure_closed_manifold(obj, weld_eps, min_feature=None, passes=3):
+    """Multi-pass boundary close + weld to kill pinholes after booleans."""
+    mesh = obj.data
+    for _ in range(max(1, passes)):
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+        if not boundary_edges:
+            bm.free(); break
+        bmesh.ops.holes_fill(bm, edges=boundary_edges)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts,
+                                 dist=max(weld_eps * 0.9, (min_feature or weld_eps) * 0.6))
+        bmesh.ops.dissolve_degenerate(bm, dist=(min_feature or weld_eps) * 0.6)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        bm.to_mesh(mesh); bm.free()
+        mesh.validate(verbose=False); mesh.update()
+
 def create_cylinders_z_aligned(holes, thickness, radius=0.0015875,
-                               embed_offset=0.0025, through_margin=0.0006):
-    """Make cylinders that cut completely through the body with a small margin."""
+                               embed_offset=0.0025, through_margin=0.0008):
+    """Make cylinders that cut completely through the body with a margin."""
     cylinders = []
     full_depth = float(thickness) + 2.0 * float(through_margin)
     for h in holes:
@@ -271,27 +299,24 @@ def create_cylinders_z_aligned(holes, thickness, radius=0.0015875,
         cylinders.append(cyl)
     return cylinders
 
-def apply_boolean_difference(target_obj, cutters):
+def apply_boolean(op, target_obj, cutters, solver_exact=True, weld_eps=0.0002):
     bpy.context.view_layer.objects.active = target_obj
-    for cutter in cutters:
+    for c in cutters:
         mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
-        mod.operation = 'DIFFERENCE'
-        mod.object = cutter
+        mod.operation = op  # 'UNION' / 'DIFFERENCE'
+        try:
+            mod.solver = 'EXACT' if solver_exact else 'FAST'
+            if hasattr(mod, "double_threshold"):
+                mod.double_threshold = weld_eps * 0.5
+        except Exception:
+            pass
+        mod.object = c
         bpy.ops.object.modifier_apply(modifier=mod.name)
-        bpy.data.objects.remove(cutter, do_unlink=True)
-
-def apply_boolean_union(target_obj, unions):
-    bpy.context.view_layer.objects.active = target_obj
-    for u in unions:
-        mod = target_obj.modifiers.new(name="Boolean", type='BOOLEAN')
-        mod.operation = 'UNION'
-        mod.object = u
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-        bpy.data.objects.remove(u, do_unlink=True)
+        bpy.data.objects.remove(c, do_unlink=True)
 
 
 # ---------------------------
-# Build triangles (Swift-parity, with seam fixes)
+# Build triangles (Swift parity)
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
@@ -339,7 +364,7 @@ def build_triangles(beardline, neckline, params):
         neck_X  = resample_polyline_by_x(neckline, xs)
         faces += strap_tris_equal_counts(beard_X, neck_X)
 
-    # Clean out razor-thin slivers before extrusion
+    # Drop razor-thin slivers early
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
 
     # Consistent weld for the whole sheet prior to extrusion
@@ -377,13 +402,9 @@ def create_anchor_ribs_along_x(beardline, params, centerY=None):
     ribs = []
     x = minX
     while x <= maxX:
-        # Create a thin box (rib) centered at (x, midY - band_y/2 .. midY + band_y/2)
-        bpy.ops.mesh.primitive_cube_add(
-            size=1.0,
-            location=(x, midY, baseZ + z_offset)
-        )
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(x, midY, baseZ + z_offset))
         rib = bpy.context.active_object
-        rib.scale = (thick * 0.5, band_y * 0.5, depth * 0.5)  # scale from unit cube
+        rib.scale = (thick * 0.5, band_y * 0.5, depth * 0.5)  # unit cube → scaled rib
         ribs.append(rib)
         x += spacing
 
@@ -458,7 +479,9 @@ def main():
     # Optional ribs (union)
     ribs = create_anchor_ribs_along_x(beardline, params)
     if ribs:
-        apply_boolean_union(mold_obj, ribs)
+        apply_boolean('UNION', mold_obj, ribs,
+                      solver_exact=bool(params.get("booleanExact", True)),
+                      weld_eps=weld_eps)
         clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
     # Optional remesh + clean again
@@ -471,11 +494,19 @@ def main():
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
-        thru = float(params.get("holeThroughMargin", 0.0006))
+        thru = float(params.get("holeThroughMargin", 0.0008))
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius,
                                              embed_offset=embed_offset, through_margin=thru)
-        apply_boolean_difference(mold_obj, cutters)
+        apply_boolean('DIFFERENCE', mold_obj, cutters,
+                      solver_exact=bool(params.get("booleanExact", True)),
+                      weld_eps=weld_eps)
+        ensure_closed_manifold(mold_obj, weld_eps, min_feature=mf_param, passes=3)
         clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
+
+    # Final “fuse” pass to kill micro gaps
+    final_fuse = float(params.get("finalFuseEps", 0.00035))
+    ensure_closed_manifold(mold_obj, final_fuse, min_feature=mf_param, passes=2)
+    clean_mesh(mold_obj, final_fuse, min_feature=mf_param, strong=True)
 
     report_non_manifold(mold_obj)
 
@@ -492,9 +523,8 @@ def main():
         f"verts(beardline)={len(beardline)} "
         f"neckline={len(neckline)} "
         f"holes={len(holes_in)} "
-        f"weld_eps={weld_eps} "
-        f"voxel={voxel_size} "
-        f"ribs={'on' if ribs else 'off'}"
+        f"weld_eps={weld_eps} voxel={voxel_size} "
+        f"finalFuse={final_fuse} ribs={'on' if ribs else 'off'}"
     )
 
 if __name__ == "__main__":
