@@ -402,6 +402,46 @@ def _snap_close_endpoints(sorted_pts, tol=1e-4):
             sorted_pts[-1] = (a[0], a[1], a[2])
     return sorted_pts
 
+def mesh_diagnostics(obj):
+    """Print quick stats slicers care about."""
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
+    boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+    shortest = 1e9
+    for e in bm.edges:
+        try:
+            shortest = min(shortest, float(e.calc_length()))
+        except Exception:
+            pass
+    bm.free()
+    print(f"[diag] boundary={len(boundary_edges)} nonmanifold={len(nonman_edges)} minEdge={shortest:.6f} m")
+    return len(boundary_edges), len(nonman_edges), shortest
+
+
+def ensure_watertight(obj, params):
+    """
+    If we still have boundary/non-manifold edges or ultra-short edges,
+    auto-escalate to a voxel remesh with a sane size derived from minFeature.
+    """
+    weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
+    min_feature = float(params.get("minFeature", 0.0012))  # 1.2 mm default safety
+    voxel_size = float(params.get("voxelRemesh", 0.0))
+
+    b, n, shortest = mesh_diagnostics(obj)
+
+    needs_fix = (b > 0 or n > 0 or shortest < min_feature * 0.25)
+    if needs_fix:
+        suggested = max(voxel_size, min_feature * 0.75)  # e.g., 0.0009 if minFeature=0.0012
+        print(f"[fix] auto-remesh → voxel={suggested:.6f} (was {voxel_size:.6f})")
+        voxel_remesh_if_requested(obj, suggested)
+        clean_mesh(obj, weld_eps, min_feature=min_feature, strong=True)
+        b, n, shortest = mesh_diagnostics(obj)
+
+    return
+
+
 
 def main():
     argv = sys.argv
@@ -458,6 +498,9 @@ def main():
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
         clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
+
+    # Force watertight if any residual issues remain
+    ensure_watertight(mold_obj, params)
 
     report_non_manifold(mold_obj)
 
