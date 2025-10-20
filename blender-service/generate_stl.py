@@ -116,6 +116,7 @@ def resample_polyline_by_x(points, xs):
         a, b = P[k], P[k + 1]
         t = 0.0 if b[0] == a[0] else (x - a[0]) / (b[0] - a[0])
         y = a[1] * (1 - t) + b[1] * t
+        z = a[2] * (1 - t) + b[1] * 0 + b[2] * 1  # same as above, explicit
         z = a[2] * (1 - t) + b[2] * t
         out.append((x, y, z))
     return out
@@ -269,6 +270,7 @@ def build_triangles(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
+    # NOTE: these remain camelCase; we unify casings earlier.  # >>> CHANGED
     lip_segments    = int(params.get("lipSegments", 100))
     arc_steps       = int(params.get("arcSteps", 24))
     max_lip_radius  = float(params.get("maxLipRadius", 0.008))
@@ -311,7 +313,7 @@ def build_triangles(beardline, neckline, params):
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
 
     # Consistent weld for the whole sheet prior to extrusion
-    weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
+    weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))   # >>> CHANGED
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
 
     return extruded, abs(extrusion_depth), weld_eps
@@ -349,6 +351,58 @@ def report_non_manifold(obj):
     except Exception:
         pass
 
+
+# >>> CHANGED: helper to lower-case keys recursively
+def _lower_keys(obj):
+    if isinstance(obj, dict):
+        return { (k.lower() if isinstance(k, str) else k): _lower_keys(v) for k, v in obj.items() }
+    if isinstance(obj, list):
+        return [ _lower_keys(v) for v in obj ]
+    return obj
+
+# >>> CHANGED: unify params (copy any lowercase aliases into existing camelCase names)
+def _unify_params(params_any):
+    params_any = params_any or {}
+    params_lc = { (k.lower() if isinstance(k, str) else k): v for k, v in params_any.items() }
+
+    # Start with whatever caller sent (keeps camelCase if present)
+    out = dict(params_any)
+
+    def use(cam, lc):
+        if cam not in out and lc in params_lc:
+            out[cam] = params_lc[lc]
+
+    # Known pairs
+    use("lipSegments",    "lipsegments")
+    use("arcSteps",       "arcsteps")
+    use("maxLipRadius",   "maxlipradius")
+    use("minLipRadius",   "minlipradius")
+    use("taperMult",      "tapermult")
+    use("extrusionDepth", "extrusiondepth")
+    use("weldEps",        "weldeps")
+    use("minFeature",     "minfeature")
+    # Voxel size can come as voxelRemesh, voxelSize, or voxelsize
+    use("voxelRemesh",    "voxelsize")
+    if "voxelSize" in out and "voxelRemesh" not in out:
+        out["voxelRemesh"] = out["voxelSize"]
+    elif "voxelsize" in params_lc and "voxelRemesh" not in out:
+        out["voxelRemesh"] = params_lc["voxelsize"]
+
+    use("embedOffset",    "embedoffset")
+    use("holeRadius",     "holeradius")
+
+    return out
+
+# >>> CHANGED: stabilize/snap endpoints to avoid hairline gaps
+def _snap_close_endpoints(sorted_pts, tol=1e-4):
+    if len(sorted_pts) > 2:
+        a, b = sorted_pts[0], sorted_pts[-1]
+        dx = a[0]-b[0]; dy = a[1]-b[1]; dz = a[2]-b[2]
+        if (dx*dx + dy*dy + dz*dz) ** 0.5 < tol:
+            sorted_pts[-1] = (a[0], a[1], a[2])
+    return sorted_pts
+
+
 def main():
     argv = sys.argv
     argv = argv[argv.index("--") + 1 :] if "--" in argv else []
@@ -359,18 +413,29 @@ def main():
     with open(input_path, 'r') as f:
         data = json.load(f)
 
-    beardline_in = data.get("beardline") or data.get("vertices")
+    data_lc = _lower_keys(data)  # >>> CHANGED
+
+    # Accept both 'beardline' and legacy 'vertices', any casing  # >>> CHANGED
+    beardline_in = data.get("beardline") or data.get("vertices") \
+                   or data_lc.get("beardline") or data_lc.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
-    beardline = [to_vec3(v) for v in beardline_in]
+    # Sort by X and snap ends to prevent nearly-duplicate seam  # >>> CHANGED
+    beardline = sorted([to_vec3(v) for v in beardline_in], key=lambda p: p[0])
+    beardline = _snap_close_endpoints(beardline, tol=1e-4)
 
-    neckline_in = data.get("neckline")
+    neckline_in = data.get("neckline") or data_lc.get("neckline")   # >>> CHANGED
     neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
     if neckline:
         neckline = smooth_vertices_open(neckline, passes=3)
 
-    holes_in = data.get("holeCenters") or data.get("holes") or []
-    params = data.get("params", {})
+    # Holes tolerant to multiple key names/casings  # >>> CHANGED
+    holes_in = data.get("holeCenters") or data.get("holes") \
+               or data_lc.get("holecenters") or data_lc.get("holes") or []
+
+    # Params: unify casings so downstream camelCase reads work  # >>> CHANGED
+    params_any = data.get("params") or data_lc.get("params") or {}
+    params = _unify_params(params_any)
 
     tris, thickness, weld_eps = build_triangles(beardline, neckline, params)
 
@@ -381,15 +446,15 @@ def main():
     clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=False)
 
     # Optional remesh + clean again
-    voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))
+    voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))   # >>> CHANGED
     voxel_remesh_if_requested(mold_obj, voxel_size)
     if voxel_size > 0:
         clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
     # Holes → boolean → clean again
     if holes_in:
-        radius = float(params.get("holeRadius", 0.0015875))
-        embed_offset = float(params.get("embedOffset", 0.0025))
+        radius = float(params.get("holeRadius", 0.0015875))        # >>> CHANGED
+        embed_offset = float(params.get("embedOffset", 0.0025))    # >>> CHANGED
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
         clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
