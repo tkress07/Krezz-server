@@ -8,7 +8,7 @@ from mathutils import Vector
 # ========= Tunables (good defaults for ~0.4 mm nozzle) =========
 WELD_EPS_DEFAULT  = 0.0002        # shared-vertex tolerance (meters)
 AREA_MIN          = 1e-14         # drop ultra-skinny sliver tris early
-VOXEL_DEFAULT     = 0.0           # OFF by default; try 0.0008–0.001 if needed
+VOXEL_DEFAULT     = 0.0           # OFF by default; set via params if needed
 # ===============================================================
 
 
@@ -116,7 +116,6 @@ def resample_polyline_by_x(points, xs):
         a, b = P[k], P[k + 1]
         t = 0.0 if b[0] == a[0] else (x - a[0]) / (b[0] - a[0])
         y = a[1] * (1 - t) + b[1] * t
-        z = a[2] * (1 - t) + b[1] * 0 + b[2] * 1  # same as above, explicit
         z = a[2] * (1 - t) + b[2] * t
         out.append((x, y, z))
     return out
@@ -270,7 +269,7 @@ def build_triangles(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    # NOTE: these remain camelCase; we unify casings earlier.  # >>> CHANGED
+    # These remain camelCase; earlier we unify casings.
     lip_segments    = int(params.get("lipSegments", 100))
     arc_steps       = int(params.get("arcSteps", 24))
     max_lip_radius  = float(params.get("maxLipRadius", 0.008))
@@ -288,7 +287,7 @@ def build_triangles(beardline, neckline, params):
     )
 
     faces = []
-    # 2a) Quads between lip rings (ring0↔ring1, ring1↔ring2, ...)
+    # 2a) Quads between lip rings
     faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
 
     # 2b) Cap basePoints ↔ ring0, skipping near-zero-width columns
@@ -296,7 +295,7 @@ def build_triangles(beardline, neckline, params):
         a = base_points[i]
         b = base_points[i + 1]
         if abs(b[0] - a[0]) < 1e-7:
-            continue  # avoid slot down the middle
+            continue
         c = lip_vertices[i * ring_count + 0]
         d = lip_vertices[(i + 1) * ring_count + 0]
         faces.append([a, c, b])
@@ -313,7 +312,7 @@ def build_triangles(beardline, neckline, params):
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
 
     # Consistent weld for the whole sheet prior to extrusion
-    weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))   # >>> CHANGED
+    weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
 
     return extruded, abs(extrusion_depth), weld_eps
@@ -351,8 +350,8 @@ def report_non_manifold(obj):
     except Exception:
         pass
 
+# ----- payload helpers -----
 
-# >>> CHANGED: helper to lower-case keys recursively
 def _lower_keys(obj):
     if isinstance(obj, dict):
         return { (k.lower() if isinstance(k, str) else k): _lower_keys(v) for k, v in obj.items() }
@@ -360,19 +359,15 @@ def _lower_keys(obj):
         return [ _lower_keys(v) for v in obj ]
     return obj
 
-# >>> CHANGED: unify params (copy any lowercase aliases into existing camelCase names)
 def _unify_params(params_any):
     params_any = params_any or {}
     params_lc = { (k.lower() if isinstance(k, str) else k): v for k, v in params_any.items() }
-
-    # Start with whatever caller sent (keeps camelCase if present)
     out = dict(params_any)
 
     def use(cam, lc):
         if cam not in out and lc in params_lc:
             out[cam] = params_lc[lc]
 
-    # Known pairs
     use("lipSegments",    "lipsegments")
     use("arcSteps",       "arcsteps")
     use("maxLipRadius",   "maxlipradius")
@@ -381,19 +376,16 @@ def _unify_params(params_any):
     use("extrusionDepth", "extrusiondepth")
     use("weldEps",        "weldeps")
     use("minFeature",     "minfeature")
-    # Voxel size can come as voxelRemesh, voxelSize, or voxelsize
     use("voxelRemesh",    "voxelsize")
     if "voxelSize" in out and "voxelRemesh" not in out:
         out["voxelRemesh"] = out["voxelSize"]
     elif "voxelsize" in params_lc and "voxelRemesh" not in out:
         out["voxelRemesh"] = params_lc["voxelsize"]
-
     use("embedOffset",    "embedoffset")
     use("holeRadius",     "holeradius")
-
+    use("autoRemesh",     "autoremesh")
     return out
 
-# >>> CHANGED: stabilize/snap endpoints to avoid hairline gaps
 def _snap_close_endpoints(sorted_pts, tol=1e-4):
     if len(sorted_pts) > 2:
         a, b = sorted_pts[0], sorted_pts[-1]
@@ -403,7 +395,6 @@ def _snap_close_endpoints(sorted_pts, tol=1e-4):
     return sorted_pts
 
 def mesh_diagnostics(obj):
-    """Print quick stats slicers care about."""
     mesh = obj.data
     bm = bmesh.new()
     bm.from_mesh(mesh)
@@ -419,29 +410,32 @@ def mesh_diagnostics(obj):
     print(f"[diag] boundary={len(boundary_edges)} nonmanifold={len(nonman_edges)} minEdge={shortest:.6f} m")
     return len(boundary_edges), len(nonman_edges), shortest
 
-
 def ensure_watertight(obj, params):
     """
-    If we still have boundary/non-manifold edges or ultra-short edges,
-    auto-escalate to a voxel remesh with a sane size derived from minFeature.
+    Print diagnostics; only auto-remesh if the caller allows it.
     """
     weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
-    min_feature = float(params.get("minFeature", 0.0012))  # 1.2 mm default safety
+    min_feature = float(params.get("minFeature", 0.0012))
     voxel_size = float(params.get("voxelRemesh", 0.0))
+    allow_auto = bool(params.get("autoRemesh", False))
 
     b, n, shortest = mesh_diagnostics(obj)
 
+    if not allow_auto:
+        print("[fix] auto-remesh disabled (autoRemesh=false).")
+        return
+
     needs_fix = (b > 0 or n > 0 or shortest < min_feature * 0.25)
     if needs_fix:
-        suggested = max(voxel_size, min_feature * 0.75)  # e.g., 0.0009 if minFeature=0.0012
+        suggested = max(voxel_size, min_feature * 0.75)
         print(f"[fix] auto-remesh → voxel={suggested:.6f} (was {voxel_size:.6f})")
         voxel_remesh_if_requested(obj, suggested)
         clean_mesh(obj, weld_eps, min_feature=min_feature, strong=True)
-        b, n, shortest = mesh_diagnostics(obj)
+        mesh_diagnostics(obj)
 
-    return
-
-
+# ---------------------------
+# Main
+# ---------------------------
 
 def main():
     argv = sys.argv
@@ -453,27 +447,24 @@ def main():
     with open(input_path, 'r') as f:
         data = json.load(f)
 
-    data_lc = _lower_keys(data)  # >>> CHANGED
+    data_lc = _lower_keys(data)
 
-    # Accept both 'beardline' and legacy 'vertices', any casing  # >>> CHANGED
     beardline_in = data.get("beardline") or data.get("vertices") \
                    or data_lc.get("beardline") or data_lc.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
-    # Sort by X and snap ends to prevent nearly-duplicate seam  # >>> CHANGED
+
     beardline = sorted([to_vec3(v) for v in beardline_in], key=lambda p: p[0])
     beardline = _snap_close_endpoints(beardline, tol=1e-4)
 
-    neckline_in = data.get("neckline") or data_lc.get("neckline")   # >>> CHANGED
+    neckline_in = data.get("neckline") or data_lc.get("neckline")
     neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
     if neckline:
         neckline = smooth_vertices_open(neckline, passes=3)
 
-    # Holes tolerant to multiple key names/casings  # >>> CHANGED
     holes_in = data.get("holeCenters") or data.get("holes") \
                or data_lc.get("holecenters") or data_lc.get("holes") or []
 
-    # Params: unify casings so downstream camelCase reads work  # >>> CHANGED
     params_any = data.get("params") or data_lc.get("params") or {}
     params = _unify_params(params_any)
 
@@ -482,33 +473,33 @@ def main():
     mf_param = params.get("minFeature")
     mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_eps=weld_eps)
 
-    # First clean
+    # Clean twice BEFORE any remesh (strong pass added)
     clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=False)
+    clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
     # Optional remesh + clean again
-    voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))   # >>> CHANGED
+    voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))
     voxel_remesh_if_requested(mold_obj, voxel_size)
     if voxel_size > 0:
         clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
     # Holes → boolean → clean again
     if holes_in:
-        radius = float(params.get("holeRadius", 0.0015875))        # >>> CHANGED
-        embed_offset = float(params.get("embedOffset", 0.0025))    # >>> CHANGED
+        radius = float(params.get("holeRadius", 0.0015875))
+        embed_offset = float(params.get("embedOffset", 0.0025))
         cutters = create_cylinders_z_aligned(holes_in, thickness, radius=radius, embed_offset=embed_offset)
         apply_boolean_difference(mold_obj, cutters)
         clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
-    # Force watertight if any residual issues remain
+    # Diagnostics / optional auto-fix (respects autoRemesh flag)
     ensure_watertight(mold_obj, params)
-
     report_non_manifold(mold_obj)
 
+    # Export
     for obj in bpy.data.objects:
         obj.select_set(False)
     mold_obj.select_set(True)
     bpy.context.view_layer.objects.active = mold_obj
-
     export_stl_selected(output_path)
 
     print(
