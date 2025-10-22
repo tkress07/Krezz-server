@@ -7,7 +7,7 @@ from mathutils import Vector
 
 # ========= Tunables (good defaults for ~0.4 mm nozzle) =========
 WELD_EPS_DEFAULT  = 0.0002        # shared-vertex tolerance (meters)
-AREA_MIN = 5e-13       # drop ultra-skinny sliver tris early
+AREA_MIN          = 1e-14         # drop ultra-skinny sliver tris early
 VOXEL_DEFAULT     = 0.0           # OFF by default; set via params if needed
 # ===============================================================
 
