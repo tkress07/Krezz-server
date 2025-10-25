@@ -7,8 +7,8 @@ import statistics
 from mathutils import Vector
 
 # ========= Tunables (meters) =========
-WELD_EPS_DEFAULT  = 0.0002        # fallback shared-vertex tolerance
-AREA_MIN          = 5e-13         # cull razor-thin triangles early
+WELD_EPS_DEFAULT  = 0.0002
+AREA_MIN          = 5e-13
 VOXEL_DEFAULT     = 0.0
 # ====================================
 
@@ -150,17 +150,13 @@ def _unify_params(params_any):
     if "voxelSize" in out and "voxelRemesh" not in out: out["voxelRemesh"] = out["voxelSize"]
     elif "voxelsize" in params_lc and "voxelRemesh" not in out: out["voxelRemesh"] = params_lc["voxelsize"]
     use("embedOffset","embedoffset"); use("holeRadius","holeradius")
-    use("autoRemesh","autoremesh")
+    use("autoRemesh","autoremesh"); use("profileBias","profilebias"); use("prelift","prelift")
     return out
 
 
 # ---------------------------
-# Lip geometry
+# Lip geometry (quarter-arc, monotonic)
 # ---------------------------
-
-def tapered_radius(x, centerX, min_r, max_r, taper_mult):
-    t = max(0.0, 1.0 - abs(x-centerX)*taper_mult)
-    return min_r + t*(max_r - min_r)
 
 def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
     if not beardline:
@@ -177,41 +173,42 @@ def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
         out.append((x, y, z)); last_x = x
     return out, minX, maxX
 
-def build_sheet_grid(base_points, arc_steps, min_r, max_r, centerX, taper_mult, neckline=None):
+def build_sheet_grid(base_points, arc_steps, min_r, max_r, centerX, taper_mult,
+                     neckline=None, profile_bias=1.0, prelift=0.0):
     """
-    Build one continuous vertex grid:
-      row 0 : neckline (if provided), else omitted
-      row 1 : base_points
-      rows 2.. : lip rings 0..arc_steps
+    Grid rows:
+      row 0 : neckline (if provided)
+      row 1 : base_points (beardline resampled)
+      rows 2.. : quarter-arc lip (monotonic outward), starting slightly off the base
     """
-    ring_count = arc_steps + 1
     n = len(base_points)
     xs = [bp[0] for bp in base_points]
+    neck_row = resample_polyline_by_x(neckline, xs) if neckline else []
 
-    neck_row = []
-    if neckline:
-        neck_row = resample_polyline_by_x(neckline, xs)
-
-    # assemble grid rows
     grid = []
-    if neck_row: grid.append(neck_row)      # row 0
-    grid.append(base_points)                # row 1
+    if neck_row: grid.append(neck_row)        # row 0
+    grid.append(base_points)                  # row 1
 
-    # rows for rings
-    for j in range(ring_count):
+    rings = arc_steps
+    for j in range(rings):
+        # t in (0,1]; start slightly above 0 so we don't duplicate the base row
+        t = (j+1)/float(rings+1)
+        t = max(1e-6, min(1.0, t))
+        t = t**max(0.1, float(profile_bias))
+        ang = 0.5*math.pi * t  # quarter circle: 0 → π/2
         row = []
-        t = j/float(arc_steps)
-        ang = math.pi * t
         for (bx, by, bz) in base_points:
-            r = tapered_radius(bx, centerX, min_r, max_r, taper_mult)
-            y = by - r*(1.0 - math.sin(ang))
-            z = bz + r*math.cos(ang)
+            # tapered radius across X
+            dx = abs(bx - centerX)
+            taper = max(0.0, 1.0 - dx * taper_mult)
+            r = min_r + taper*(max_r - min_r)
+            y = by - r * math.sin(ang)                         # monotonic offset in Y
+            z = bz + float(prelift) * (1.0 - math.cos(ang))    # subtle lift only, no flip
             row.append((bx, y, z))
         grid.append(row)
 
-    depth = len(grid)
-    return grid, n, depth
-
+    rows = len(grid)
+    return grid, n, rows
 
 def tris_from_grid(grid, cols, rows):
     faces = []
@@ -237,34 +234,26 @@ def consolidate_front_sheet(faces, weld_eps, min_feature):
         k = _rounded_key(p, weld_eps)
         v = vmap.get(k)
         if v is None:
-            v = bm.verts.new(Vector(k))
-            vmap[k] = v
+            v = bm.verts.new(Vector(k)); vmap[k] = v
         return v
-
     for (a, b, c) in faces:
         va, vb, vc = v_for(a), v_for(b), v_for(c)
-        try:
-            bm.faces.new([va, vb, vc])
-        except ValueError:
-            pass
+        try: bm.faces.new([va, vb, vc])
+        except ValueError: pass
 
     bm.verts.ensure_lookup_table(); bm.edges.ensure_lookup_table(); bm.faces.ensure_lookup_table()
-
-    # aggressive but safe sheet cleanup
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps)
     bmesh.ops.dissolve_degenerate(bm, dist=max(min_feature*0.25, 1e-7))
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
     bmesh.ops.dissolve_limit(bm, angle_limit=0.01, use_dissolve_boundaries=True, verts=bm.verts, edges=bm.edges)
     bmesh.ops.triangulate(bm, faces=bm.faces)
 
-    # fill residual tiny holes on the sheet
     boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
     if boundary_edges:
         try:
             bmesh.ops.holes_fill(bm, edges=boundary_edges)
             bmesh.ops.triangulate(bm, faces=bm.faces)
-        except Exception:
-            pass
+        except Exception: pass
 
     tris = []
     for f in bm.faces:
@@ -287,7 +276,6 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps):
         ia, ib, ic = idx_of(a), idx_of(b), idx_of(c)
         tris_idx.append((ia, ib, ic))
 
-    # boundary detection on front sheet
     edge_count, edge_dir = {}, {}
     for ia, ib, ic in tris_idx:
         for (u, v) in ((ia, ib), (ib, ic), (ic, ia)):
@@ -312,17 +300,14 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps):
         out.append((verts[u], back_verts[jv-back_offset], back_verts[ju-back_offset]))
     return out
 
-
 def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
     v2i, verts, faces_idx = {}, [], []
     def key(p): return _rounded_key(p, weld_eps)
-
     for (a, b, c) in tris:
         ids = []
         for p in (a, b, c):
             k = key(p)
-            if k not in v2i:
-                v2i[k] = len(verts); verts.append(k)
+            if k not in v2i: v2i[k] = len(verts); verts.append(k)
             ids.append(v2i[k])
         if area2(verts[ids[0]], verts[ids[1]], verts[ids[2]]) > AREA_MIN:
             faces_idx.append(tuple(ids))
@@ -381,7 +366,7 @@ def mesh_diagnostics(obj):
 
 
 # ---------------------------
-# Main triangle builder (unified grid → no sliver)
+# Main triangle builder
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
@@ -394,8 +379,10 @@ def build_triangles(beardline, neckline, params):
     min_lip_radius  = float(params.get("minLipRadius", 0.0045))
     taper_mult      = float(params.get("taperMult", 20.0))
     extrusion_depth = float(params.get("extrusionDepth", -0.011))
-    # weld at least half of minFeature to avoid micro seams even if parameter is small
-    min_feature     = float(params.get("minFeature", 0.0018))
+    profile_bias    = float(params.get("profileBias", 1.0))
+    prelift         = float(params.get("prelift", 0.0))
+
+    min_feature     = float(params.get("minFeature", 0.0012))
     weld_eps_param  = float(params.get("weldEps", WELD_EPS_DEFAULT))
     weld_eps        = max(weld_eps_param, 0.5*min_feature)
 
@@ -403,15 +390,14 @@ def build_triangles(beardline, neckline, params):
     centerX = 0.5*(minX+maxX)
 
     grid, cols, rows = build_sheet_grid(
-        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult, neckline
+        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult,
+        neckline=neckline, profile_bias=profile_bias, prelift=prelift
     )
 
     faces = tris_from_grid(grid, cols, rows)
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
 
-    # Consolidate the sheet before extrusion to remove overlaps / T-junctions
     sheet = consolidate_front_sheet(faces, weld_eps=weld_eps, min_feature=min_feature)
-
     extruded = extrude_surface_z_solid(sheet, extrusion_depth, weld_eps=weld_eps)
     return extruded, abs(extrusion_depth), weld_eps
 
@@ -446,12 +432,12 @@ def report_non_manifold(obj):
 
 def ensure_watertight(obj, params):
     weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
-    min_feature = float(params.get("minFeature", 0.0018))
+    min_feature = float(params.get("minFeature", 0.0012))
     voxel_size = float(params.get("voxelRemesh", 0.0))
-    allow_auto = bool(params.get("autoRemesh", False))
+    allow_auto = bool(params.get("autoRemesh", True))  # default ON
     b, n, shortest = mesh_diagnostics(obj)
     if not allow_auto:
-        print("[fix] auto-remesh disabled (autoRemesh=false).")
+        print("[fix] auto-remesh disabled.")
         return
     if (b > 0 or n > 0 or shortest < min_feature*0.25):
         suggested = max(voxel_size, min_feature*0.75)
@@ -477,13 +463,13 @@ def main():
         data = json.load(f)
     data_lc = _lower_keys(data)
 
-    # Beardline (or legacy vertices)
+    # Beardline / legacy vertices
     beardline_in = data.get("beardline") or data.get("vertices") \
                    or data_lc.get("beardline") or data_lc.get("vertices")
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
-    beardline_raw = [to_vec3(v) for v in beardline_in]
-    beard_segments = _split_segments(beardline_raw)
+    beard_raw = [to_vec3(v) for v in beardline_in]
+    beard_segments = _split_segments(beard_raw)
     print(f"[clean:beard] segments={len(beard_segments)} sizes={[len(s) for s in beard_segments]}")
     beardline = compose_beardline_uniform(
         beard_segments,
@@ -491,7 +477,7 @@ def main():
     )
     beardline = _snap_close_endpoints(sorted(beardline, key=lambda p: p[0]), tol=1e-4)
 
-    # Neckline: keep longest continuous run, smooth
+    # Neckline (keep longest continuous segment)
     neckline_in = data.get("neckline") or data_lc.get("neckline")
     if neckline_in:
         neck_pts = [to_vec3(v) for v in neckline_in]
@@ -512,17 +498,17 @@ def main():
     tris, thickness, weld_eps = build_triangles(beardline, neckline, params)
     mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_eps=weld_eps)
 
-    # Clean passes
+    # Cleaning
     clean_mesh(mold_obj, weld_eps, min_feature=params.get("minFeature"), strong=False)
     clean_mesh(mold_obj, weld_eps, min_feature=params.get("minFeature"), strong=True)
 
-    # Optional remesh + clean
+    # Optional remesh
     voxel_size = float(params.get("voxelRemesh", VOXEL_DEFAULT))
     voxel_remesh_if_requested(mold_obj, voxel_size)
     if voxel_size > 0:
         clean_mesh(mold_obj, weld_eps, min_feature=params.get("minFeature"), strong=True)
 
-    # Holes → boolean → clean again
+    # Holes → boolean → clean
     if holes_in:
         radius = float(params.get("holeRadius", 0.0015875))
         embed_offset = float(params.get("embedOffset", 0.0025))
@@ -541,10 +527,11 @@ def main():
             bpy.data.objects.remove(cutter, do_unlink=True)
         clean_mesh(mold_obj, weld_eps, min_feature=params.get("minFeature"), strong=True)
 
-    # Diagnostics / export
-    mesh_diagnostics(mold_obj)
-    report_non_manifold(mold_obj)
+    # Force watertight if needed (auto on)
+    ensure_watertight(mold_obj, params)
 
+    # Export
+    mesh_diagnostics(mold_obj)
     for o in bpy.data.objects: o.select_set(False)
     mold_obj.select_set(True); bpy.context.view_layer.objects.active = mold_obj
     export_stl_selected(output_path)
