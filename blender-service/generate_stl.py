@@ -323,7 +323,7 @@ def report_all(obj):
 
 
 # ---------------------------
-# Payload helpers
+# Payload helpers + beardline composer
 # ---------------------------
 
 def _lower_keys(obj):
@@ -368,7 +368,7 @@ def _snap_close_endpoints(sorted_pts, tol=1e-4):
             sorted_pts[-1] = (a[0], a[1], a[2])
     return sorted_pts
 
-# ---- NEW: polyline cleaning to remove duplicates/teleports ----
+# ---- polyline de-dupe + split on teleports ----
 
 def _dedupe_exact(points, eps=0.0):
     out, last = [], None
@@ -392,31 +392,64 @@ def _split_by_discontinuity(points, mult=8.0, floor=0.002):
             segs[-1].append(P[i])
     return segs
 
-def _seg_len(seg):
-    return sum(math.dist(seg[i+1], seg[i]) for i in range(len(seg)-1)) if len(seg) > 1 else 0.0
-
-def _seg_xspan(seg):
-    return abs(seg[-1][0] - seg[0][0]) if seg else 0.0
-
-def _clean_polyline_for_build(points, name="poly"):
-    """
-    De-dupe identical rows, split on teleports, then keep the segment with the
-    largest 3D length (tie → largest X span). This avoids accidentally keeping
-    a tiny dense chunk.
-    """
-    P0 = list(points)
-    P = _dedupe_exact(P0)
+def _split_segments(points):
+    P = _dedupe_exact(points)
     P = sorted(P, key=lambda p: p[0])
-    segs = _split_by_discontinuity(P, mult=8.0, floor=0.002)  # 2 mm floor
+    segs = _split_by_discontinuity(P, mult=8.0, floor=0.002)
+    # drop tiny 1–2 point segments
+    segs = [s for s in segs if len(s) >= 3]
+    return segs
 
-    if not segs:
-        print(f"[clean:{name}] empty after split"); return P
+def _interp_on_segment(seg, x):
+    """Return (x,y,z) interpolated on seg if x is within range; else None."""
+    if not seg: return None
+    if x < seg[0][0] or x > seg[-1][0]:
+        return None
+    # linear search (segments are short)
+    for k in range(len(seg)-1):
+        a, b = seg[k], seg[k+1]
+        if a[0] <= x <= b[0]:
+            t = 0.0 if b[0] == a[0] else (x - a[0]) / (b[0] - a[0])
+            y = a[1]*(1-t) + b[1]*t
+            z = a[2]*(1-t) + b[2]*t
+            return (x, y, z)
+    return (x, seg[-1][1], seg[-1][2])
 
-    best = max(segs, key=lambda s: (_seg_len(s), _seg_xspan(s)))
-    total_x = abs(P[-1][0] - P[0][0]) if len(P) > 1 else 0.0
-    print(f"[clean:{name}] in={len(P0)} dedup={len(P)} segments={len(segs)} "
-          f"chosen_len={_seg_len(best):.4f} xspan={_seg_xspan(best):.4f} totalX={total_x:.4f}")
-    return best
+def compose_beardline_uniform(segments, sample_count=400, eps=1e-6):
+    """Sample across X and at each X pick the topmost (max-Y) candidate from all segments."""
+    if not segments:
+        return []
+    xs_min = min(s[0][0] for s in segments if s)
+    xs_max = max(s[-1][0] for s in segments if s)
+    if xs_max <= xs_min:
+        return segments[0][:]
+
+    xs = [xs_min + i*(xs_max - xs_min)/max(1, sample_count-1) for i in range(sample_count)]
+    # precompute nearest endpoints as fallback
+    endpoints = [seg[0] for seg in segments] + [seg[-1] for seg in segments]
+
+    out = []
+    last_x = None
+    for x in xs:
+        candidates = []
+        for seg in segments:
+            p = _interp_on_segment(seg, x)
+            if p is not None:
+                candidates.append(p)
+        if candidates:
+            # choose highest Y
+            px, py, pz = max(candidates, key=lambda q: q[1])
+        else:
+            # fallback to nearest endpoint (choose the one with highest Y among nearest few)
+            nearest = min(endpoints, key=lambda e: abs(e[0]-x))
+            px, py, pz = (x, nearest[1], nearest[2])
+        if last_x is not None and abs(px - last_x) < eps:
+            px = last_x + eps
+        out.append((px, py, pz))
+        last_x = px
+
+    print(f"[compose:beard] segments={len(segments)} X[{xs_min:.4f},{xs_max:.4f}] samples={len(out)}")
+    return out
 
 
 # ---------------------------
@@ -444,7 +477,6 @@ def consolidate_front_sheet(faces, weld_eps, min_feature):
         try:
             bm.faces.new([va, vb, vc])
         except ValueError:
-            # face already exists; skip
             pass
 
     bm.verts.ensure_lookup_table(); bm.edges.ensure_lookup_table(); bm.faces.ensure_lookup_table()
@@ -452,19 +484,11 @@ def consolidate_front_sheet(faces, weld_eps, min_feature):
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps)
     bmesh.ops.dissolve_degenerate(bm, dist=max(min_feature * 0.25, 1e-7))
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-
-    # Merge co-planar strips
     bmesh.ops.dissolve_limit(
-        bm,
-        angle_limit=0.01,  # ~0.57 degrees
-        use_dissolve_boundaries=True,
-        verts=bm.verts, edges=bm.edges
+        bm, angle_limit=0.01, use_dissolve_boundaries=True, verts=bm.verts, edges=bm.edges
     )
-
-    # Triangulate for a clean sheet
     bmesh.ops.triangulate(bm, faces=bm.faces)
 
-    # Emit triangles
     tris = []
     for f in bm.faces:
         if len(f.verts) == 3:
@@ -610,17 +634,23 @@ def main():
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
 
-    # Clean beardline: dedupe + split on teleports, keep longest segment, snap ends
+    # Compose beardline from ALL segments (no more picking a single run)
     beardline_raw = [to_vec3(v) for v in beardline_in]
-    beardline = _clean_polyline_for_build(beardline_raw, name="beard")
+    beard_segments = _split_segments(beardline_raw)
+    print(f"[clean:beard] segments={len(beard_segments)} sizes={[len(s) for s in beard_segments]}")
+    beardline = compose_beardline_uniform(
+        beard_segments,
+        sample_count=max(400, int((data.get('params') or {}).get('lipSegments', 160)) * 2)
+    )
     beardline = _snap_close_endpoints(sorted(beardline, key=lambda p: p[0]), tol=1e-4)
 
-    # Neckline (optional) with same cleaning
+    # Neckline (optional) — keep longest continuous run and smooth
     neckline_in = data.get("neckline") or data_lc.get("neckline")
     if neckline_in:
-        neckline_raw = [to_vec3(v) for v in neckline_in]
-        neckline = _clean_polyline_for_build(neckline_raw, name="neck")
-        neckline = smooth_vertices_open(sorted(neckline, key=lambda p: p[0]), passes=3)
+        neckline_pts = [to_vec3(v) for v in neckline_in]
+        neck_segs = _split_segments(neckline_pts)
+        neck = max(neck_segs, key=len) if neck_segs else neckline_pts
+        neckline = smooth_vertices_open(sorted(neck, key=lambda p: p[0]), passes=3)
     else:
         neckline = []
 
