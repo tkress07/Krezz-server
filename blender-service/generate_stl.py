@@ -7,7 +7,7 @@ from mathutils import Vector
 
 # ========= Tunables (good defaults for ~0.4 mm nozzle) =========
 WELD_EPS_DEFAULT  = 0.0002        # shared-vertex tolerance (meters)
-AREA_MIN          = 1e-14         # drop ultra-skinny sliver tris early
+AREA_MIN          = 5e-13         # tighter sliver filter to cull razor-thin tris
 VOXEL_DEFAULT     = 0.0           # OFF by default; set via params if needed
 # ===============================================================
 
@@ -42,34 +42,52 @@ def smooth_vertices_open(vertices, passes=1):
         V = NV
     return V
 
+def resample_polyline_by_x(points, xs):
+    """Linear interpolation along the X-sorted polyline."""
+    if not points:
+        return [(x, 0.0, 0.0) for x in xs]
+    P = sorted(points, key=lambda p: p[0])
+    out = []
+    k = 0
+    n = len(P)
+    for x in xs:
+        if x <= P[0][0]:
+            out.append((x, P[0][1], P[0][2])); continue
+        if x >= P[-1][0]:
+            out.append((x, P[-1][1], P[-1][2])); continue
+        while k < n - 2 and P[k + 1][0] < x:
+            k += 1
+        a, b = P[k], P[k + 1]
+        t = 0.0 if b[0] == a[0] else (x - a[0]) / (b[0] - a[0])
+        y = a[1] * (1 - t) + b[1] * t
+        z = a[2] * (1 - t) + b[2] * t
+        out.append((x, y, z))
+    return out
+
 def sample_base_points_along_x(beardline, lip_segments, eps=1e-6):
     """
-    Sample along X with strictly increasing X (no duplicate columns).
+    TRUE interpolation sampler:
+    - decides a uniform X-grid;
+    - interpolates (y,z) along the beardline polyline;
+    - enforces strictly increasing X.
     """
     if not beardline:
-        return [(-0.008 + 0.016 * i / max(1, lip_segments - 1), 0.03, 0.0)
-                for i in range(lip_segments)], -0.008, 0.008
+        cols = [(-0.008 + 0.016 * i / max(1, lip_segments - 1), 0.03, 0.0)
+                for i in range(lip_segments)]
+        return cols, -0.008, 0.008
 
-    xs = [p[0] for p in beardline]
-    ys = [p[1] for p in beardline]
-    zs = [p[2] for p in beardline]
+    P = sorted(beardline, key=lambda p: p[0])
+    minX, maxX = P[0][0], P[-1][0]
+    xs = [minX + i * (maxX - minX) / max(1, lip_segments - 1) for i in range(lip_segments)]
+    cols = resample_polyline_by_x(P, xs)
 
-    minX, maxX = min(xs), max(xs)
-    seg_w = (maxX - minX) / max(1, (lip_segments - 1))
-    fallbackY = max(ys)
-    fallbackZ = sum(zs) / len(zs)
-
-    cols = []
-    last_x = None
-    for i in range(lip_segments):
-        x = minX + i * seg_w
+    out, last_x = [], None
+    for (x, y, z) in cols:
         if last_x is not None and abs(x - last_x) < eps:
             x = last_x + eps
+        out.append((x, y, z))
         last_x = x
-        top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
-        cols.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
-
-    return cols, minX, maxX
+    return out, minX, maxX
 
 def tapered_radius(x, centerX, min_r, max_r, taper_mult):
     taper = max(0.0, 1.0 - abs(x - centerX) * taper_mult)
@@ -98,27 +116,6 @@ def quads_to_tris_between_rings(lip_vertices, base_count, ring_count):
             faces.append([a, c, b])
             faces.append([b, c, d])
     return faces
-
-def resample_polyline_by_x(points, xs):
-    if not points:
-        return [(x, 0.0, 0.0) for x in xs]
-    P = sorted(points, key=lambda p: p[0])
-    out = []
-    k = 0
-    n = len(P)
-    for x in xs:
-        if x <= P[0][0]:
-            out.append((x, P[0][1], P[0][2])); continue
-        if x >= P[-1][0]:
-            out.append((x, P[-1][1], P[-1][2])); continue
-        while k < n - 2 and P[k + 1][0] < x:
-            k += 1
-        a, b = P[k], P[k + 1]
-        t = 0.0 if b[0] == a[0] else (x - a[0]) / (b[0] - a[0])
-        y = a[1] * (1 - t) + b[1] * t
-        z = a[2] * (1 - t) + b[2] * t
-        out.append((x, y, z))
-    return out
 
 def strap_tris_equal_counts(A, B):
     faces = []
@@ -186,7 +183,8 @@ def extrude_surface_z_solid(tri_faces, depth, weld_eps):
     return out
 
 def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
-    v2i, verts, faces = {}, [], []
+    """Build an object from triangle coordinate tuples, removing duplicate faces."""
+    v2i, verts, faces_idx = {}, [], []
 
     def key(p): return _rounded_key(p, weld_eps)
 
@@ -199,15 +197,25 @@ def make_mesh_from_tris(tris, name="MoldMesh", weld_eps=WELD_EPS_DEFAULT):
                 verts.append(k)
             ids.append(v2i[k])
         if area2(verts[ids[0]], verts[ids[1]], verts[ids[2]]) > AREA_MIN:
-            faces.append(tuple(ids))
+            faces_idx.append(tuple(ids))
+
+    # remove duplicate faces (same vertex set)
+    uniq, out_faces = set(), []
+    for (i, j, k) in faces_idx:
+        fkey = tuple(sorted((i, j, k)))
+        if fkey in uniq:
+            continue
+        uniq.add(fkey)
+        out_faces.append((i, j, k))
 
     mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata([Vector(v) for v in verts], [], faces)
+    mesh.from_pydata([Vector(v) for v in verts], [], out_faces)
     mesh.validate(verbose=True); mesh.update()
 
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
     return obj
+
 
 def _do_clean(bm, weld_dist, degenerate_dist):
     # micro + main weld & dissolve
@@ -262,95 +270,60 @@ def apply_boolean_difference(target_obj, cutters):
 
 
 # ---------------------------
-# Build triangles (Swift-parity, with seam fixes)
+# Diagnostics (mesh health)
 # ---------------------------
 
-def build_triangles(beardline, neckline, params):
-    if not beardline:
-        raise ValueError("Empty beardline supplied.")
+def mesh_diagnostics(obj):
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
+    boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+    shortest = 1e9
+    for e in bm.edges:
+        try:
+            shortest = min(shortest, float(e.calc_length()))
+        except Exception:
+            pass
+    bm.free()
+    print(f"[diag] boundary={len(boundary_edges)} nonmanifold={len(nonman_edges)} minEdge={shortest:.6f} m")
+    return len(boundary_edges), len(nonman_edges), shortest
 
-    # These remain camelCase; earlier we unify casings.
-    lip_segments    = int(params.get("lipSegments", 100))
-    arc_steps       = int(params.get("arcSteps", 24))
-    max_lip_radius  = float(params.get("maxLipRadius", 0.008))
-    min_lip_radius  = float(params.get("minLipRadius", 0.003))
-    taper_mult      = float(params.get("taperMult", 25.0))
-    extrusion_depth = float(params.get("extrusionDepth", -0.008))
+def count_duplicate_faces(obj):
+    me = obj.data
+    bm = bmesh.new(); bm.from_mesh(me)
+    bm.verts.ensure_lookup_table(); bm.faces.ensure_lookup_table()
+    seen, dup = set(), 0
+    for f in bm.faces:
+        key = tuple(sorted(v.index for v in f.verts))
+        if key in seen: dup += 1
+        else: seen.add(key)
+    bm.free()
+    print(f"[diag] duplicate_faces={dup}")
+    return dup
 
-    # 1) Base points sampled by X (strictly increasing columns)
-    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
-    centerX = 0.5 * (minX + maxX)
+def slice_islands(obj, z, tol=1e-5):
+    me = obj.data
+    bm = bmesh.new(); bm.from_mesh(me)
+    edges = 0
+    for e in bm.edges:
+        z0 = e.verts[0].co.z; z1 = e.verts[1].co.z
+        if (z0 - z) * (z1 - z) <= 0 and abs(z0 - z) > tol and abs(z1 - z) > tol:
+            edges += 1
+    bm.free()
+    print(f"[diag] cross_edges@z={z:.4f} -> {edges}")
+    return edges
 
-    # 2) Lip rings from base points
-    lip_vertices, ring_count = generate_lip_rings(
-        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
-    )
-
-    faces = []
-    # 2a) Quads between lip rings
-    faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
-
-    # 2b) Cap basePoints ↔ ring0, skipping near-zero-width columns
-    for i in range(len(base_points) - 1):
-        a = base_points[i]
-        b = base_points[i + 1]
-        if abs(b[0] - a[0]) < 1e-7:
-            continue
-        c = lip_vertices[i * ring_count + 0]
-        d = lip_vertices[(i + 1) * ring_count + 0]
-        faces.append([a, c, b])
-        faces.append([b, c, d])
-
-    # 3) Separate strap: make TOP of strap exactly our base grid to guarantee weld
-    if neckline:
-        xs = [bp[0] for bp in base_points]
-        beard_X = base_points[:]  # share exact columns with lip/base
-        neck_X  = resample_polyline_by_x(neckline, xs)
-        faces += strap_tris_equal_counts(beard_X, neck_X)
-
-    # Clean out razor-thin slivers before extrusion
-    faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
-
-    # Consistent weld for the whole sheet prior to extrusion
-    weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
-    extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
-
-    return extruded, abs(extrusion_depth), weld_eps
+def report_all(obj):
+    mesh_diagnostics(obj)
+    count_duplicate_faces(obj)
+    z_top = max(v.co.z for v in obj.data.vertices)
+    slice_islands(obj, z_top - 0.0005)
 
 
 # ---------------------------
-# IO / main pipeline
+# Payload helpers
 # ---------------------------
-
-def export_stl_selected(filepath):
-    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
-
-def voxel_remesh_if_requested(obj, voxel_size):
-    if voxel_size <= 0:
-        return
-    try:
-        for o in bpy.data.objects:
-            o.select_set(False)
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
-    except Exception:
-        pass
-
-def report_non_manifold(obj):
-    try:
-        mesh = obj.data
-        bm = bmesh.new()
-        bm.from_mesh(mesh)
-        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
-        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
-        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
-        bm.free()
-    except Exception:
-        pass
-
-# ----- payload helpers -----
 
 def _lower_keys(obj):
     if isinstance(obj, dict):
@@ -394,21 +367,153 @@ def _snap_close_endpoints(sorted_pts, tol=1e-4):
             sorted_pts[-1] = (a[0], a[1], a[2])
     return sorted_pts
 
-def mesh_diagnostics(obj):
-    mesh = obj.data
+
+# ---------------------------
+# Front sheet consolidation (pre-extrusion)
+# ---------------------------
+
+def consolidate_front_sheet(faces, weld_eps, min_feature):
+    """
+    Build a BM mesh from 'faces', weld/dissolve/triangulate to remove overlaps
+    and co-planar duplicates, then return cleaned triangle tuples.
+    """
     bm = bmesh.new()
-    bm.from_mesh(mesh)
-    nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
-    boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
-    shortest = 1e9
-    for e in bm.edges:
+    vmap = {}
+
+    def v_for(p):
+        k = _rounded_key(p, weld_eps)
+        v = vmap.get(k)
+        if v is None:
+            v = bm.verts.new(Vector(k))
+            vmap[k] = v
+        return v
+
+    for (a, b, c) in faces:
+        va, vb, vc = v_for(a), v_for(b), v_for(c)
         try:
-            shortest = min(shortest, float(e.calc_length()))
-        except Exception:
+            bm.faces.new([va, vb, vc])
+        except ValueError:
+            # face already exists; skip
             pass
+
+    bm.verts.ensure_lookup_table(); bm.edges.ensure_lookup_table(); bm.faces.ensure_lookup_table()
+
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_eps)
+    bmesh.ops.dissolve_degenerate(bm, dist=max(min_feature * 0.25, 1e-7))
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    # Merge co-planar strips
+    bmesh.ops.dissolve_limit(
+        bm,
+        angle_limit=0.01,  # ~0.57 degrees
+        use_dissolve_boundaries=True,
+        verts=bm.verts, edges=bm.edges
+    )
+
+    # Triangulate for a clean sheet
+    bmesh.ops.triangulate(bm, faces=bm.faces)
+
+    # Emit triangles
+    tris = []
+    for f in bm.faces:
+        if len(f.verts) == 3:
+            a, b, c = f.verts
+            tris.append((tuple(a.co), tuple(b.co), tuple(c.co)))
     bm.free()
-    print(f"[diag] boundary={len(boundary_edges)} nonmanifold={len(nonman_edges)} minEdge={shortest:.6f} m")
-    return len(boundary_edges), len(nonman_edges), shortest
+    return tris
+
+
+# ---------------------------
+# Build triangles (Swift-parity, with seam + sheet fixes)
+# ---------------------------
+
+def build_triangles(beardline, neckline, params):
+    if not beardline:
+        raise ValueError("Empty beardline supplied.")
+
+    lip_segments    = int(params.get("lipSegments", 100))
+    arc_steps       = int(params.get("arcSteps", 24))
+    max_lip_radius  = float(params.get("maxLipRadius", 0.008))
+    min_lip_radius  = float(params.get("minLipRadius", 0.003))
+    taper_mult      = float(params.get("taperMult", 25.0))
+    extrusion_depth = float(params.get("extrusionDepth", -0.008))
+    weld_eps        = float(params.get("weldEps", WELD_EPS_DEFAULT))
+    min_feature     = float(params.get("minFeature", max(0.0012, weld_eps * 2.0)))
+
+    # 1) Base points sampled by X (strictly increasing columns, true interpolation)
+    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
+    centerX = 0.5 * (minX + maxX)
+
+    # 2) Lip rings from base points
+    lip_vertices, ring_count = generate_lip_rings(
+        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult
+    )
+
+    faces = []
+    # 2a) Quads between lip rings
+    faces += quads_to_tris_between_rings(lip_vertices, len(base_points), ring_count)
+
+    # 2b) Cap basePoints ↔ ring0, skipping near-zero-width columns
+    for i in range(len(base_points) - 1):
+        a = base_points[i]
+        b = base_points[i + 1]
+        if abs(b[0] - a[0]) < 1e-7:
+            continue
+        c = lip_vertices[i * ring_count + 0]
+        d = lip_vertices[(i + 1) * ring_count + 0]
+        faces.append([a, c, b])
+        faces.append([b, c, d])
+
+    # 3) Separate strap: make TOP of strap exactly our base grid to guarantee weld
+    if neckline:
+        xs = [bp[0] for bp in base_points]
+        beard_X = base_points[:]  # share exact columns with lip/base
+        neck_X  = resample_polyline_by_x(neckline, xs)
+        faces += strap_tris_equal_counts(beard_X, neck_X)
+
+    # Clean out razor-thin slivers before any consolidation
+    faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
+
+    # 4) CONSOLIDATE front sheet (remove overlaps/duplicates) BEFORE extrusion
+    faces = consolidate_front_sheet(faces, weld_eps=weld_eps, min_feature=min_feature)
+
+    # 5) Consistent weld for the whole sheet prior to extrusion
+    extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
+
+    return extruded, abs(extrusion_depth), weld_eps
+
+
+# ---------------------------
+# IO / main pipeline
+# ---------------------------
+
+def export_stl_selected(filepath):
+    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=True)
+
+def voxel_remesh_if_requested(obj, voxel_size):
+    if voxel_size <= 0:
+        return
+    try:
+        for o in bpy.data.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        bpy.ops.object.voxel_remesh(voxel_size=float(voxel_size), adaptivity=0.0)
+    except Exception:
+        pass
+
+def report_non_manifold(obj):
+    try:
+        mesh = obj.data
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        nonman_edges = [e for e in bm.edges if len(e.link_faces) not in (1, 2)]
+        boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+        print(f"Non-manifold edges: {len(nonman_edges)} | Boundary edges: {len(boundary_edges)}")
+        bm.free()
+    except Exception:
+        pass
 
 def ensure_watertight(obj, params):
     """
@@ -420,6 +525,7 @@ def ensure_watertight(obj, params):
     allow_auto = bool(params.get("autoRemesh", False))
 
     b, n, shortest = mesh_diagnostics(obj)
+    count_duplicate_faces(obj)
 
     if not allow_auto:
         print("[fix] auto-remesh disabled (autoRemesh=false).")
@@ -432,10 +538,8 @@ def ensure_watertight(obj, params):
         voxel_remesh_if_requested(obj, suggested)
         clean_mesh(obj, weld_eps, min_feature=min_feature, strong=True)
         mesh_diagnostics(obj)
+        count_duplicate_faces(obj)
 
-# ---------------------------
-# Main
-# ---------------------------
 
 def main():
     argv = sys.argv
@@ -449,6 +553,7 @@ def main():
 
     data_lc = _lower_keys(data)
 
+    # Accept both 'beardline' and legacy 'vertices', any casing
     beardline_in = data.get("beardline") or data.get("vertices") \
                    or data_lc.get("beardline") or data_lc.get("vertices")
     if beardline_in is None:
@@ -473,7 +578,7 @@ def main():
     mf_param = params.get("minFeature")
     mold_obj = make_mesh_from_tris(tris, name="BeardMold", weld_eps=weld_eps)
 
-    # Clean twice BEFORE any remesh (strong pass added)
+    # Clean twice BEFORE any optional remesh
     clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=False)
     clean_mesh(mold_obj, weld_eps, min_feature=mf_param, strong=True)
 
