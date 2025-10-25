@@ -3,6 +3,7 @@ import bmesh
 import json
 import sys
 import math
+import statistics
 from mathutils import Vector
 
 # ========= Tunables (good defaults for ~0.4 mm nozzle) =========
@@ -367,6 +368,42 @@ def _snap_close_endpoints(sorted_pts, tol=1e-4):
             sorted_pts[-1] = (a[0], a[1], a[2])
     return sorted_pts
 
+# ---- NEW: polyline cleaning to remove duplicates/teleports ----
+
+def _dedupe_exact(points, eps=0.0):
+    out = []
+    last = None
+    for p in points:
+        if last is None or abs(p[0]-last[0])>eps or abs(p[1]-last[1])>eps or abs(p[2]-last[2])>eps:
+            out.append(p); last = p
+    return out
+
+def _split_by_discontinuity(points, mult=8.0, floor=0.002):
+    """
+    Split X-sorted points whenever the 3D jump is much bigger than normal.
+    mult: times the median step to be a 'jump'; floor: absolute 2 mm default.
+    """
+    if len(points) < 3: return [points]
+    P = sorted(points, key=lambda p: p[0])
+    steps = [((P[i+1][0]-P[i][0])**2 + (P[i+1][1]-P[i][1])**2 + (P[i+1][2]-P[i][2])**2)**0.5 for i in range(len(P)-1)]
+    med = max(1e-9, statistics.median(steps))
+    thr = max(floor, mult * med)
+    segs = [[P[0]]]
+    for i in range(1, len(P)):
+        d = ((P[i][0]-P[i-1][0])**2 + (P[i][1]-P[i-1][1])**2 + (P[i][2]-P[i-1][2])**2)**0.5
+        if d > thr:
+            segs.append([P[i]])
+        else:
+            segs[-1].append(P[i])
+    return segs
+
+def _clean_polyline_for_build(points, name="poly"):
+    P = _dedupe_exact(points)
+    segs = _split_by_discontinuity(P, mult=8.0, floor=0.002)   # 2 mm floor
+    seg = max(segs, key=lambda s: len(s))
+    print(f"[clean:{name}] in={len(points)} dedup={len(P)} segments={len(segs)} using={len(seg)}")
+    return seg
+
 
 # ---------------------------
 # Front sheet consolidation (pre-extrusion)
@@ -559,17 +596,25 @@ def main():
     if beardline_in is None:
         raise ValueError("Missing 'beardline' (or legacy 'vertices') in payload.")
 
-    beardline = sorted([to_vec3(v) for v in beardline_in], key=lambda p: p[0])
-    beardline = _snap_close_endpoints(beardline, tol=1e-4)
+    # Clean beardline: dedupe + split on teleports, keep longest segment, snap ends
+    beardline_raw = [to_vec3(v) for v in beardline_in]
+    beardline = _clean_polyline_for_build(beardline_raw, name="beard")
+    beardline = _snap_close_endpoints(sorted(beardline, key=lambda p: p[0]), tol=1e-4)
 
+    # Neckline (optional) with same cleaning
     neckline_in = data.get("neckline") or data_lc.get("neckline")
-    neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
-    if neckline:
-        neckline = smooth_vertices_open(neckline, passes=3)
+    if neckline_in:
+        neckline_raw = [to_vec3(v) for v in neckline_in]
+        neckline = _clean_polyline_for_build(nickname := neckline_raw, name="neck")
+        neckline = smooth_vertices_open(sorted(neckline, key=lambda p: p[0]), passes=3)
+    else:
+        neckline = []
 
+    # Holes tolerant to multiple key names/casings
     holes_in = data.get("holeCenters") or data.get("holes") \
                or data_lc.get("holecenters") or data_lc.get("holes") or []
 
+    # Params: unify casings so downstream camelCase reads work
     params_any = data.get("params") or data_lc.get("params") or {}
     params = _unify_params(params_any)
 
