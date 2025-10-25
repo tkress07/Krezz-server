@@ -371,38 +371,52 @@ def _snap_close_endpoints(sorted_pts, tol=1e-4):
 # ---- NEW: polyline cleaning to remove duplicates/teleports ----
 
 def _dedupe_exact(points, eps=0.0):
-    out = []
-    last = None
+    out, last = [], None
     for p in points:
         if last is None or abs(p[0]-last[0])>eps or abs(p[1]-last[1])>eps or abs(p[2]-last[2])>eps:
             out.append(p); last = p
     return out
 
 def _split_by_discontinuity(points, mult=8.0, floor=0.002):
-    """
-    Split X-sorted points whenever the 3D jump is much bigger than normal.
-    mult: times the median step to be a 'jump'; floor: absolute 2 mm default.
-    """
+    """Split X-sorted points at big 3D jumps (meters)."""
     if len(points) < 3: return [points]
     P = sorted(points, key=lambda p: p[0])
-    steps = [((P[i+1][0]-P[i][0])**2 + (P[i+1][1]-P[i][1])**2 + (P[i+1][2]-P[i][2])**2)**0.5 for i in range(len(P)-1)]
+    steps = [math.dist(P[i+1], P[i]) for i in range(len(P)-1)]
     med = max(1e-9, statistics.median(steps))
     thr = max(floor, mult * med)
     segs = [[P[0]]]
     for i in range(1, len(P)):
-        d = ((P[i][0]-P[i-1][0])**2 + (P[i][1]-P[i-1][1])**2 + (P[i][2]-P[i-1][2])**2)**0.5
-        if d > thr:
+        if math.dist(P[i], P[i-1]) > thr:
             segs.append([P[i]])
         else:
             segs[-1].append(P[i])
     return segs
 
+def _seg_len(seg):
+    return sum(math.dist(seg[i+1], seg[i]) for i in range(len(seg)-1)) if len(seg) > 1 else 0.0
+
+def _seg_xspan(seg):
+    return abs(seg[-1][0] - seg[0][0]) if seg else 0.0
+
 def _clean_polyline_for_build(points, name="poly"):
-    P = _dedupe_exact(points)
-    segs = _split_by_discontinuity(P, mult=8.0, floor=0.002)   # 2 mm floor
-    seg = max(segs, key=lambda s: len(s))
-    print(f"[clean:{name}] in={len(points)} dedup={len(P)} segments={len(segs)} using={len(seg)}")
-    return seg
+    """
+    De-dupe identical rows, split on teleports, then keep the segment with the
+    largest 3D length (tie → largest X span). This avoids accidentally keeping
+    a tiny dense chunk.
+    """
+    P0 = list(points)
+    P = _dedupe_exact(P0)
+    P = sorted(P, key=lambda p: p[0])
+    segs = _split_by_discontinuity(P, mult=8.0, floor=0.002)  # 2 mm floor
+
+    if not segs:
+        print(f"[clean:{name}] empty after split"); return P
+
+    best = max(segs, key=lambda s: (_seg_len(s), _seg_xspan(s)))
+    total_x = abs(P[-1][0] - P[0][0]) if len(P) > 1 else 0.0
+    print(f"[clean:{name}] in={len(P0)} dedup={len(P)} segments={len(segs)} "
+          f"chosen_len={_seg_len(best):.4f} xspan={_seg_xspan(best):.4f} totalX={total_x:.4f}")
+    return best
 
 
 # ---------------------------
@@ -605,7 +619,7 @@ def main():
     neckline_in = data.get("neckline") or data_lc.get("neckline")
     if neckline_in:
         neckline_raw = [to_vec3(v) for v in neckline_in]
-        neckline = _clean_polyline_for_build(nickname := neckline_raw, name="neck")
+        neckline = _clean_polyline_for_build(neckline_raw, name="neck")
         neckline = smooth_vertices_open(sorted(neckline, key=lambda p: p[0]), passes=3)
     else:
         neckline = []
