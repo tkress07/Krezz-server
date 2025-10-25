@@ -1,4 +1,4 @@
-# krezz_mold.py — watertight mold generator with adaptive columns + lip smoothing
+# krezz_mold.py — continuous top-edge lip + arc-length sweep + watertight solid
 # Python 3 / Blender 3.x
 
 import bpy
@@ -8,7 +8,7 @@ import sys
 import math
 from mathutils import Vector
 
-# ========= Tunables (safe defaults; most things are overridden by params) ====
+# ========= Tunables (safe defaults; override via "params") ====================
 WELD_EPS_DEFAULT  = 0.0002     # shared-vertex tolerance (meters)
 AREA_MIN          = 1e-14      # drop ultra-skinny sliver tris early
 VOXEL_DEFAULT     = 0.0        # OFF by default; use autoRemesh or set voxelRemesh
@@ -31,48 +31,54 @@ def area2(a, b, c):
     return cx * cx + cy * cy + cz * cz
 
 def smooth_vertices_open(vertices, passes=1):
+    """Average only Y/Z (leave X as-is)."""
     if len(vertices) < 3 or passes <= 0:
         return vertices[:]
     V = vertices[:]
     for _ in range(passes):
         NV = [V[0]]
         for i in range(1, len(V) - 1):
-            px, py, pz = V[i - 1]
-            cx, cy, cz = V[i]
-            nx, ny, nz = V[i + 1]
-            NV.append((cx, (py + cy + ny) / 3.0, (pz + cz + nz) / 3.0))
+            x = V[i][0]
+            y = (V[i - 1][1] + V[i][1] + V[i + 1][1]) / 3.0
+            z = (V[i - 1][2] + V[i][2] + V[i + 1][2]) / 3.0
+            NV.append((x, y, z))
         NV.append(V[-1])
         V = NV
     return V
 
-def sample_base_points_along_x(beardline, count, eps=1e-6):
-    """
-    Uniformly sample along X with strictly increasing X.
-    """
-    if not beardline:
-        return [(-0.008 + 0.016 * i / max(1, count - 1), 0.03, 0.0)
-                for i in range(count)], -0.008, 0.008
+# --------- Arc-length parameterization (top edge becomes intrinsically smooth)
+def _cumlen(points):
+    L = [0.0]
+    for i in range(1, len(points)):
+        a, b = points[i-1], points[i]
+        dx = b[0]-a[0]; dy = b[1]-a[1]; dz = b[2]-a[2]
+        L.append(L[-1] + (dx*dx+dy*dy+dz*dz)**0.5)
+    return L, (L[-1] if L else 0.0)
 
-    xs = [p[0] for p in beardline]
-    ys = [p[1] for p in beardline]
-    zs = [p[2] for p in beardline]
-
-    minX, maxX = min(xs), max(xs)
-    seg_w = (maxX - minX) / max(1, (count - 1))
-    fallbackY = max(ys)
-    fallbackZ = sum(zs) / len(zs)
-
-    cols = []
-    last_x = None
-    for i in range(count):
-        x = minX + i * seg_w
-        if last_x is not None and abs(x - last_x) < eps:
-            x = last_x + eps
-        last_x = x
-        top = min(beardline, key=lambda p: abs(p[0] - x)) if beardline else None
-        cols.append((x, top[1], top[2]) if top else (x, fallbackY, fallbackZ))
-
-    return cols, minX, maxX
+def _resample_by_t(points, ts):
+    """Linear interpolate by arc-length t in [0,1]."""
+    if not points:
+        return [(0.0, 0.0, 0.0) for _ in ts]
+    P = points[:]
+    L, total = _cumlen(P)
+    if total <= 1e-12:
+        x = [p[0] for p in P]; y = sum(p[1] for p in P)/len(P); z = sum(p[2] for p in P)/len(P)
+        return [(xi, y, z) for xi in x]
+    out = []
+    i = 0
+    for t in ts:
+        s = t * total
+        while i < len(L)-2 and L[i+1] < s:
+            i += 1
+        a, b = P[i], P[i+1]
+        s0, s1 = L[i], L[i+1]
+        u = 0.0 if s1 == s0 else (s - s0) / (s1 - s0)
+        out.append((
+            a[0]*(1-u)+b[0]*u,
+            a[1]*(1*u)+b[1]*u - 0.0*(1-u),  # standard LERP
+            a[2]*(1-u)+b[2]*u
+        ))
+    return out
 
 def resample_polyline_by_x(points, xs):
     if not points:
@@ -95,7 +101,7 @@ def resample_polyline_by_x(points, xs):
         out.append((x, y, z))
     return out
 
-# --- NEW: adaptive densifier along X (limits “stair step” on side wall)
+# --- optional X-densifier (kept for compatibility)
 def densify_by_dx(points, max_dx):
     P = sorted(points, key=lambda p: p[0])
     if len(P) < 2: return P
@@ -111,7 +117,6 @@ def densify_by_dx(points, max_dx):
                         a[2]*(1-t) + b[2]*t))
     return out
 
-# --- NEW: smooth a single row in Y/Z only (keeps the X columns fixed for welding)
 def smooth_row_keep_x(row, passes=2):
     if len(row) < 3 or passes <= 0: return row
     R = row[:]
@@ -259,43 +264,8 @@ def apply_boolean_difference(target_obj, cutters):
 
 
 # ---------------------------
-# Grid construction (quarter-arc lip with smoothing)
+# Grid construction
 # ---------------------------
-
-def build_sheet_grid(base_points, arc_steps, min_r, max_r, centerX, taper_mult,
-                     neckline=None, profile_bias=1.0, prelift=0.0,
-                     lip_smooth_passes=2):
-    """
-    Grid rows:
-      row 0 : neckline (if provided)
-      row 1 : base_points (beardline resampled)
-      rows 2.. : quarter-arc lip (monotonic outward, smoothed in Y/Z)
-    """
-    n = len(base_points)
-    xs = [bp[0] for bp in base_points]
-    neck_row = resample_polyline_by_x(neckline, xs) if neckline else []
-
-    grid = []
-    if neck_row: grid.append(neck_row)
-    grid.append(base_points)
-
-    rings = arc_steps
-    for j in range(rings):
-        t = (j + 1) / float(rings + 1)                 # (0,1]
-        t = max(1e-6, min(1.0, t)) ** max(0.1, float(profile_bias))
-        ang = 0.5 * math.pi * t                        # quarter arc: 0 → π/2
-        row = []
-        for (bx, by, bz) in base_points:
-            dx = abs(bx - centerX)
-            taper = max(0.0, 1.0 - dx * taper_mult)
-            r = min_r + taper * (max_r - min_r)
-            y = by - r * math.sin(ang)
-            z = bz + float(prelift) * (1.0 - math.cos(ang))
-            row.append((bx, y, z))
-        grid.append(smooth_row_keep_x(row, passes=lip_smooth_passes))
-
-    rows = len(grid)
-    return grid, n, rows
 
 def grid_to_tris(grid):
     """Convert a [rows][cols] vertex grid to triangle list (row-wise strips)."""
@@ -314,47 +284,114 @@ def grid_to_tris(grid):
 
 
 # ---------------------------
-# Build triangles (overlay seam fixes + smoothing)
+# Build triangles (smooth top + edge roll + quarter-arc)
 # ---------------------------
 
 def build_triangles(beardline, neckline, params):
     if not beardline:
         raise ValueError("Empty beardline supplied.")
 
-    lip_segments    = int(params.get("lipSegments", 160))
-    arc_steps       = int(params.get("arcSteps", 40))
+    # ---- Params
+    lip_segments    = int(params.get("lipSegments", 200))
+    arc_steps       = int(params.get("arcSteps", 48))
     max_lip_radius  = float(params.get("maxLipRadius", 0.010))
     min_lip_radius  = float(params.get("minLipRadius", 0.0045))
     taper_mult      = float(params.get("taperMult", 20.0))
     extrusion_depth = float(params.get("extrusionDepth", -0.011))
-    profile_bias    = float(params.get("profileBias", 2.0))
-    prelift         = float(params.get("prelift", 0.0006))
-    target_dx       = float(params.get("targetDx", 0.00045))
-    lip_smooth_pass = int(params.get("lipSmoothPasses", 3))
+    profile_bias    = float(params.get("profileBias", 2.2))   # speeds initial curvature
+    prelift         = float(params.get("prelift", 0.0008))
+    weld_eps        = float(params.get("weldEps", WELD_EPS_DEFAULT))
 
-    # 1) Base points sampled by X (strictly increasing columns), then densify
-    base_points, minX, maxX = sample_base_points_along_x(beardline, lip_segments)
-    avg_dx = (maxX - minX) / max(1, len(base_points) - 1)
-    if avg_dx > target_dx:
-        base_points = densify_by_dx(base_points, target_dx)
-        print(f"[refine] columns: {len(base_points)} (target Δx={target_dx:.6f})")
+    # sampling & smoothing
+    sample_mode     = str(params.get("sampleMode", "arclen")).lower()  # "arclen" | "x"
+    base_smooth     = int(params.get("baseSmoothPasses", 3))
+    lip_smooth_pass = int(params.get("lipSmoothPasses", 3))
+    target_dx       = float(params.get("targetDx", 0.00045))  # only used for "x" mode
+
+    # top-edge roll (continuous lip all around the top edge)
+    edgeR           = float(params.get("edgeLipRadius", 0.0015))   # ~1.5 mm
+    edgeAngDeg      = float(params.get("edgeLipAngleDeg", 35.0))   # roll angle
+    edgeSteps       = int(params.get("edgeLipSteps", 4))           # rows for the roll
+
+    # ---- 1) Build base row with smooth, arc-length sampling
+    P = [tuple(p) for p in sorted(beardline, key=lambda p: p[0])]
+    if sample_mode == "arclen":
+        ts = [i / max(1, lip_segments - 1) for i in range(lip_segments)]
+        base = _resample_by_t(P, ts)
+        if base_smooth > 0:
+            base = smooth_row_keep_x(base, passes=base_smooth)
+        xs = [b[0] for b in base]  # for neckline resample
+    else:
+        # legacy X-regular grid
+        base, minX, maxX = resample_polyline_by_x(P, [P[0][0] + (P[-1][0]-P[0][0])*i/max(1, lip_segments-1) for i in range(lip_segments)]), P[0][0], P[-1][0]
+        if (maxX - minX) / max(1, len(base)-1) > target_dx:
+            base = densify_by_dx(base, target_dx)
+        if base_smooth > 0:
+            base = smooth_row_keep_x(base, passes=base_smooth)
+        xs = [b[0] for b in base]
+
+    minX = min(b[0] for b in base); maxX = max(b[0] for b in base)
     centerX = 0.5 * (minX + maxX)
 
-    # 2) Build a smoothed lip grid (quarter-arc), include neckline row if present
-    grid, cols, rows = build_sheet_grid(
-        base_points, arc_steps, min_lip_radius, max_lip_radius, centerX, taper_mult,
-        neckline=neckline, profile_bias=profile_bias, prelift=prelift,
-        lip_smooth_passes=lip_smooth_pass
-    )
+    # ---- 2) Optional neckline strap (resampled to the same parameter)
+    neck_row = []
+    if neckline:
+        if sample_mode == "arclen":
+            neck_row = _resample_by_t(sorted(neckline, key=lambda p: p[0]), [i/max(1, len(base)-1) for i in range(len(base))])
+            neck_row = smooth_vertices_open(neck_row, passes=3)
+        else:
+            neck_row = resample_polyline_by_x(neckline, xs)
+            neck_row = smooth_vertices_open(neck_row, passes=3)
 
-    # 3) Quads → triangles
+    # ---- 3) Build grid rows:
+    #   (a) edge roll ABOVE the base (small convex fillet)
+    grid = []
+    if edgeR > 0.0 and edgeSteps > 0 and edgeAngDeg > 0.0:
+        phi = math.radians(max(0.0, min(85.0, edgeAngDeg)))  # clamp
+        for k in range(edgeSteps, 0, -1):
+            t = k / float(edgeSteps)
+            ang = phi * t                                  # 0..phi
+            row = []
+            for (bx, by, bz) in base:
+                y = by + edgeR * math.sin(ang)
+                z = bz + edgeR * (1.0 - math.cos(ang))
+                row.append((bx, y, z))
+            grid.append(smooth_row_keep_x(row, passes=max(1, lip_smooth_pass//2)))
+
+    #   (b) base row itself (top edge the slicer sees)
+    grid.append(base)
+
+    #   (c) main quarter-arc lip DOWN from base (smooth)
+    for j in range(arc_steps):
+        tt = (j + 1) / float(arc_steps + 1)               # (0,1]
+        tt = max(1e-6, min(1.0, tt)) ** max(0.1, float(profile_bias))
+        ang = 0.5 * math.pi * tt                          # 0 → π/2
+        row = []
+        for (bx, by, bz) in base:
+            dx = abs(bx - centerX)
+            taper = max(0.0, 1.0 - dx * taper_mult)
+            r = min_lip_radius + taper * (max_lip_radius - min_lip_radius)
+            y = by - r * math.sin(ang)                    # down the cheek
+            z = bz + prelift * (1.0 - math.cos(ang))      # tiny prelift to avoid micro steps
+            row.append((bx, y, z))
+        grid.append(smooth_row_keep_x(row, passes=lip_smooth_pass))
+
+    # ---- 4) Triangulate the grid
     faces = grid_to_tris(grid)
 
-    # Clean out razor-thin slivers before extrusion
+    # ---- 5) Optionally strap base↔neckline (shares the same base row vertices)
+    if neck_row:
+        A = base
+        B = neck_row
+        m = min(len(A), len(B))
+        for i in range(m - 1):
+            faces.append([A[i],   B[i],   A[i + 1]])
+            faces.append([A[i+1], B[i],   B[i + 1]])
+
+    # purge slivers
     faces = [tri for tri in faces if area2(tri[0], tri[1], tri[2]) > AREA_MIN]
 
-    # 4) Consistent weld for the whole sheet prior to extrusion
-    weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
+    # ---- 6) Extrude to a watertight solid (front/back + side walls)
     extruded = extrude_surface_z_solid(faces, extrusion_depth, weld_eps=weld_eps)
 
     return extruded, abs(extrusion_depth), weld_eps
@@ -392,7 +429,7 @@ def mesh_diagnostics(obj):
             shortest = min(shortest, float(e.calc_length()))
         except Exception:
             pass
-    # duplicate faces quick check
+    # duplicates quick check
     seen = set(); dup = 0
     for f in bm.faces:
         key = tuple(sorted(v.index for v in f.verts))
@@ -405,7 +442,6 @@ def mesh_diagnostics(obj):
     return len(boundary_edges), len(nonman_edges), shortest
 
 def ensure_watertight(obj, params):
-    """If residual issues remain, auto-remesh at a sane size (unless disabled)."""
     weld_eps = float(params.get("weldEps", WELD_EPS_DEFAULT))
     min_feature = float(params.get("minFeature", 0.0012))
     voxel_size  = float(params.get("voxelRemesh", 0.0))
@@ -469,6 +505,11 @@ def _unify_params(params_any):
     use("prelift",        "prelift")
     use("targetDx",       "targetdx")
     use("lipSmoothPasses","lipsmoothpasses")
+    use("baseSmoothPasses","basesmoothpasses")
+    use("sampleMode",     "samplemode")
+    use("edgeLipRadius",  "edgelipradius")
+    use("edgeLipAngleDeg","edgelipangledeg")
+    use("edgeLipSteps",   "edgelipsteps")
     use("autoRemesh",     "autoremessh")
     return out
 
@@ -505,8 +546,6 @@ def main():
 
     neckline_in = data.get("neckline") or data_lc.get("neckline")
     neckline = [to_vec3(v) for v in neckline_in] if neckline_in else []
-    if neckline:
-        neckline = smooth_vertices_open(neckline, passes=3)
 
     holes_in = data.get("holeCenters") or data.get("holes") \
                or data_lc.get("holecenters") or data_lc.get("holes") or []
@@ -538,7 +577,6 @@ def main():
 
     # Force watertight if needed (autoRemesh may escalate)
     ensure_watertight(mold_obj, params)
-
     report_non_manifold(mold_obj)
 
     for obj in bpy.data.objects:
@@ -552,8 +590,6 @@ def main():
         f"STL export complete for job ID: {data.get('job_id', data.get('jobID','N/A'))} "
         f"overlay: {data.get('overlay','N/A')} "
         f"verts(beardline)={len(beardline)} "
-        f"neckline={len(neckline)} "
-        f"holes={len(holes_in)} "
         f"weld_eps={weld_eps} "
         f"voxel={voxel_size}"
     )
