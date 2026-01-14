@@ -26,19 +26,26 @@ def index():
 @app.route('/create-checkout-session', methods=['POST'])
 def create_checkout_session():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         items = data.get("items", [])
         shipping_info = data.get("shippingInfo", {})
 
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
-        job_id = items[0].get("job_id") or str(uuid.uuid4())
+        # ✅ NEW: order_id (receipt / purchase id)
+        order_id = data.get("order_id") or str(uuid.uuid4())
 
-        # ✅ Store both items and shipping info
-        ORDER_DATA[job_id] = {
+        # ✅ Ensure each item has a job_id (STL id)
+        for it in items:
+            if not it.get("job_id"):
+                return jsonify({"error": "Each item must include job_id"}), 400
+
+        # ✅ Store order by order_id (NOT job_id)
+        ORDER_DATA[order_id] = {
             "items": items,
-            "shipping": shipping_info
+            "shipping": shipping_info,
+            "status": "created"
         }
 
         line_items = []
@@ -54,32 +61,26 @@ def create_checkout_session():
                 "quantity": 1
             })
 
-        # ✅ Pass shipping info in metadata (optional but useful)
+        # ✅ Stripe metadata: keep it SMALL
+        # (metadata has size limits; best practice = store order_id only)
         metadata = {
-            "job_id": job_id,
-            "shipping_name": shipping_info.get("fullName", ""),
-            "shipping_email": shipping_info.get("email", ""),
-            "shipping_phone": shipping_info.get("phone", ""),
-            "shipping_address": shipping_info.get("addressLine", ""),
-            "shipping_city": shipping_info.get("city", ""),
-            "shipping_state": shipping_info.get("state", ""),
-            "shipping_zip": shipping_info.get("zipCode", ""),
-            "shipping_country": shipping_info.get("country", ""),
-            "shipping_material": shipping_info.get("material", ""),
-            "shipping_color": shipping_info.get("color", "")
+            "order_id": order_id
         }
 
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             mode='payment',
             line_items=line_items,
-            success_url=f'krezzapp://order-confirmed?job_id={job_id}',  # 🔁 Deep link
+
+            # ✅ NEW: deep link back with order_id
+            success_url=f'krezzapp://order-confirmed?order_id={order_id}',
             cancel_url='https://krezzapp.com/cancel',
+
             metadata=metadata
         )
 
-        print(f"✅ Created checkout session: {session.id}")
-        return jsonify({ "url": session.url })
+        print(f"✅ Created checkout session: {session.id} for order_id: {order_id}")
+        return jsonify({ "url": session.url, "order_id": order_id })
 
     except Exception as e:
         print(f"❌ Error in checkout session: {e}")
@@ -104,42 +105,55 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        job_id = session.get("metadata", {}).get("job_id")
 
-        order = {
-            "id": session["id"],
-            "amount_total": session["amount_total"],
-            "currency": session["currency"],
+        # ✅ NEW: read order_id from metadata
+        order_id = (session.get("metadata") or {}).get("order_id")
+
+        if not order_id:
+            print("❌ Missing order_id in Stripe metadata")
+            return jsonify(success=True)
+
+        payment_info = {
+            "stripe_session_id": session["id"],
+            "amount_total": session.get("amount_total"),
+            "currency": session.get("currency"),
             "created": datetime.utcfromtimestamp(session["created"]).isoformat(),
             "email": session.get("customer_email", "unknown"),
             "status": "paid"
         }
 
-        if job_id not in ORDER_DATA:
-            ORDER_DATA[job_id] = { "items": [], "shipping": {} }
+        if order_id not in ORDER_DATA:
+            ORDER_DATA[order_id] = { "items": [], "shipping": {}, "status": "created" }
 
-        for item in ORDER_DATA[job_id]["items"]:
-            item.update(order)
+        ORDER_DATA[order_id]["status"] = "paid"
+        ORDER_DATA[order_id]["payment"] = payment_info
 
-        print(f"✅ Payment confirmed for job_id: {job_id}")
+        # Optional: attach payment info to each item too
+        for item in ORDER_DATA[order_id]["items"]:
+            item.update(payment_info)
+
+        print(f"✅ Payment confirmed for order_id: {order_id}")
 
     return jsonify(success=True)
 
 # -------------------- GET ORDER INFO --------------------
-@app.route('/order-data/<job_id>', methods=['GET'])
-def get_order_data(job_id):
-    print(f"📥 Fetch order-data for job_id: {job_id}")
-    data = ORDER_DATA.get(job_id)
-    print(f"🧾 ORDER_DATA content for job_id: {data}")
+@app.route('/order-data/<order_id>', methods=['GET'])
+def get_order_data(order_id):
+    print(f"📥 Fetch order-data for order_id: {order_id}")
+    data = ORDER_DATA.get(order_id)
+    print(f"🧾 ORDER_DATA content for order_id: {data}")
+
     if data:
         return jsonify({
-            "job_id": job_id,
+            "order_id": order_id,
+            "status": data.get("status", "created"),
+            "payment": data.get("payment", {}),
             "items": data.get("items", []),
             "shipping": data.get("shipping", {})
         })
     else:
-        print("❌ Job ID not found")
-        return jsonify({"error": "Job ID not found"}), 404
+        print("❌ Order ID not found")
+        return jsonify({"error": "Order ID not found"}), 404
 
 # -------------------- SERVE STL FILE --------------------
 @app.route('/stl/<job_id>.stl', methods=['GET'])
