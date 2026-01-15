@@ -2,101 +2,110 @@ from flask import Flask, request, jsonify, send_file, abort
 import stripe
 import os
 import uuid
+import json
 from datetime import datetime
 
 app = Flask(__name__)
 
-# ✅ Load from environment variables (safe for GitHub)
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_ENDPOINT_SECRET")
-
 if not stripe.api_key or not endpoint_secret:
     raise ValueError("❌ Stripe environment variables not set.")
 
-ORDER_DATA = {}
-
-UPLOAD_DIR = "/data/uploads"
+# ✅ Use Render disk env var (matches your render.yaml)
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.route('/')
-def index():
-    return '✅ Krezz server is live and ready to receive Stripe events.'
+# ✅ Persist ORDER_DATA so it survives Render restarts
+DATA_PATH = os.getenv("ORDER_DATA_PATH", "/data/order_data.json")
+ORDER_DATA = {}
 
-# -------------------- CREATE CHECKOUT SESSION --------------------
-@app.route('/create-checkout-session', methods=['POST'])
+def load_order_data():
+    global ORDER_DATA
+    try:
+        with open(DATA_PATH, "r") as f:
+            ORDER_DATA = json.load(f)
+        print(f"✅ Loaded ORDER_DATA ({len(ORDER_DATA)} orders)")
+    except Exception:
+        ORDER_DATA = {}
+        print("ℹ️ No prior ORDER_DATA found (starting fresh)")
+
+def save_order_data():
+    try:
+        with open(DATA_PATH, "w") as f:
+            json.dump(ORDER_DATA, f)
+    except Exception as e:
+        print(f"❌ Failed to persist ORDER_DATA: {e}")
+
+load_order_data()
+
+@app.route("/")
+def index():
+    return "✅ Krezz server is live and ready to receive Stripe events."
+
+@app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
+        print("📥 /create-checkout-session payload:", data)
+
         items = data.get("items", [])
         shipping_info = data.get("shippingInfo", {})
 
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
-        # ✅ NEW: order_id (receipt / purchase id)
         order_id = data.get("order_id") or str(uuid.uuid4())
 
-        # ✅ Ensure each item has a job_id (STL id)
+        # ✅ Accept job_id OR id OR jobId, normalize to job_id
+        normalized_items = []
         for it in items:
-            if not it.get("job_id"):
-                return jsonify({"error": "Each item must include job_id"}), 400
+            job_id = it.get("job_id") or it.get("jobId") or it.get("id")
+            if not job_id:
+                # If the client forgot, generate one so checkout still works
+                job_id = str(uuid.uuid4())
+            it["job_id"] = job_id
+            normalized_items.append(it)
 
-        # ✅ Store order by order_id (NOT job_id)
         ORDER_DATA[order_id] = {
-            "items": items,
+            "items": normalized_items,
             "shipping": shipping_info,
             "status": "created"
         }
+        save_order_data()
 
-        line_items = []
-        for item in items:
-            line_items.append({
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": item.get("name", "Beard Mold")
-                    },
-                    "unit_amount": int(item.get("price", 7500)),
-                },
-                "quantity": 1
-            })
-
-        # ✅ Stripe metadata: keep it SMALL
-        # (metadata has size limits; best practice = store order_id only)
-        metadata = {
-            "order_id": order_id
-        }
+        line_items = [{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": it.get("name", "Beard Mold")},
+                "unit_amount": int(it.get("price", 7500)),
+            },
+            "quantity": 1
+        } for it in normalized_items]
 
         session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            mode='payment',
+            payment_method_types=["card"],
+            mode="payment",
             line_items=line_items,
-
-            # ✅ NEW: deep link back with order_id
-            success_url=f'krezzapp://order-confirmed?order_id={order_id}',
-            cancel_url='https://krezzapp.com/cancel',
-
-            metadata=metadata
+            success_url=f"krezzapp://order-confirmed?order_id={order_id}",
+            cancel_url="https://krezzapp.com/cancel",
+            metadata={"order_id": order_id},
         )
 
-        print(f"✅ Created checkout session: {session.id} for order_id: {order_id}")
-        return jsonify({ "url": session.url, "order_id": order_id })
+        print(f"✅ Created checkout session: {session.id} order_id={order_id}")
+        return jsonify({"url": session.url, "order_id": order_id})
 
     except Exception as e:
         print(f"❌ Error in checkout session: {e}")
-        return jsonify({ "error": str(e) }), 500
+        return jsonify({"error": str(e)}), 500
 
-# -------------------- WEBHOOK HANDLER --------------------
-@app.route('/webhook', methods=['POST'])
+@app.route("/webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature")
 
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
-    except stripe.error.SignatureVerificationError as e:
-        print(f"❌ Invalid signature: {e}")
-        return "Invalid signature", 400
     except Exception as e:
         print(f"❌ Webhook error: {e}")
         return "Webhook error", 400
@@ -105,15 +114,17 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-
-        # ✅ NEW: read order_id from metadata
         order_id = (session.get("metadata") or {}).get("order_id")
 
         if not order_id:
             print("❌ Missing order_id in Stripe metadata")
             return jsonify(success=True)
 
-        payment_info = {
+        if order_id not in ORDER_DATA:
+            ORDER_DATA[order_id] = {"items": [], "shipping": {}, "status": "created"}
+
+        ORDER_DATA[order_id]["status"] = "paid"
+        ORDER_DATA[order_id]["payment"] = {
             "stripe_session_id": session["id"],
             "amount_total": session.get("amount_total"),
             "currency": session.get("currency"),
@@ -121,76 +132,40 @@ def stripe_webhook():
             "email": session.get("customer_email", "unknown"),
             "status": "paid"
         }
-
-        if order_id not in ORDER_DATA:
-            ORDER_DATA[order_id] = { "items": [], "shipping": {}, "status": "created" }
-
-        ORDER_DATA[order_id]["status"] = "paid"
-        ORDER_DATA[order_id]["payment"] = payment_info
-
-        # Optional: attach payment info to each item too
-        for item in ORDER_DATA[order_id]["items"]:
-            item.update(payment_info)
-
+        save_order_data()
         print(f"✅ Payment confirmed for order_id: {order_id}")
 
     return jsonify(success=True)
 
-# -------------------- GET ORDER INFO --------------------
-@app.route('/order-data/<order_id>', methods=['GET'])
+@app.route("/order-data/<order_id>", methods=["GET"])
 def get_order_data(order_id):
-    print(f"📥 Fetch order-data for order_id: {order_id}")
     data = ORDER_DATA.get(order_id)
-    print(f"🧾 ORDER_DATA content for order_id: {data}")
-
-    if data:
-        return jsonify({
-            "order_id": order_id,
-            "status": data.get("status", "created"),
-            "payment": data.get("payment", {}),
-            "items": data.get("items", []),
-            "shipping": data.get("shipping", {})
-        })
-    else:
-        print("❌ Order ID not found")
+    if not data:
         return jsonify({"error": "Order ID not found"}), 404
+    return jsonify({
+        "order_id": order_id,
+        "status": data.get("status", "created"),
+        "payment": data.get("payment", {}),
+        "items": data.get("items", []),
+        "shipping": data.get("shipping", {})
+    })
 
-# -------------------- SERVE STL FILE --------------------
-@app.route('/stl/<job_id>.stl', methods=['GET'])
-def serve_stl(job_id):
-    stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
-
-    if not os.path.exists(stl_path):
-        print(f"❌ STL not found at: {stl_path}")
-        return abort(404)
-    
-    print(f"📤 Serving STL file: {stl_path}")
-    return send_file(
-        stl_path,
-        mimetype='application/sla',
-        as_attachment=True,
-        download_name=f"mold_{job_id}.stl"
-    )
-
-# -------------------- UPLOAD STL FILE --------------------
-@app.route('/upload', methods=['POST'])
+@app.route("/upload", methods=["POST"])
 def upload_stl():
-    job_id = request.form.get('job_id')
-    file = request.files.get('file')
-
+    job_id = request.form.get("job_id")
+    file = request.files.get("file")
     if not job_id or not file:
-        return jsonify({ "error": "Missing job_id or file" }), 400
+        return jsonify({"error": "Missing job_id or file"}), 400
 
     save_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
-    try:
-        file.save(save_path)
-        print(f"✅ Uploaded STL for job_id: {job_id} -> {save_path}")
-        return jsonify({ "success": True, "path": save_path })
-    except Exception as e:
-        print(f"❌ Failed to save STL: {e}")
-        return jsonify({ "error": str(e) }), 500
+    file.save(save_path)
+    print(f"✅ Uploaded STL job_id={job_id} -> {save_path}")
+    return jsonify({"success": True, "path": save_path})
 
-# -------------------- RUN --------------------
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+@app.route("/stl/<job_id>.stl", methods=["GET"])
+def serve_stl(job_id):
+    stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
+    if not os.path.exists(stl_path):
+        return abort(404)
+    return send_file(stl_path, mimetype="application/sla", as_attachment=True,
+                     download_name=f"mold_{job_id}.stl")
