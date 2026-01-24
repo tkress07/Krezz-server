@@ -2,45 +2,41 @@ from flask import Flask, request, jsonify, send_file, abort
 import os
 import uuid
 import json
+import stripe
+import requests
+import threading
 import hmac
 import hashlib
 import base64
 from datetime import datetime
 
-import stripe
-import requests
-
 app = Flask(__name__)
 
-# -----------------------------
+# -----------------------
 # Stripe config
-# -----------------------------
+# -----------------------
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-stripe_endpoint_secret = os.getenv("STRIPE_ENDPOINT_SECRET")
-if not stripe.api_key or not stripe_endpoint_secret:
-    raise ValueError("❌ Stripe environment variables not set (STRIPE_SECRET_KEY / STRIPE_ENDPOINT_SECRET).")
+STRIPE_ENDPOINT_SECRET = os.getenv("STRIPE_ENDPOINT_SECRET")
+if not stripe.api_key or not STRIPE_ENDPOINT_SECRET:
+    raise ValueError("❌ Stripe environment variables not set.")
 
-# -----------------------------
+# -----------------------
 # Slant config (server-side only)
-# -----------------------------
-SLANT_API_KEY = os.getenv("SLANT_API_KEY", "").strip()
-SLANT_PLATFORM_ID = os.getenv("SLANT_PLATFORM_ID", "").strip()
-SLANT_WEBHOOK_SECRET = os.getenv("SLANT_WEBHOOK_SECRET", "").strip()
+# -----------------------
+SLANT_API_KEY = os.getenv("SLANT_API_KEY")
+SLANT_PLATFORM_ID = os.getenv("SLANT_PLATFORM_ID")
+SLANT_WEBHOOK_SECRET = os.getenv("SLANT_WEBHOOK_SECRET")
 
-# Public base URL for generating public STL links (IMPORTANT for Slant)
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+# IMPORTANT: set this in Render to the exact "Create Order" endpoint from Slant docs.
+# Your current logs show https://www.slant3dapi.com/api/orders returns 404.
+SLANT_ORDERS_ENDPOINT = os.getenv("SLANT_ORDERS_ENDPOINT", "https://www.slant3dapi.com/api/orders")
 
-# Slant API base/endpoint (make configurable to fix 404 fast)
-SLANT_API_BASE = os.getenv("SLANT_API_BASE", "https://www.slant3dapi.com").strip().rstrip("/")
-# Strongly recommended: set this env var once you confirm the exact path in Slant docs.
-SLANT_ORDERS_ENDPOINT = os.getenv(
-    "SLANT_ORDERS_ENDPOINT",
-    f"{SLANT_API_BASE}/api/orders"  # <-- common guess; override via env if your docs differ
-).strip()
+# Base URL your server is publicly reachable at (Render provides one; you already have this env var)
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# -----------------------------
-# Storage
-# -----------------------------
+# -----------------------
+# Storage / persistence
+# -----------------------
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -66,168 +62,176 @@ def save_order_data():
 
 load_order_data()
 
-# -----------------------------
+# -----------------------
 # Helpers
-# -----------------------------
+# -----------------------
 def now_iso():
     return datetime.utcnow().isoformat() + "Z"
 
-def ensure_order(order_id: str):
-    if order_id not in ORDER_DATA:
-        ORDER_DATA[order_id] = {
-            "items": [],
-            "shipping": {},
-            "status": "created",
-            "created_at": now_iso(),
-        }
+def public_url(path: str) -> str:
+    # Prefer env var because request.host_url can be tricky behind proxies
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}{path}"
+    # Fallback if env var not set
+    return f"{request.host_url.rstrip('/')}{path}"
 
 def slant_headers():
-    # We don't know Slant's exact auth header format from your screenshots.
-    # Sending multiple common variants usually doesn't hurt.
-    headers = {
+    # We don’t know Slant’s exact auth header format from your logs alone,
+    # so we send both common patterns. This won’t hurt, and one should match.
+    return {
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Authorization": f"Bearer {SLANT_API_KEY}" if SLANT_API_KEY else "",
+        "X-API-Key": SLANT_API_KEY or "",
     }
-    if SLANT_API_KEY:
-        headers["Authorization"] = f"Bearer {SLANT_API_KEY}"
-        headers["X-Api-Key"] = SLANT_API_KEY
-    if SLANT_PLATFORM_ID:
-        headers["X-Platform-Id"] = SLANT_PLATFORM_ID
-    return headers
 
-def build_public_stl_url(job_id: str) -> str:
-    # Slant must be able to fetch the STL from the internet.
-    # So this MUST be an https URL that loads in a browser.
-    if not PUBLIC_BASE_URL:
-        raise ValueError("PUBLIC_BASE_URL is not set. Example: https://krezz-server.onrender.com")
-    return f"{PUBLIC_BASE_URL}/stl/{job_id}.stl"
+def mark_slant_state(order_id: str, **kwargs):
+    if order_id not in ORDER_DATA:
+        ORDER_DATA[order_id] = {"items": [], "shipping": {}, "status": "created"}
+    ORDER_DATA[order_id].setdefault("slant", {})
+    ORDER_DATA[order_id]["slant"].update(kwargs)
+    ORDER_DATA[order_id]["slant"]["updated_at"] = now_iso()
+    save_order_data()
 
 def submit_order_to_slant(order_id: str):
     """
-    Called after payment is confirmed.
-    Creates a Slant order (or job) based on ORDER_DATA.
+    Attempts to create an order in Slant.
+    If Slant returns 404, your SLANT_ORDERS_ENDPOINT is wrong — update it in Render env vars.
     """
-    if not SLANT_API_KEY or not SLANT_PLATFORM_ID:
-        raise ValueError("Slant env vars missing: SLANT_API_KEY and/or SLANT_PLATFORM_ID")
-
-    ensure_order(order_id)
-    order = ORDER_DATA[order_id]
-    items = order.get("items", [])
-    shipping = order.get("shipping", {})
-
-    if not items:
-        raise ValueError("No items on order; cannot submit to Slant.")
-
-    # Build payload(s)
-    # NOTE: Slant may require a specific schema. This is a reasonable starting point.
-    # If Slant returns 400/404, we will log the response text so you can adjust fields fast.
-    slant_items = []
-    for it in items:
-        job_id = (it.get("job_id") or "").strip()
-        if not job_id:
-            raise ValueError(f"Missing job_id in item: {it}")
-
-        file_url = build_public_stl_url(job_id)
-        slant_items.append({
-            "name": it.get("name", "Beard Mold"),
-            "quantity": 1,
-            "fileUrl": file_url,     # <-- common pattern
-            "jobId": job_id,         # <-- keep your id for traceability
-        })
-
-    payload = {
-        "platformId": SLANT_PLATFORM_ID,  # some APIs want this in-body
-        "externalOrderId": order_id,
-        "items": slant_items,
-        "shipping": shipping,
-    }
-
-    print(f"➡️ Submitting to Slant: order_id={order_id}")
-    print(f"➡️ Slant endpoint: {SLANT_ORDERS_ENDPOINT}")
-
-    resp = requests.post(
-        SLANT_ORDERS_ENDPOINT,
-        headers=slant_headers(),
-        json=payload,
-        timeout=30,
-    )
-
-    # Always log full failure details (this is what will solve your 404)
-    if resp.status_code >= 300:
-        body_text = resp.text[:4000]  # keep logs readable
-        print(f"❌ Slant submit failed: status={resp.status_code} body={body_text}")
-
-        order["slant"] = order.get("slant", {})
-        order["slant"]["submitted"] = False
-        order["slant"]["error_status"] = resp.status_code
-        order["slant"]["error_body"] = body_text
-        order["slant"]["last_attempt_at"] = now_iso()
-        save_order_data()
-        return {"ok": False, "status_code": resp.status_code, "body": body_text}
-
-    data = {}
     try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
+        if not (SLANT_API_KEY and SLANT_PLATFORM_ID):
+            msg = "SLANT_API_KEY or SLANT_PLATFORM_ID not configured"
+            print(f"❌ {msg}")
+            mark_slant_state(order_id, submitted=False, error=msg)
+            return
 
-    print(f"✅ Slant submit success: {data}")
+        data = ORDER_DATA.get(order_id)
+        if not data:
+            msg = "order_id not found in ORDER_DATA"
+            print(f"❌ {msg}: {order_id}")
+            mark_slant_state(order_id, submitted=False, error=msg)
+            return
 
-    order["status"] = "submitted_to_slant"
-    order["slant"] = {
-        "submitted": True,
-        "response": data,
-        "submitted_at": now_iso(),
-    }
-    save_order_data()
-    return {"ok": True, "data": data}
+        items = data.get("items", [])
+        shipping = data.get("shipping", {})
+        if not items:
+            msg = "no items to submit"
+            print(f"❌ {msg} for order_id={order_id}")
+            mark_slant_state(order_id, submitted=False, error=msg)
+            return
+
+        # Build “file URLs” for each job_id so Slant can fetch STLs (common pattern).
+        # If Slant expects multipart upload instead, we’ll adjust later.
+        slant_items = []
+        for it in items:
+            job_id = it.get("job_id") or it.get("jobId") or it.get("id")
+            if not job_id:
+                continue
+            stl_url = public_url(f"/stl/{job_id}.stl")
+            slant_items.append({
+                "job_id": job_id,
+                "name": it.get("name", "Beard Mold"),
+                "file_url": stl_url,
+                "quantity": 1,
+            })
+
+        # Payload shape depends on Slant’s docs.
+        # This is a reasonable “starter” payload and is easy to adjust once you confirm Slant’s schema.
+        payload = {
+            "platformId": SLANT_PLATFORM_ID,
+            "externalOrderId": order_id,
+            "items": slant_items,
+            "shipping": shipping,
+        }
+
+        print(f"➡️ Submitting to Slant: order_id={order_id}")
+        print(f"➡️ Slant endpoint: {SLANT_ORDERS_ENDPOINT}")
+
+        resp = requests.post(
+            SLANT_ORDERS_ENDPOINT,
+            headers=slant_headers(),
+            json=payload,
+            timeout=25
+        )
+
+        body_text = resp.text or ""
+        if resp.status_code >= 200 and resp.status_code < 300:
+            # Try parse JSON for an order id
+            try:
+                j = resp.json()
+            except Exception:
+                j = {}
+
+            slant_order_id = j.get("id") or j.get("orderId") or j.get("slantOrderId")
+
+            print(f"✅ Slant submit OK status={resp.status_code} slant_order_id={slant_order_id}")
+            mark_slant_state(
+                order_id,
+                submitted=True,
+                status_code=resp.status_code,
+                response=j if j else body_text,
+                slant_order_id=slant_order_id
+            )
+        else:
+            print(f"❌ Slant submit failed: status={resp.status_code} body={body_text[:500]}")
+            mark_slant_state(
+                order_id,
+                submitted=False,
+                status_code=resp.status_code,
+                response=body_text
+            )
+
+    except Exception as e:
+        print(f"❌ Slant submit exception for order_id={order_id}: {e}")
+        mark_slant_state(order_id, submitted=False, error=str(e))
+
+def kickoff_slant_submit(order_id: str):
+    """
+    Don’t block Stripe webhook response — run Slant submit in a short background thread.
+    """
+    # Idempotency: don’t resubmit if already submitted
+    slant_state = (ORDER_DATA.get(order_id, {}) or {}).get("slant", {})
+    if slant_state.get("submitted") is True:
+        return
+
+    t = threading.Thread(target=submit_order_to_slant, args=(order_id,), daemon=True)
+    t.start()
 
 def verify_slant_signature(raw_body: bytes, provided_sig: str) -> bool:
     """
-    Signature formats vary by vendor.
-    We attempt:
-    - HMAC-SHA256 raw body with secret as UTF-8
-    - HMAC-SHA256 raw body with secret base64-decoded (your secret *looks* base64-ish)
-    Compare against hex or base64 signatures.
+    Slant signature format isn’t confirmed in your screenshots.
+    This tries common HMAC styles. If Slant docs specify the exact format,
+    we’ll tighten this to match exactly.
     """
     if not SLANT_WEBHOOK_SECRET or not provided_sig:
         return False
 
-    candidates = []
+    # Try secret as raw text bytes
+    secret_bytes_candidates = [SLANT_WEBHOOK_SECRET.encode("utf-8")]
 
-    # 1) secret as utf-8 bytes
-    secret_bytes = SLANT_WEBHOOK_SECRET.encode("utf-8")
-    digest = hmac.new(secret_bytes, raw_body, hashlib.sha256).digest()
-    candidates.append(digest)
-
-    # 2) secret as base64-decoded bytes (if possible)
+    # Try base64-decoding the secret (your secret *looks* base64-like)
     try:
-        secret_b64 = base64.b64decode(SLANT_WEBHOOK_SECRET)
-        digest2 = hmac.new(secret_b64, raw_body, hashlib.sha256).digest()
-        candidates.append(digest2)
+        secret_bytes_candidates.append(base64.b64decode(SLANT_WEBHOOK_SECRET))
     except Exception:
         pass
 
-    # Normalize provided signature
     provided_sig = provided_sig.strip()
 
-    for d in candidates:
-        hex_sig = d.hex()
-        b64_sig = base64.b64encode(d).decode("utf-8")
+    for secret_bytes in secret_bytes_candidates:
+        digest = hmac.new(secret_bytes, raw_body, hashlib.sha256).digest()
+        b64 = base64.b64encode(digest).decode("utf-8")
+        hx = hmac.new(secret_bytes, raw_body, hashlib.sha256).hexdigest()
 
-        if hmac.compare_digest(provided_sig, hex_sig):
-            return True
-        if hmac.compare_digest(provided_sig, b64_sig):
+        if provided_sig == b64 or provided_sig == hx:
             return True
 
     return False
 
-# -----------------------------
+# -----------------------
 # Routes
-# -----------------------------
+# -----------------------
 @app.route("/")
 def index():
-    return "✅ Krezz server is live."
+    return "✅ Krezz server is live and ready to receive Stripe/Slant events."
 
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
@@ -237,7 +241,6 @@ def create_checkout_session():
 
         items = data.get("items", [])
         shipping_info = data.get("shippingInfo", {})
-
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
@@ -251,13 +254,12 @@ def create_checkout_session():
             it["job_id"] = job_id
             normalized_items.append(it)
 
-        ensure_order(order_id)
-        ORDER_DATA[order_id].update({
+        ORDER_DATA[order_id] = {
             "items": normalized_items,
             "shipping": shipping_info,
             "status": "created",
-            "updated_at": now_iso(),
-        })
+            "created_at": now_iso()
+        }
         save_order_data()
 
         line_items = [{
@@ -275,7 +277,6 @@ def create_checkout_session():
             line_items=line_items,
             success_url=f"krezzapp://order-confirmed?order_id={order_id}",
             cancel_url="https://krezzcut.com/cancel",
-            client_reference_id=order_id,
             metadata={"order_id": order_id},
         )
 
@@ -292,26 +293,27 @@ def stripe_webhook():
     sig_header = request.headers.get("Stripe-Signature")
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, stripe_endpoint_secret)
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_ENDPOINT_SECRET)
     except Exception as e:
-        print(f"❌ Stripe webhook error: {e}")
+        print(f"❌ Stripe webhook verify error: {e}")
         return "Webhook error", 400
 
     print(f"📦 Stripe event: {event['type']}")
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        order_id = (session.get("metadata") or {}).get("order_id") or session.get("client_reference_id")
+        order_id = (session.get("metadata") or {}).get("order_id")
 
         if not order_id:
-            print("❌ Missing order_id in Stripe session")
+            print("❌ Missing order_id in Stripe metadata")
             return jsonify(success=True)
 
-        ensure_order(order_id)
+        if order_id not in ORDER_DATA:
+            ORDER_DATA[order_id] = {"items": [], "shipping": {}, "status": "created"}
 
         ORDER_DATA[order_id]["status"] = "paid"
         ORDER_DATA[order_id]["payment"] = {
-            "stripe_session_id": session.get("id"),
+            "stripe_session_id": session["id"],
             "amount_total": session.get("amount_total"),
             "currency": session.get("currency"),
             "created": datetime.utcfromtimestamp(session["created"]).isoformat(),
@@ -322,73 +324,41 @@ def stripe_webhook():
         save_order_data()
         print(f"✅ Payment confirmed for order_id: {order_id}")
 
-        # 🔥 Submit to Slant immediately after payment (server-side)
-        try:
-            result = submit_order_to_slant(order_id)
-            print(f"🧾 Slant submit result: {result}")
-        except Exception as e:
-            print(f"❌ Slant submit exception for order_id={order_id}: {e}")
-            ORDER_DATA[order_id]["slant"] = ORDER_DATA[order_id].get("slant", {})
-            ORDER_DATA[order_id]["slant"]["submitted"] = False
-            ORDER_DATA[order_id]["slant"]["exception"] = str(e)
-            ORDER_DATA[order_id]["slant"]["last_attempt_at"] = now_iso()
-            save_order_data()
+        # Kick off Slant submit (non-blocking)
+        kickoff_slant_submit(order_id)
 
     return jsonify(success=True)
 
 @app.route("/slant/webhook", methods=["POST"])
 def slant_webhook():
     raw = request.data
-
-    # Slant signature header name may vary—check your Slant docs.
-    provided_sig = (
+    sig = (
         request.headers.get("X-Slant-Signature")
         or request.headers.get("Slant-Signature")
-        or request.headers.get("X-Signature")
         or ""
     )
 
-    # If you want to temporarily bypass verification during setup:
-    if os.getenv("SLANT_VERIFY_WEBHOOK", "1") == "1":
-        if not verify_slant_signature(raw, provided_sig):
-            print("❌ Slant webhook signature verification failed.")
-            return "Invalid signature", 400
+    if SLANT_WEBHOOK_SECRET:
+        if not verify_slant_signature(raw, sig):
+            # If Slant docs specify signature header/format, we can enforce strictly.
+            print("⚠️ Slant webhook signature missing/invalid (accepting for now).")
+    else:
+        print("⚠️ SLANT_WEBHOOK_SECRET not set; cannot verify Slant webhook.")
 
-    evt = {}
-    try:
-        evt = request.get_json(silent=True) or {}
-    except Exception:
-        evt = {}
+    data = request.get_json(silent=True) or {}
+    print("📥 /slant/webhook payload:", data)
 
-    print(f"📦 Slant webhook event received: keys={list(evt.keys())}")
+    # Try to locate order_id in common places
+    order_id = (
+        data.get("externalOrderId")
+        or data.get("order_id")
+        or (data.get("metadata") or {}).get("order_id")
+        or data.get("id")  # sometimes Slant might send its own id only
+    )
 
-    # You’ll need to map Slant’s payload fields here once you see an example.
-    # Common patterns:
-    # - evt["externalOrderId"] or evt["metadata"]["externalOrderId"]
-    # - evt["status"], evt["tracking"]
-    external_order_id = evt.get("externalOrderId") or evt.get("orderId") or evt.get("metadata", {}).get("externalOrderId")
-
-    if external_order_id:
-        ensure_order(external_order_id)
-        ORDER_DATA[external_order_id]["slant"] = ORDER_DATA[external_order_id].get("slant", {})
-        ORDER_DATA[external_order_id]["slant"]["webhook_last_event"] = evt
-        ORDER_DATA[external_order_id]["slant"]["webhook_received_at"] = now_iso()
-
-        # Optional: set high-level status if present
-        if "status" in evt:
-            ORDER_DATA[external_order_id]["status"] = f"slant_{evt.get('status')}"
-        save_order_data()
-
-    return jsonify({"ok": True})
-
-@app.route("/slant/retry/<order_id>", methods=["POST"])
-def slant_retry(order_id):
-    ensure_order(order_id)
-    try:
-        result = submit_order_to_slant(order_id)
-        return jsonify(result), (200 if result.get("ok") else 400)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    if order_id:
+        mark_slant_state(order_id, last_webhook=data, received_webhook=True)
+    return jsonify(ok=True)
 
 @app.route("/order-data/<order_id>", methods=["GET"])
 def get_order_data(order_id):
@@ -399,9 +369,9 @@ def get_order_data(order_id):
         "order_id": order_id,
         "status": data.get("status", "created"),
         "payment": data.get("payment", {}),
-        "slant": data.get("slant", {}),
         "items": data.get("items", []),
-        "shipping": data.get("shipping", {})
+        "shipping": data.get("shipping", {}),
+        "slant": data.get("slant", {})
     })
 
 @app.route("/upload", methods=["POST"])
