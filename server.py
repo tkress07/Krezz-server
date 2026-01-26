@@ -1,387 +1,461 @@
 from __future__ import annotations
 
 import os
-import re
 import json
 import uuid
 import time
-import stripe
-import fcntl
+import logging
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import stripe
 import requests
 from flask import Flask, request, jsonify, send_file, abort
 
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("krezz-server")
+
+# ------------------------------------------------------------
+# Flask
+# ------------------------------------------------------------
 app = Flask(__name__)
 
-# -----------------------------
-# Config
-# -----------------------------
-def must_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise ValueError(f"Missing required env var: {name}")
-    return v
+# ------------------------------------------------------------
+# Stripe config
+# ------------------------------------------------------------
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_ENDPOINT_SECRET = os.getenv("STRIPE_ENDPOINT_SECRET")
+if not stripe.api_key or not STRIPE_ENDPOINT_SECRET:
+    raise ValueError("Stripe env vars missing: STRIPE_SECRET_KEY and/or STRIPE_ENDPOINT_SECRET")
 
-# Stripe
-stripe.api_key = must_env("STRIPE_SECRET_KEY")
-STRIPE_ENDPOINT_SECRET = must_env("STRIPE_ENDPOINT_SECRET")
-
-# Storage
+# ------------------------------------------------------------
+# Local storage (Render disk)
+# ------------------------------------------------------------
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 DATA_PATH = os.getenv("ORDER_DATA_PATH", "/data/order_data.json")
-os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
 
-# Public base URL (CRITICAL so Slant can fetch the STL)
-# Example: https://krezz-server.onrender.com
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# Slant
-# Per public docs/mock: production base is https://api.slant3d.com/api and auth is api-key header. :contentReference[oaicite:2]{index=2}
-SLANT_API_KEY = must_env("SLANT_API_KEY")
-SLANT_API_BASES = [
-    os.getenv("SLANT_API_BASE", "https://api.slant3d.com/api").rstrip("/"),
-    # fallback (some people get keys working here too)
-    "https://slant3dapi.com/api",
-]
+class OrderStore:
+    """
+    Small JSON store with a process-local lock + atomic writes.
+    Note: if you run multiple gunicorn workers, each worker is its own process.
+    For true multi-worker safety, move this to a DB. For now keep workers=1.
+    """
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self.data: Dict[str, Any] = {}
+        self.load()
 
+    def load(self) -> None:
+        with self._lock:
+            try:
+                with open(self.path, "r") as f:
+                    self.data = json.load(f)
+                log.info("✅ Loaded ORDER_DATA (%d orders) from %s", len(self.data), self.path)
+            except Exception:
+                self.data = {}
+                log.info("ℹ️ No prior ORDER_DATA found (starting fresh)")
+
+    def save(self) -> None:
+        with self._lock:
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                # atomic write
+                with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(self.path)) as tf:
+                    json.dump(self.data, tf)
+                    tmp_name = tf.name
+                os.replace(tmp_name, self.path)
+            except Exception as e:
+                log.exception("❌ Failed to persist ORDER_DATA: %s", e)
+
+    def get(self, order_id: str) -> Optional[dict]:
+        with self._lock:
+            v = self.data.get(order_id)
+            return json.loads(json.dumps(v)) if v is not None else None
+
+    def set(self, order_id: str, value: dict) -> None:
+        with self._lock:
+            self.data[order_id] = value
+
+    def update(self, order_id: str, patch: dict) -> None:
+        with self._lock:
+            base = self.data.get(order_id) or {}
+            base.update(patch)
+            self.data[order_id] = base
+
+
+STORE = OrderStore(DATA_PATH)
+
+# ------------------------------------------------------------
+# Slant config  (IMPORTANT: use slant3dapi.com/v2/api + Bearer)
+# ------------------------------------------------------------
+SLANT_API_KEY = os.getenv("SLANT_API_KEY")
+SLANT_PLATFORM_ID = os.getenv("SLANT_PLATFORM_ID")  # REQUIRED for file upload (per your 400 error)
+SLANT_BASE_URL = (os.getenv("SLANT_BASE_URL") or "https://slant3dapi.com/v2/api").rstrip("/")
+
+# Optional
+SLANT_DEFAULT_FILAMENT_ID = os.getenv("SLANT_DEFAULT_FILAMENT_ID")  # publicId
 SLANT_TIMEOUT_SEC = int(os.getenv("SLANT_TIMEOUT_SEC", "30"))
-SLANT_VALIDATE_SLICE = os.getenv("SLANT_VALIDATE_SLICE", "0") == "1"
+SLANT_UPLOAD_TIMEOUT_SEC = int(os.getenv("SLANT_UPLOAD_TIMEOUT_SEC", "90"))
 
-# Your app defaults
-DEFAULT_PROFILE = os.getenv("SLANT_DEFAULT_PROFILE", "PETG").upper()  # PLA or PETG
-DEFAULT_COLOR_TAG = os.getenv("SLANT_DEFAULT_COLOR_TAG", "black").lower()
-
-# In-memory cache
-ORDER_DATA: Dict[str, Any] = {}
-_FILAMENT_CACHE = {"ts": 0.0, "data": None}
-_FILAMENT_CACHE_TTL = 10 * 60  # 10 minutes
+# Endpoints (overrideable)
+SLANT_FILAMENTS_ENDPOINT = os.getenv("SLANT_FILAMENTS_ENDPOINT") or f"{SLANT_BASE_URL}/filaments"
+SLANT_FILES_ENDPOINT = os.getenv("SLANT_FILES_ENDPOINT") or f"{SLANT_BASE_URL}/files"
+SLANT_ORDERS_ENDPOINT = os.getenv("SLANT_ORDERS_ENDPOINT") or f"{SLANT_BASE_URL}/orders"
 
 
-# -----------------------------
-# Persistence helpers (atomic + file lock)
-# -----------------------------
-def _with_locked_file(path: str, mode: str):
-    f = open(path, mode)
-    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-    return f
+@dataclass
+class SlantError(Exception):
+    status: int
+    body: str
+    where: str
 
-def load_order_data() -> None:
-    global ORDER_DATA
-    if not os.path.exists(DATA_PATH):
-        ORDER_DATA = {}
-        print("ℹ️ No prior ORDER_DATA found (starting fresh)")
-        return
-
-    try:
-        with _with_locked_file(DATA_PATH, "r") as f:
-            raw = f.read().strip()
-            ORDER_DATA = json.loads(raw) if raw else {}
-        print(f"✅ Loaded ORDER_DATA ({len(ORDER_DATA)} orders) from {DATA_PATH}")
-    except Exception as e:
-        ORDER_DATA = {}
-        print(f"❌ Failed loading ORDER_DATA, starting fresh. Error: {e}")
-
-def save_order_data() -> None:
-    # Atomic write: temp file then rename
-    try:
-        dirpath = os.path.dirname(DATA_PATH) or "."
-        fd, tmp_path = tempfile.mkstemp(prefix="order_data_", suffix=".json", dir=dirpath)
-        with os.fdopen(fd, "w") as tmp:
-            json.dump(ORDER_DATA, tmp)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        os.replace(tmp_path, DATA_PATH)
-    except Exception as e:
-        print(f"❌ Failed to persist ORDER_DATA: {e}")
-
-load_order_data()
+    def __str__(self) -> str:
+        return f"{self.where}: status={self.status} body={self.body[:1200]}"
 
 
-# -----------------------------
-# Small normalization helpers
-# -----------------------------
-def now_iso() -> str:
-    return datetime.utcnow().isoformat()
+class SlantClient:
+    def __init__(self, api_key: str, platform_id: Optional[str]):
+        self.api_key = api_key
+        self.platform_id = platform_id
+        self.sess = requests.Session()
 
-def boolish(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
+    def headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+            "User-Agent": "KrezzServer/1.0",
+        }
 
-def normalize_country_iso2(country_val: str) -> str:
-    if not country_val:
-        return "US"
-    c = country_val.strip().lower()
-    if c in ("us", "usa", "united states", "united states of america"):
-        return "US"
-    if len(country_val.strip()) == 2:
-        return country_val.strip().upper()
-    return "US"
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: Optional[dict] = None,
+        data: Optional[dict] = None,
+        files: Optional[dict] = None,
+        timeout: int = SLANT_TIMEOUT_SEC,
+        where: str = "slant",
+        retry: int = 2,
+    ) -> requests.Response:
+        # Very small retry for transient failures
+        for attempt in range(retry + 1):
+            try:
+                r = self.sess.request(
+                    method=method,
+                    url=url,
+                    headers=self.headers(),
+                    json=json_body,
+                    data=data,
+                    files=files,
+                    timeout=timeout,
+                )
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < retry:
+                    time.sleep(0.7 * (attempt + 1))
+                    continue
+                return r
+            except requests.RequestException as e:
+                if attempt >= retry:
+                    raise SlantError(status=0, body=str(e), where=where)
+                time.sleep(0.7 * (attempt + 1))
+        raise SlantError(status=0, body="Unknown request failure", where=where)
 
-def normalize_phone(phone: str) -> str:
-    if not phone:
-        return ""
-    s = phone.strip()
-    # Keep leading + if present, strip everything else to digits
-    plus = s.startswith("+")
-    digits = re.sub(r"\D+", "", s)
-    if plus:
-        return f"+{digits}"
-    # If 10 digits assume US
-    if len(digits) == 10:
-        return f"+1{digits}"
-    if digits:
-        return f"+{digits}"
-    return ""
+    def get_filaments(self) -> List[dict]:
+        r = self._request("GET", SLANT_FILAMENTS_ENDPOINT, where="Slant get_filaments")
+        if r.status_code >= 400:
+            raise SlantError(r.status_code, r.text, "Slant get_filaments")
+        payload = r.json() if r.text else {}
+        return payload.get("data") or []
 
-def stl_public_url(job_id: str) -> str:
-    if not PUBLIC_BASE_URL:
-        # Fallback: attempt to derive from request. This is less reliable behind proxies.
-        base = request.host_url.rstrip("/")
-        return f"{base}/stl/{job_id}.stl"
-    return f"{PUBLIC_BASE_URL}/stl/{job_id}.stl"
+    def resolve_filament_id(self, shipping: dict) -> str:
+        material = (shipping.get("material") or "").upper()
+        color = (shipping.get("color") or "").strip().lower()
+        want_profile = "PETG" if "PETG" in material else "PLA"
+
+        filaments = self.get_filaments()
+
+        # exact match (profile + color)
+        for f in filaments:
+            if not f.get("available", True):
+                continue
+            if (f.get("profile") or "").upper() == want_profile and (f.get("color") or "").lower() == color:
+                if f.get("publicId"):
+                    return f["publicId"]
+
+        # profile match
+        for f in filaments:
+            if not f.get("available", True):
+                continue
+            if (f.get("profile") or "").upper() == want_profile and f.get("publicId"):
+                return f["publicId"]
+
+        if SLANT_DEFAULT_FILAMENT_ID:
+            return SLANT_DEFAULT_FILAMENT_ID
+
+        if filaments and filaments[0].get("publicId"):
+            return filaments[0]["publicId"]
+
+        raise RuntimeError("No filament available and SLANT_DEFAULT_FILAMENT_ID not set.")
+
+    def upload_stl(self, job_id: str, stl_path: str) -> str:
+        if not self.platform_id:
+            # This is the exact cause of your earlier 400.
+            raise RuntimeError("SLANT_PLATFORM_ID is missing (required for /files upload).")
+
+        if not os.path.exists(stl_path):
+            raise RuntimeError(f"STL not found for job_id={job_id}: {stl_path}")
+
+        with open(stl_path, "rb") as f:
+            files = {
+                # many APIs accept model/stl; your prior application/sla worked too.
+                "file": (f"{job_id}.stl", f, "model/stl"),
+            }
+            form = {
+                "platformId": self.platform_id,
+                "name": f"{job_id}.stl",
+                # keep optional hints; harmless if ignored
+                "type": "STL",
+            }
+
+            log.info("➡️ Uploading STL to Slant Files: job_id=%s endpoint=%s", job_id, SLANT_FILES_ENDPOINT)
+            r = self._request(
+                "POST",
+                SLANT_FILES_ENDPOINT,
+                files=files,
+                data=form,
+                timeout=SLANT_UPLOAD_TIMEOUT_SEC,
+                where="Slant upload_stl",
+            )
+
+        if r.status_code >= 400:
+            raise SlantError(r.status_code, r.text, "Slant upload_stl")
+
+        payload = r.json() if r.text else {}
+        data_obj = payload.get("data") if isinstance(payload, dict) else None
+
+        public_id = None
+        if isinstance(data_obj, dict):
+            public_id = data_obj.get("publicFileServiceId") or data_obj.get("publicId")
+        if not public_id and isinstance(payload, dict):
+            public_id = payload.get("publicFileServiceId") or payload.get("publicId")
+
+        if not public_id:
+            raise RuntimeError(f"Upload succeeded but no publicId returned: {str(payload)[:800]}")
+
+        log.info("✅ Slant file uploaded: job_id=%s publicFileServiceId=%s", job_id, public_id)
+        return public_id
+
+    def create_order(self, internal_order_id: str, shipping: dict, items: List[dict]) -> str:
+        """
+        Creates (drafts) a Slant order. Payload includes redundant keys to be tolerant of schema variations.
+        If Slant returns a schema error, the response is logged + stored so you can adjust quickly.
+        """
+        if not self.platform_id:
+            raise RuntimeError("SLANT_PLATFORM_ID is missing (required to place orders).")
+
+        # Normalize shipping
+        def country_iso2(v: str) -> str:
+            if not v:
+                return "US"
+            c = v.strip().lower()
+            if c in ("us", "usa", "united states", "united states of america"):
+                return "US"
+            if len(v.strip()) == 2:
+                return v.strip().upper()
+            return "US"
+
+        email = shipping.get("email") or "unknown@test.com"
+        full_name = shipping.get("fullName") or shipping.get("name") or "Customer"
+        phone = shipping.get("phone") or ""
+        is_res = shipping.get("isResidential")
+        if isinstance(is_res, str):
+            is_res = is_res.strip().lower() in ("1", "true", "yes", "y")
+        is_res = bool(is_res) if is_res is not None else True
+
+        addr = {
+            "name": full_name,
+            "line1": shipping.get("addressLine") or shipping.get("line1") or "",
+            "line2": shipping.get("addressLine2") or shipping.get("line2") or "",
+            "city": shipping.get("city") or "",
+            "state": shipping.get("state") or "",
+            "zip": shipping.get("zipCode") or shipping.get("zip") or "",
+            "country": country_iso2(shipping.get("country") or "US"),
+        }
+
+        filament_id = self.resolve_filament_id(shipping)
+
+        slant_items = []
+        for it in items:
+            pfsid = it.get("publicFileServiceId")
+            if not pfsid:
+                raise RuntimeError(f"Missing publicFileServiceId for item job_id={it.get('job_id')}")
+            slant_items.append({
+                "type": "PRINT",
+                "publicFileServiceId": pfsid,
+                "filamentId": filament_id,
+                "quantity": int(it.get("quantity", 1)),
+                "name": it.get("name", "Krezz Mold"),
+                "SKU": it.get("SKU") or it.get("sku") or it.get("job_id", ""),
+            })
+
+        payload = {
+            # platform identifiers (often required)
+            "platformId": self.platform_id,
+            "customer": {
+                "platformId": self.platform_id,
+                "details": {
+                    "email": email,
+                    "phone": phone,
+                    "isResidential": is_res,
+                    "address": addr,
+                },
+            },
+            "items": slant_items,
+            "metadata": {
+                "internalOrderId": internal_order_id,
+                "jobIds": [it.get("job_id") for it in items],
+                "source": "KREZZ_SERVER",
+            },
+        }
+
+        log.info("➡️ Creating Slant order: endpoint=%s internalOrderId=%s", SLANT_ORDERS_ENDPOINT, internal_order_id)
+        r = self._request(
+            "POST",
+            SLANT_ORDERS_ENDPOINT,
+            json_body=payload,
+            timeout=SLANT_TIMEOUT_SEC,
+            where="Slant create_order",
+        )
+        if r.status_code >= 400:
+            raise SlantError(r.status_code, r.text, "Slant create_order")
+
+        resp = r.json() if r.text else {}
+        data_obj = resp.get("data") if isinstance(resp, dict) else None
+        public_order_id = None
+        if isinstance(data_obj, dict):
+            public_order_id = data_obj.get("publicId") or data_obj.get("publicOrderId")
+        if not public_order_id and isinstance(resp, dict):
+            public_order_id = resp.get("publicId") or resp.get("publicOrderId")
+
+        if not public_order_id:
+            raise RuntimeError(f"Create order succeeded but no publicId returned: {str(resp)[:1200]}")
+
+        log.info("✅ Slant order created: publicOrderId=%s", public_order_id)
+        return public_order_id
+
+    def process_order(self, public_order_id: str) -> dict:
+        """
+        Some APIs use POST /orders/{id}/process, others POST /orders/{id}.
+        We'll try /process first, then fallback.
+        """
+        url_process = f"{SLANT_ORDERS_ENDPOINT}/{public_order_id}/process"
+        url_fallback = f"{SLANT_ORDERS_ENDPOINT}/{public_order_id}"
+
+        log.info("➡️ Processing Slant order (try /process): %s", url_process)
+        r = self._request("POST", url_process, timeout=SLANT_TIMEOUT_SEC, where="Slant process_order(/process)")
+        if r.status_code == 404:
+            log.info("ℹ️ /process not found, trying fallback: %s", url_fallback)
+            r = self._request("POST", url_fallback, timeout=SLANT_TIMEOUT_SEC, where="Slant process_order(fallback)")
+
+        if r.status_code >= 400:
+            raise SlantError(r.status_code, r.text, "Slant process_order")
+
+        return r.json() if r.text else {"success": True}
 
 
-# -----------------------------
-# Slant API client (v1 "official format")
-# -----------------------------
-def slant_headers() -> Dict[str, str]:
-    # Official mock/docs show api-key header. :contentReference[oaicite:3]{index=3}
-    return {
-        "api-key": SLANT_API_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        # harmless extra (some deployments accept bearer too)
-        "Authorization": f"Bearer {SLANT_API_KEY}",
-    }
-
-def slant_request(method: str, path: str, *, json_body: Any = None, timeout: int = SLANT_TIMEOUT_SEC) -> Tuple[int, str, Optional[Dict[str, Any]]]:
-    """
-    Try SLANT_API_BASES in order until one returns a response (even error).
-    Return (status_code, text, parsed_json_or_none)
-    """
-    last = None
-    for base in SLANT_API_BASES:
-        url = f"{base}{path}"
-        try:
-            r = requests.request(method, url, headers=slant_headers(), json=json_body, timeout=timeout)
-            text = r.text or ""
-            parsed = None
-            if "application/json" in (r.headers.get("Content-Type") or ""):
-                try:
-                    parsed = r.json()
-                except Exception:
-                    parsed = None
-            return r.status_code, text, parsed
-        except Exception as e:
-            last = e
-            continue
-    raise RuntimeError(f"Slant request failed for all bases. Last error: {last}")
-
-def slant_get_filaments_cached() -> List[Dict[str, Any]]:
-    now = time.time()
-    if _FILAMENT_CACHE["data"] is not None and (now - _FILAMENT_CACHE["ts"]) < _FILAMENT_CACHE_TTL:
-        return _FILAMENT_CACHE["data"]
-
-    # Per mock/docs: GET /api/filament exists. :contentReference[oaicite:4]{index=4}
-    status, text, parsed = slant_request("GET", "/filament", json_body=None)
-    if status >= 400:
-        print(f"❌ Slant filaments fetch failed: {status} {text[:500]}")
-        return []
-
-    filaments = (parsed or {}).get("filaments") or []
-    _FILAMENT_CACHE["ts"] = now
-    _FILAMENT_CACHE["data"] = filaments
-    return filaments
-
-def resolve_slant_filament(shipping_info: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Returns (order_item_color, profile)
-    Filament model includes filament/profile/colorTag. :contentReference[oaicite:5]{index=5}
-    """
-    material = (shipping_info.get("material") or "").upper()
-    color = (shipping_info.get("color") or DEFAULT_COLOR_TAG).strip().lower()
-
-    want_profile = "PETG" if "PETG" in material else "PLA"
-
-    filaments = slant_get_filaments_cached()
-
-    # Try exact profile + colorTag match
-    for f in filaments:
-        if (f.get("profile") or "").upper() == want_profile and (f.get("colorTag") or "").lower() == color:
-            return (f.get("filament") or f"{want_profile} {color}".upper()), want_profile
-
-    # Try any filament with profile
-    for f in filaments:
-        if (f.get("profile") or "").upper() == want_profile:
-            return (f.get("filament") or f"{want_profile} {color}".upper()), want_profile
-
-    # Fallback
-    return (f"{want_profile} {color}".upper(), want_profile)
-
-def slant_slice_validate(file_url: str) -> None:
-    # Per types: SliceRequest is { fileURL }. :contentReference[oaicite:6]{index=6}
-    # Per mock: endpoint is POST /api/slicer. :contentReference[oaicite:7]{index=7}
-    status, text, parsed = slant_request("POST", "/slicer", json_body={"fileURL": file_url}, timeout=60)
-    if status >= 400:
-        raise RuntimeError(f"Slant slicer failed: status={status} body={text[:1200]}")
-    # Optional: check parsed["data"]["price"] etc (SliceResponse). :contentReference[oaicite:8]{index=8}
-    print(f"✅ Slant slicer ok for fileURL={file_url}")
-
-def slant_place_order(order_obj: Dict[str, Any]) -> str:
-    """
-    Official format uses POST /api/order with an ARRAY body. :contentReference[oaicite:9]{index=9}
-    Response: { orderId: "..." } :contentReference[oaicite:10]{index=10}
-    """
-    status, text, parsed = slant_request("POST", "/order", json_body=[order_obj], timeout=60)
-    if status >= 400:
-        raise RuntimeError(f"Slant placeOrder failed: status={status} body={text[:1500]}")
-
-    order_id = (parsed or {}).get("orderId")
-    if not order_id:
-        raise RuntimeError(f"Slant placeOrder succeeded but missing orderId. Response: {str(parsed)[:800]}")
-    return str(order_id)
+def slant_enabled() -> bool:
+    return bool(SLANT_API_KEY)
 
 
-# -----------------------------
-# Building a Slant order object
-# -----------------------------
-def build_slant_order(order_id: str, item: Dict[str, Any], shipping: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Matches generated Order type (flat snake_case, fileURL, string quantities). :contentReference[oaicite:11]{index=11}
-    """
-    full_name = shipping.get("fullName") or shipping.get("name") or "Customer"
-    email = shipping.get("email") or "unknown@example.com"
-    phone = normalize_phone(shipping.get("phone") or "")
-
-    line1 = shipping.get("addressLine") or shipping.get("line1") or ""
-    line2 = shipping.get("addressLine2") or shipping.get("line2") or ""
-    city = shipping.get("city") or ""
-    state = shipping.get("state") or ""
-    zip_code = shipping.get("zipCode") or shipping.get("zip") or ""
-    country = normalize_country_iso2(shipping.get("country") or "US")
-
-    is_res = "true" if boolish(shipping.get("isResidential")) else "false"
-
-    job_id = item.get("job_id")
-    if not job_id:
-        raise RuntimeError("Item missing job_id")
-    file_url = stl_public_url(job_id)
-
-    # Pick filament/profile
-    order_item_color, profile = resolve_slant_filament(shipping)
-
-    qty = str(int(item.get("quantity", 1)))
-    item_name = item.get("name") or "Krezz Mold"
-
-    order_obj = {
-        "email": email,
-        "phone": phone,
-        "name": full_name,
-
-        "orderNumber": order_id,
-
-        "filename": f"{job_id}.stl",
-        "fileURL": file_url,
-
-        # billing
-        "bill_to_street_1": line1,
-        "bill_to_street_2": line2 or None,
-        "bill_to_city": city,
-        "bill_to_state": state,
-        "bill_to_zip": zip_code,
-        "bill_to_country_as_iso": country,
-        "bill_to_is_US_residential": is_res,
-
-        # shipping
-        "ship_to_name": full_name,
-        "ship_to_street_1": line1,
-        "ship_to_street_2": line2 or None,
-        "ship_to_city": city,
-        "ship_to_state": state,
-        "ship_to_zip": zip_code,
-        "ship_to_country_as_iso": country,
-        "ship_to_is_US_residential": is_res,
-
-        # item
-        "order_item_name": item_name,
-        "order_quantity": qty,          # string per spec :contentReference[oaicite:12]{index=12}
-        "order_sku": item.get("SKU") or item.get("sku") or job_id,
-        "order_item_color": order_item_color,
-
-        # Some Slant examples include profile in the order object. :contentReference[oaicite:13]{index=13}
-        "profile": profile,
-    }
-
-    # remove Nones so you don't send nulls unless needed
-    return {k: v for k, v in order_obj.items() if v is not None}
+def get_slant_client() -> SlantClient:
+    if not SLANT_API_KEY:
+        raise RuntimeError("SLANT_API_KEY not configured")
+    return SlantClient(api_key=SLANT_API_KEY, platform_id=SLANT_PLATFORM_ID)
 
 
 def submit_paid_order_to_slant(order_id: str) -> None:
-    data = ORDER_DATA.get(order_id) or {}
-    if not data:
-        raise RuntimeError(f"Order not found: {order_id}")
+    """
+    Idempotent: only submit once. Stores errors on the order record.
+    """
+    order = STORE.get(order_id) or {}
+    status = order.get("status")
 
-    # Idempotency: don’t resubmit if already placed
-    slant_meta = data.get("slant") or {}
-    if slant_meta.get("orderId"):
-        print(f"ℹ️ Already placed with Slant: order_id={order_id} slantOrderId={slant_meta['orderId']}")
+    if status in ("submitted_to_slant", "slant_processing", "in_production"):
+        log.info("ℹ️ Order already submitted: order_id=%s status=%s", order_id, status)
         return
 
-    items = data.get("items") or []
-    shipping = data.get("shipping") or {}
-    if not items:
-        raise RuntimeError("Order has no items")
+    items = order.get("items", []) or []
+    shipping = order.get("shipping", {}) or {}
 
-    # For now: place one Slant order per item (simple + predictable).
-    # If you prefer: you can bundle items, but Slant’s format is “one fileURL per order object”.
-    placed = []
+    client = get_slant_client()
+
+    # mark submitting
+    order["status"] = "slant_submitting"
+    order.pop("slant_error", None)
+    STORE.set(order_id, order)
+    STORE.save()
+
+    # upload files if needed
     for it in items:
         job_id = it.get("job_id")
         if not job_id:
             raise RuntimeError("Item missing job_id")
 
-        stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
-        if not os.path.exists(stl_path):
-            raise RuntimeError(f"STL missing on server for job_id={job_id}: {stl_path}")
+        if not it.get("publicFileServiceId"):
+            stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
+            pfsid = client.upload_stl(job_id, stl_path)
+            it["publicFileServiceId"] = pfsid
 
-        file_url = stl_public_url(job_id)
+    # create + process order
+    public_order_id = client.create_order(order_id, shipping, items)
+    order.setdefault("slant", {})
+    order["slant"]["publicOrderId"] = public_order_id
+    order["status"] = "slant_created"
+    STORE.set(order_id, order)
+    STORE.save()
 
-        # Optional preflight: confirm Slant can fetch/slice your URL
-        if SLANT_VALIDATE_SLICE:
-            slant_slice_validate(file_url)
+    process_resp = client.process_order(public_order_id)
+    order["slant"]["processResponse"] = process_resp
+    order["status"] = "submitted_to_slant"
+    STORE.set(order_id, order)
+    STORE.save()
 
-        order_obj = build_slant_order(order_id, it, shipping)
-        print(f"➡️ Slant placeOrder POST {SLANT_API_BASES[0]}/order orderNumber={order_id} fileURL={order_obj.get('fileURL')}")
-        slant_order_id = slant_place_order(order_obj)
-        placed.append({"job_id": job_id, "slantOrderId": slant_order_id})
-
-    data["slant"] = {"orders": placed, "placed_at": now_iso()}
-    data["status"] = "submitted_to_slant"
-    ORDER_DATA[order_id] = data
-    save_order_data()
-    print(f"✅ Slant submission complete: order_id={order_id} placed={placed}")
+    log.info("✅ Slant submission complete: order_id=%s publicOrderId=%s", order_id, public_order_id)
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Routes
-# -----------------------------
+# ------------------------------------------------------------
 @app.route("/")
 def index():
-    return "✅ Krezz server is live (Stripe + Slant v1 order flow)."
+    return "✅ Krezz server is live (Stripe + Slant)."
+
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "time": now_iso()})
+    return jsonify({
+        "ok": True,
+        "time": datetime.utcnow().isoformat() + "Z",
+        "slant_enabled": slant_enabled(),
+        "slant_base_url": SLANT_BASE_URL,
+        "has_slant_platform_id": bool(SLANT_PLATFORM_ID),
+        "upload_dir": UPLOAD_DIR,
+        "order_data_path": DATA_PATH,
+    })
 
 
 @app.route("/upload", methods=["POST"])
@@ -391,13 +465,9 @@ def upload_stl():
     if not job_id or not file:
         return jsonify({"error": "Missing job_id or file"}), 400
 
-    # Optional: basic safety check
-    if not job_id or len(job_id) > 128:
-        return jsonify({"error": "Invalid job_id"}), 400
-
     save_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
     file.save(save_path)
-    print(f"✅ Uploaded STL job_id={job_id} -> {save_path}")
+    log.info("✅ Uploaded STL job_id=%s -> %s", job_id, save_path)
     return jsonify({"success": True, "path": save_path})
 
 
@@ -406,26 +476,28 @@ def serve_stl(job_id):
     stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
     if not os.path.exists(stl_path):
         return abort(404)
-
-    # IMPORTANT: serve as a normal file (not forced download) so Slant fetchers don’t choke.
-    resp = send_file(stl_path, mimetype="application/sla", as_attachment=False)
-    resp.headers["Cache-Control"] = "public, max-age=3600"
-    return resp
+    return send_file(
+        stl_path,
+        mimetype="model/stl",
+        as_attachment=True,
+        download_name=f"mold_{job_id}.stl",
+    )
 
 
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
     try:
-        payload = request.get_json(silent=True) or {}
-        print("📥 /create-checkout-session payload:", payload)
+        data = request.get_json(silent=True) or {}
+        log.info("📥 /create-checkout-session payload: %s", data)
 
-        items = payload.get("items", [])
-        shipping_info = payload.get("shippingInfo", {})
+        items = data.get("items", []) or []
+        shipping_info = data.get("shippingInfo", {}) or {}
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
-        order_id = payload.get("order_id") or str(uuid.uuid4())
+        order_id = data.get("order_id") or str(uuid.uuid4())
 
+        # normalize items
         normalized_items = []
         for it in items:
             job_id = it.get("job_id") or it.get("jobId") or it.get("id")
@@ -435,13 +507,13 @@ def create_checkout_session():
             it["quantity"] = int(it.get("quantity", 1))
             normalized_items.append(it)
 
-        ORDER_DATA[order_id] = {
+        STORE.set(order_id, {
             "items": normalized_items,
             "shipping": shipping_info,
             "status": "created",
-            "created_at": now_iso(),
-        }
-        save_order_data()
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        })
+        STORE.save()
 
         line_items = [{
             "price_data": {
@@ -449,7 +521,7 @@ def create_checkout_session():
                 "product_data": {"name": it.get("name", "Beard Mold")},
                 "unit_amount": int(it.get("price", 7500)),
             },
-            "quantity": int(it.get("quantity", 1))
+            "quantity": int(it.get("quantity", 1)),
         } for it in normalized_items]
 
         session = stripe.checkout.Session.create(
@@ -461,11 +533,11 @@ def create_checkout_session():
             metadata={"order_id": order_id},
         )
 
-        print(f"✅ Created checkout session: {session.id} order_id={order_id}")
+        log.info("✅ Created checkout session: %s order_id=%s", session.id, order_id)
         return jsonify({"url": session.url, "order_id": order_id})
 
     except Exception as e:
-        print(f"❌ Error in checkout session: {e}")
+        log.exception("❌ Error in checkout session: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -477,49 +549,56 @@ def stripe_webhook():
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_ENDPOINT_SECRET)
     except Exception as e:
-        print(f"❌ Stripe webhook error: {e}")
+        log.exception("❌ Stripe webhook error: %s", e)
         return "Webhook error", 400
 
-    print(f"📦 Stripe event: {event['type']}")
+    log.info("📦 Stripe event: %s", event["type"])
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         order_id = (session.get("metadata") or {}).get("order_id")
+
         if not order_id:
-            print("❌ Missing order_id in Stripe metadata")
+            log.error("❌ Missing order_id in Stripe metadata")
             return jsonify(success=True)
 
-        data = ORDER_DATA.get(order_id) or {"items": [], "shipping": {}, "status": "created"}
-        data["status"] = "paid"
-        data["payment"] = {
+        order = STORE.get(order_id) or {"items": [], "shipping": {}, "status": "created"}
+
+        order["status"] = "paid"
+        order["payment"] = {
             "stripe_session_id": session.get("id"),
             "amount_total": session.get("amount_total"),
             "currency": session.get("currency"),
-            "created": datetime.utcfromtimestamp(session["created"]).isoformat(),
+            "created": datetime.utcfromtimestamp(session["created"]).isoformat() + "Z",
             "email": session.get("customer_email", "unknown"),
             "status": "paid",
         }
-        ORDER_DATA[order_id] = data
-        save_order_data()
-        print(f"✅ Payment confirmed for order_id: {order_id}")
 
-        try:
-            print(f"➡️ Submitting to Slant: order_id={order_id}")
-            submit_paid_order_to_slant(order_id)
-        except Exception as e:
-            print(f"❌ Slant submit exception: {e}")
-            data = ORDER_DATA.get(order_id) or {}
-            data["slant_error"] = str(e)
-            data["status"] = data.get("status") or "paid"
-            ORDER_DATA[order_id] = data
-            save_order_data()
+        STORE.set(order_id, order)
+        STORE.save()
+        log.info("✅ Payment confirmed for order_id=%s", order_id)
+
+        # Submit to Slant (never fail the webhook)
+        if slant_enabled():
+            try:
+                log.info("➡️ Submitting to Slant: order_id=%s", order_id)
+                submit_paid_order_to_slant(order_id)
+            except Exception as e:
+                log.exception("❌ Slant submit exception: %s", e)
+                order = STORE.get(order_id) or order
+                order["slant_error"] = str(e)
+                order["status"] = "slant_failed"
+                STORE.set(order_id, order)
+                STORE.save()
+        else:
+            log.info("ℹ️ Slant disabled (no SLANT_API_KEY). Skipping submit.")
 
     return jsonify(success=True)
 
 
 @app.route("/order-data/<order_id>", methods=["GET"])
 def get_order_data(order_id):
-    data = ORDER_DATA.get(order_id)
+    data = STORE.get(order_id)
     if not data:
         return jsonify({"error": "Order ID not found"}), 404
     return jsonify({
@@ -534,24 +613,48 @@ def get_order_data(order_id):
 
 
 # -----------------------------
-# Debug endpoints
+# Debug helpers
 # -----------------------------
+@app.route("/debug/slant/config", methods=["GET"])
+def debug_slant_config():
+    return jsonify({
+        "slant_base_url": SLANT_BASE_URL,
+        "filaments_endpoint": SLANT_FILAMENTS_ENDPOINT,
+        "files_endpoint": SLANT_FILES_ENDPOINT,
+        "orders_endpoint": SLANT_ORDERS_ENDPOINT,
+        "has_api_key": bool(SLANT_API_KEY),
+        "has_platform_id": bool(SLANT_PLATFORM_ID),
+    })
+
+
 @app.route("/debug/slant/filaments", methods=["GET"])
 def debug_slant_filaments():
     try:
-        filaments = slant_get_filaments_cached()
-        return jsonify({"ok": True, "count": len(filaments), "filaments": filaments})
+        client = get_slant_client()
+        filaments = client.get_filaments()
+        return jsonify({"ok": True, "count": len(filaments), "data": filaments})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/debug/slant/place/<order_id>", methods=["POST"])
-def debug_slant_place(order_id):
+@app.route("/debug/slant/upload/<job_id>", methods=["POST"])
+def debug_slant_upload(job_id):
+    try:
+        stl_path = os.path.join(UPLOAD_DIR, f"{job_id}.stl")
+        client = get_slant_client()
+        pfsid = client.upload_stl(job_id, stl_path)
+        return jsonify({"ok": True, "job_id": job_id, "publicFileServiceId": pfsid})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/debug/slant/submit/<order_id>", methods=["POST"])
+def debug_slant_submit(order_id):
     try:
         submit_paid_order_to_slant(order_id)
-        return jsonify({"ok": True, "order_id": order_id, "slant": ORDER_DATA.get(order_id, {}).get("slant")})
+        return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "order_id": order_id, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
