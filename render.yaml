@@ -1,36 +1,45 @@
 services:
   - type: web
-    name: flask-stripe-app
-    env: python
+    name: krezz-server
+    runtime: docker
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -b 0.0.0.0:$PORT server:app
     autoDeploy: true
+
+    healthCheckPath: /health
+
+    disk:
+      name: krezz-data
+      mountPath: /data
+      sizeGB: 5
+
     envVars:
       - key: FLASK_ENV
         value: production
+
       - key: UPLOAD_DIR
         value: /data/uploads
+
+      - key: ORDER_DATA_PATH
+        value: /data/order_data.json
+
+      # Slant
+      - key: SLANT_BASE_URL
+        value: https://slant3dapi.com/v2/api
+
+      # Optional: increase upload timeout for larger STLs
+      - key: SLANT_UPLOAD_TIMEOUT_SEC
+        value: "180"
+
+      # Turn on extra logging just while troubleshooting
+      - key: SLANT_DEBUG
+        value: "true"
+
+      # Secrets (keep these in Render dashboard; leaving sync:false here is fine too)
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_ENDPOINT_SECRET
         sync: false
-    disk:
-      name: uploads
-      mountPath: /data
-      sizeGB: 5
-
-  - type: web
-    name: blender-service
-    env: docker
-    rootDir: blender-service
-    plan: starter
-    autoDeploy: true
-    healthCheckPath: /
-    envVars:
-      - key: JOBS_DIR
-        value: /data/jobs
-    disk:
-      name: jobs
-      mountPath: /data
-      sizeGB: 10
+      - key: SLANT_API_KEY
+        sync: false
+      - key: SLANT_PLATFORM_ID
+        sync: false
