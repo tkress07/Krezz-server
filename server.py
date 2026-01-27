@@ -8,7 +8,7 @@ import time
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import requests
 import stripe
@@ -88,6 +88,7 @@ class Config:
 
     # Behavior
     slant_enabled: bool
+    debug_slant: bool
 
     @staticmethod
     def load() -> "Config":
@@ -102,9 +103,14 @@ class Config:
         order_data_path = env_str("ORDER_DATA_PATH", "/data/order_data.json")
         os.makedirs(os.path.dirname(order_data_path), exist_ok=True)
 
-        # Slant
+        # Slant (support BOTH names so you never get bit again)
         slant_api_key = env_str("SLANT_API_KEY")
-        slant_platform_id = env_str("SLANT_PLATFORM_ID")  # <-- your key fix: strip() + correct name
+
+        # People commonly mix these up; we accept both:
+        # - SLANT_PLATFORM_ID  (correct)
+        # - SLANT_PLATFORM_ID  (older / typo versions some setups used)
+        slant_platform_id = env_str("SLANT_PLATFORM_ID") or env_str("SLANT_PLATFORM_ID")
+
         slant_base_url = env_str("SLANT_BASE_URL", "https://slant3dapi.com/v2/api").rstrip("/")
 
         slant_files_endpoint = env_str("SLANT_FILES_ENDPOINT", f"{slant_base_url}/files")
@@ -113,10 +119,12 @@ class Config:
 
         slant_default_filament_id = env_str("SLANT_DEFAULT_FILAMENT_ID")
         slant_timeout_sec = int(env_str("SLANT_TIMEOUT_SEC", "30") or 30)
-        slant_upload_timeout_sec = int(env_str("SLANT_UPLOAD_TIMEOUT_SEC", "90") or 90)
+        slant_upload_timeout_sec = int(env_str("SLANT_UPLOAD_TIMEOUT_SEC", "120") or 120)
 
-        # Enable Slant only if key is present
-        slant_enabled = bool(slant_api_key)
+        debug_slant = env_bool("SLANT_DEBUG", False)
+
+        # Enable Slant only if BOTH key + platform id are present
+        slant_enabled = bool(slant_api_key and slant_platform_id)
 
         cfg = Config(
             stripe_secret_key=stripe_secret_key,
@@ -133,6 +141,7 @@ class Config:
             slant_timeout_sec=slant_timeout_sec,
             slant_upload_timeout_sec=slant_upload_timeout_sec,
             slant_enabled=slant_enabled,
+            debug_slant=debug_slant,
         )
 
         # Log critical runtime flags (no secrets)
@@ -141,8 +150,10 @@ class Config:
         print("   ORDER_DATA_PATH:", cfg.order_data_path)
         print("   SLANT_ENABLED:", cfg.slant_enabled)
         print("   SLANT_BASE_URL:", cfg.slant_base_url)
+        print("   SLANT_FILES_ENDPOINT:", cfg.slant_files_endpoint)
+        print("   SLANT_ORDERS_ENDPOINT:", cfg.slant_orders_endpoint)
         print("   SLANT_API_KEY:", mask_secret(cfg.slant_api_key))
-        print("   SLANT_PLATFORM_ID present:", bool(cfg.slant_platform_id), "len=", len(cfg.slant_platform_id))
+        print("   SLANT_PLATFORM_ID:", mask_secret(cfg.slant_platform_id), "len=", len(cfg.slant_platform_id))
 
         return cfg
 
@@ -184,7 +195,6 @@ def load_order_data() -> None:
 def save_order_data() -> None:
     try:
         os.makedirs(os.path.dirname(CFG.order_data_path), exist_ok=True)
-        # atomic write
         dirpath = os.path.dirname(CFG.order_data_path)
         fd, tmp_path = tempfile.mkstemp(prefix="order_data_", suffix=".json", dir=dirpath)
         with os.fdopen(fd, "w") as tmp:
@@ -210,11 +220,23 @@ class SlantError(RuntimeError):
         self.where = where
 
 
-def slant_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {CFG.slant_api_key}",
+def slant_headers(extra: Dict[str, str] | None = None) -> Dict[str, str]:
+    """
+    Some APIs want Authorization: Bearer ...
+    Some want X-API-Key: ...
+    We send both (safe in practice; Slant will ignore what it doesn't use).
+    """
+    h = {
         "Accept": "application/json",
+        "User-Agent": "KrezzServer/1.0",
     }
+    if CFG.slant_api_key:
+        h["Authorization"] = f"Bearer {CFG.slant_api_key}"
+        h["X-API-Key"] = CFG.slant_api_key
+
+    if extra:
+        h.update(extra)
+    return h
 
 
 _FILAMENT_CACHE = {"ts": 0.0, "data": None}
@@ -267,30 +289,85 @@ def resolve_filament_id(shipping_info: dict) -> str:
 
 
 def slant_upload_stl(job_id: str, stl_path: str) -> str:
-    # FAIL FAST: this prevents the “platformId required” mystery loop
+    """
+    Your exact error is: “platformId is a required field to upload a file”.
+    That means Slant is not seeing platformId where it expects it.
+
+    So we submit platformId in ALL common places:
+      - multipart form field (platformId)
+      - alternate field spellings (platform_id / platformID)
+      - querystring (?platformId=...)
+      - header (X-Platform-Id)
+    """
     pid = (CFG.slant_platform_id or "").strip()
     if not pid:
-        raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime. (Render env not loaded / service not restarted)")
+        raise RuntimeError("SLANT_PLATFORM_ID missing/blank at runtime. (Render env not loaded / service not restarted)")
 
     if not os.path.exists(stl_path):
         raise RuntimeError(f"STL not found on server for job_id={job_id}: {stl_path}")
 
-    print(f"➡️ Uploading STL to Slant Files: job_id={job_id} has_platform_id={bool(pid)} endpoint={CFG.slant_files_endpoint}")
+    def attempt(where: str, *, url: str, params: Dict[str, str] | None, extra_headers: Dict[str, str] | None, data: Dict[str, str]) -> requests.Response:
+        if CFG.debug_slant:
+            print(f"🧪 Slant upload attempt={where}")
+            print("   url:", url)
+            print("   params:", params)
+            print("   headers:", {k: ("***" if "key" in k.lower() or "auth" in k.lower() else v) for k, v in (extra_headers or {}).items()})
+            print("   data keys:", list(data.keys()))
 
-    with open(stl_path, "rb") as f:
-        files = {"file": (f"{job_id}.stl", f, "model/stl")}
-        data = {
-            "platformId": pid,                 # <-- REQUIRED
-            "name": f"{job_id}.stl",
-            "type": "STL",
-        }
-        r = requests.post(
-            CFG.slant_files_endpoint,
-            headers=slant_headers(),
-            files=files,
-            data=data,
-            timeout=CFG.slant_upload_timeout_sec,
-        )
+        with open(stl_path, "rb") as f:
+            files = {"file": (f"{job_id}.stl", f, "model/stl")}
+            return requests.post(
+                url,
+                headers=slant_headers(extra_headers),
+                params=params,
+                files=files,
+                data=data,
+                timeout=CFG.slant_upload_timeout_sec,
+            )
+
+    base_data = {
+        "name": f"{job_id}.stl",
+        "type": "STL",
+        # the “normal” expected key
+        "platformId": pid,
+    }
+
+    # Attempt 1: standard multipart fields
+    r = attempt(
+        "multipart_form",
+        url=CFG.slant_files_endpoint,
+        params=None,
+        extra_headers=None,
+        data=base_data,
+    )
+
+    # If Slant still says platformId missing, try “belt and suspenders”
+    if r.status_code >= 400:
+        body = (r.text or "")
+        if CFG.debug_slant:
+            print("   -> status:", r.status_code)
+            print("   -> body:", body[:1200])
+
+        if "platformId" in body or "platformid" in body:
+            data2 = {
+                **base_data,
+                "platform_id": pid,
+                "platformID": pid,
+            }
+            r2 = attempt(
+                "query+header+aliases",
+                url=CFG.slant_files_endpoint,
+                params={"platformId": pid},
+                extra_headers={"X-Platform-Id": pid},
+                data=data2,
+            )
+            if r2.status_code < 400:
+                r = r2
+            else:
+                if CFG.debug_slant:
+                    print("   -> status:", r2.status_code)
+                    print("   -> body:", (r2.text or "")[:1200])
+                r = r2
 
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant upload_stl")
@@ -369,7 +446,7 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
     print(f"➡️ Drafting Slant order: endpoint={CFG.slant_orders_endpoint}")
     r = requests.post(
         CFG.slant_orders_endpoint,
-        headers={**slant_headers(), "Content-Type": "application/json"},
+        headers=slant_headers({"Content-Type": "application/json"}),
         json=payload,
         timeout=CFG.slant_timeout_sec,
     )
@@ -393,7 +470,6 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
 
 
 def slant_process_order(public_order_id: str) -> dict:
-    # try /process first, then fallback
     url1 = f"{CFG.slant_orders_endpoint}/{public_order_id}/process"
     url2 = f"{CFG.slant_orders_endpoint}/{public_order_id}"
 
@@ -418,9 +494,8 @@ def submit_paid_order_to_slant(order_id: str) -> None:
         return
 
     if not CFG.slant_enabled:
-        raise RuntimeError("Slant is disabled (SLANT_API_KEY missing)")
+        raise RuntimeError("Slant is disabled (missing SLANT_API_KEY and/or SLANT_PLATFORM_ID)")
 
-    # mark progress
     data["status"] = "slant_submitting"
     ORDER_DATA[order_id] = data
     save_order_data()
@@ -439,7 +514,6 @@ def submit_paid_order_to_slant(order_id: str) -> None:
             pfsid = slant_upload_stl(job_id, stl_path)
             it["publicFileServiceId"] = pfsid
 
-    # Create + process
     public_order_id = slant_draft_order(order_id, shipping, items)
     data.setdefault("slant", {})
     data["slant"]["publicOrderId"] = public_order_id
@@ -466,19 +540,20 @@ def index():
 
 @app.route("/health")
 def health():
+    pid = (CFG.slant_platform_id or "").strip()
     return jsonify({
         "ok": True,
         "time": utc_iso(),
         "slant_enabled": CFG.slant_enabled,
         "slant_base_url": CFG.slant_base_url,
-        "has_slant_platform_id": bool(CFG.slant_platform_id),
-        "slant_platform_id_len": len(CFG.slant_platform_id),
+        "slant_files_endpoint": CFG.slant_files_endpoint,
+        "has_slant_platform_id": bool(pid),
+        "slant_platform_id_len": len(pid),
         "upload_dir": CFG.upload_dir,
         "orders": len(ORDER_DATA),
     })
 
 
-# 🔥 Key debug endpoint to confirm Render actually loaded your env var
 @app.route("/debug/env")
 def debug_env():
     pid = (CFG.slant_platform_id or "").strip()
@@ -491,6 +566,8 @@ def debug_env():
         "SLANT_ORDERS_ENDPOINT": CFG.slant_orders_endpoint,
         "has_SLANT_API_KEY": bool(CFG.slant_api_key),
         "SLANT_API_KEY_masked": mask_secret(CFG.slant_api_key, keep=4),
+        "SLANT_ENABLED": CFG.slant_enabled,
+        "SLANT_DEBUG": CFG.debug_slant,
     })
 
 
@@ -637,7 +714,6 @@ def get_order_data(order_id):
     })
 
 
-# Debug: quick Slant checks
 @app.route("/debug/slant/filaments", methods=["GET"])
 def debug_slant_filaments():
     try:
