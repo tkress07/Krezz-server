@@ -1,45 +1,35 @@
 services:
   - type: web
     name: krezz-server
-    runtime: docker
+    env: python
     plan: starter
-    autoDeploy: true
-
-    healthCheckPath: /health
-
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
     disk:
-      name: krezz-data
+      name: data
       mountPath: /data
-      sizeGB: 5
-
+      sizeGB: 1
     envVars:
       - key: FLASK_ENV
         value: production
-
       - key: UPLOAD_DIR
         value: /data/uploads
-
       - key: ORDER_DATA_PATH
         value: /data/order_data.json
 
-      # Slant
       - key: SLANT_BASE_URL
         value: https://slant3dapi.com/v2/api
-
-      # Optional: increase upload timeout for larger STLs
-      - key: SLANT_UPLOAD_TIMEOUT_SEC
-        value: "180"
-
-      # Turn on extra logging just while troubleshooting
       - key: SLANT_DEBUG
-        value: "true"
+        value: "1"
 
-      # Secrets (keep these in Render dashboard; leaving sync:false here is fine too)
-      - key: STRIPE_SECRET_KEY
-        sync: false
-      - key: STRIPE_ENDPOINT_SECRET
-        sync: false
+      # keep secrets in Render dashboard or mark them secret in your workflow
       - key: SLANT_API_KEY
         sync: false
       - key: SLANT_PLATFORM_ID
+        sync: false
+      - key: SLANT_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_ENDPOINT_SECRET
         sync: false
