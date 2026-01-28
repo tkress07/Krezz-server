@@ -220,23 +220,15 @@ class SlantError(RuntimeError):
         self.where = where
 
 
-def slant_headers(extra: Dict[str, str] | None = None) -> Dict[str, str]:
-    """
-    Some APIs want Authorization: Bearer ...
-    Some want X-API-Key: ...
-    We send both (safe in practice; Slant will ignore what it doesn't use).
-    """
+def slant_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     h = {
+        "Authorization": f"Bearer {CFG.slant_api_key}",
         "Accept": "application/json",
-        "User-Agent": "KrezzServer/1.0",
     }
-    if CFG.slant_api_key:
-        h["Authorization"] = f"Bearer {CFG.slant_api_key}"
-        h["X-API-Key"] = CFG.slant_api_key
-
     if extra:
         h.update(extra)
     return h
+
 
 
 _FILAMENT_CACHE = {"ts": 0.0, "data": None}
@@ -288,104 +280,168 @@ def resolve_filament_id(shipping_info: dict) -> str:
     raise RuntimeError("No filament available and SLANT_DEFAULT_FILAMENT_ID not set.")
 
 
-def slant_upload_stl(job_id: str, stl_path: str) -> str:
-    """
-    Your exact error is: “platformId is a required field to upload a file”.
-    That means Slant is not seeing platformId where it expects it.
+def _extract_public_file_id(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    data_obj = payload.get("data")
+    if isinstance(data_obj, dict):
+        return data_obj.get("publicFileServiceId") or data_obj.get("publicId")
+    return payload.get("publicFileServiceId") or payload.get("publicId")
 
-    So we submit platformId in ALL common places:
-      - multipart form field (platformId)
-      - alternate field spellings (platform_id / platformID)
-      - querystring (?platformId=...)
-      - header (X-Platform-Id)
-    """
+
+def _looks_like_platformid_missing(body_text: str) -> bool:
+    t = (body_text or "").lower()
+    return "platformid" in t and "required" in t
+
+
+def slant_upload_stl(job_id: str, stl_path: str) -> str:
     pid = (CFG.slant_platform_id or "").strip()
     if not pid:
-        raise RuntimeError("SLANT_PLATFORM_ID missing/blank at runtime. (Render env not loaded / service not restarted)")
+        raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime.")
 
     if not os.path.exists(stl_path):
         raise RuntimeError(f"STL not found on server for job_id={job_id}: {stl_path}")
 
-    def attempt(where: str, *, url: str, params: Dict[str, str] | None, extra_headers: Dict[str, str] | None, data: Dict[str, str]) -> requests.Response:
-        if CFG.debug_slant:
-            print(f"🧪 Slant upload attempt={where}")
-            print("   url:", url)
-            print("   params:", params)
-            print("   headers:", {k: ("***" if "key" in k.lower() or "auth" in k.lower() else v) for k, v in (extra_headers or {}).items()})
-            print("   data keys:", list(data.keys()))
-
-        with open(stl_path, "rb") as f:
-            files = {"file": (f"{job_id}.stl", f, "model/stl")}
-            return requests.post(
-                url,
-                headers=slant_headers(extra_headers),
-                params=params,
-                files=files,
-                data=data,
-                timeout=CFG.slant_upload_timeout_sec,
-            )
+    # Some APIs accept platformId via: form field, query param, or headers.
+    # We'll send it in ALL places to avoid guessing.
+    candidate_file_fields = ("file", "stl", "stlFile", "upload", "model")
 
     base_data = {
         "name": f"{job_id}.stl",
         "type": "STL",
-        # the “normal” expected key
-        "platformId": pid,
+        "platformId": pid,  # form field
     }
 
-    # Attempt 1: standard multipart fields
-    r = attempt(
-        "multipart_form",
-        url=CFG.slant_files_endpoint,
-        params=None,
-        extra_headers=None,
-        data=base_data,
-    )
+    base_params = {"platformId": pid}  # query param
 
-    # If Slant still says platformId missing, try “belt and suspenders”
-    if r.status_code >= 400:
-        body = (r.text or "")
-        if CFG.debug_slant:
-            print("   -> status:", r.status_code)
-            print("   -> body:", body[:1200])
+    header_platform_variants = {
+        # common header patterns
+        "platformId": pid,
+        "PlatformId": pid,
+        "X-Platform-Id": pid,
+        "X-PlatformId": pid,
+    }
 
-        if "platformId" in body or "platformid" in body:
-            data2 = {
-                **base_data,
-                "platform_id": pid,
-                "platformID": pid,
-            }
-            r2 = attempt(
-                "query+header+aliases",
-                url=CFG.slant_files_endpoint,
-                params={"platformId": pid},
-                extra_headers={"X-Platform-Id": pid},
-                data=data2,
-            )
-            if r2.status_code < 400:
-                r = r2
-            else:
-                if CFG.debug_slant:
-                    print("   -> status:", r2.status_code)
-                    print("   -> body:", (r2.text or "")[:1200])
-                r = r2
+    last_err = None
 
-    if r.status_code >= 400:
-        raise SlantError(r.status_code, r.text, "Slant upload_stl")
+    if CFG.slant_debug:
+        print("🧪 SLANT DEBUG upload starting")
+        print("   endpoint:", CFG.slant_files_endpoint)
+        print("   job_id:", job_id)
+        print("   stl_path:", stl_path)
+        print("   pid_masked:", mask_secret(pid))
 
-    payload = r.json() if r.text else {}
-    data_obj = payload.get("data") if isinstance(payload, dict) else None
+    # ---------- Attempt A: multipart upload (with platformId everywhere) ----------
+    for field_name in candidate_file_fields:
+        try:
+            if CFG.slant_debug:
+                print(f"➡️ Trying multipart upload field='{field_name}' params+headers+form platformId")
 
-    public_id = None
-    if isinstance(data_obj, dict):
-        public_id = data_obj.get("publicFileServiceId") or data_obj.get("publicId")
-    if not public_id and isinstance(payload, dict):
-        public_id = payload.get("publicFileServiceId") or payload.get("publicId")
+            with open(stl_path, "rb") as f:
+                files = {
+                    field_name: (f"{job_id}.stl", f, "application/octet-stream")
+                }
+                r = requests.post(
+                    CFG.slant_files_endpoint,
+                    headers=slant_headers(header_platform_variants),
+                    params=base_params,
+                    files=files,
+                    data=base_data,
+                    timeout=CFG.slant_upload_timeout_sec,
+                )
 
-    if not public_id:
-        raise RuntimeError(f"Slant upload succeeded but no public id returned: {str(payload)[:800]}")
+            if CFG.slant_debug:
+                print("   status:", r.status_code)
+                print("   body:", (r.text or "")[:900])
 
-    print(f"✅ Slant file uploaded: job_id={job_id} publicFileServiceId={public_id}")
-    return public_id
+            if r.status_code < 400:
+                payload = r.json() if r.text else {}
+                public_id = _extract_public_file_id(payload)
+                if not public_id:
+                    raise RuntimeError(f"Slant upload succeeded but no public id returned: {str(payload)[:900]}")
+                print(f"✅ Slant file uploaded: job_id={job_id} publicFileServiceId={public_id}")
+                return public_id
+
+            # If the API still says platformId is required, it may not be multipart.
+            if r.status_code == 400 and _looks_like_platformid_missing(r.text or ""):
+                last_err = SlantError(r.status_code, r.text, f"Slant upload_stl multipart field={field_name}")
+                break  # jump to JSON fallback
+
+            last_err = SlantError(r.status_code, r.text, f"Slant upload_stl multipart field={field_name}")
+
+        except Exception as e:
+            last_err = e
+
+    # ---------- Attempt B: JSON handshake (in case /files expects JSON and returns a presigned upload URL) ----------
+    # Some APIs do: POST /files {platformId,name,type} -> returns uploadUrl + publicFileServiceId.
+    try:
+        if CFG.slant_debug:
+            print("➡️ Trying JSON create-file flow (handshake)")
+
+        create_payload = {
+            "platformId": pid,
+            "name": f"{job_id}.stl",
+            "type": "STL",
+        }
+
+        r = requests.post(
+            CFG.slant_files_endpoint,
+            headers=slant_headers({"Content-Type": "application/json", **header_platform_variants}),
+            params=base_params,
+            json=create_payload,
+            timeout=CFG.slant_timeout_sec,
+        )
+
+        if CFG.slant_debug:
+            print("   handshake status:", r.status_code)
+            print("   handshake body:", (r.text or "")[:900])
+
+        if r.status_code < 400:
+            payload = r.json() if r.text else {}
+            public_id = _extract_public_file_id(payload)
+
+            data_obj = payload.get("data") if isinstance(payload, dict) else None
+            upload_url = None
+            if isinstance(data_obj, dict):
+                upload_url = data_obj.get("uploadUrl") or data_obj.get("presignedUrl") or data_obj.get("url")
+            if not upload_url and isinstance(payload, dict):
+                upload_url = payload.get("uploadUrl") or payload.get("presignedUrl") or payload.get("url")
+
+            # If we got a presigned URL, PUT the STL there
+            if upload_url:
+                if CFG.slant_debug:
+                    print("   got upload_url (masked-ish):", upload_url[:60] + "…")
+
+                with open(stl_path, "rb") as f:
+                    put = requests.put(
+                        upload_url,
+                        data=f,
+                        headers={"Content-Type": "application/octet-stream"},
+                        timeout=CFG.slant_upload_timeout_sec,
+                    )
+
+                if CFG.slant_debug:
+                    print("   PUT status:", put.status_code)
+                    print("   PUT body:", (put.text or "")[:400])
+
+                if put.status_code >= 400:
+                    raise SlantError(put.status_code, put.text, "Slant presigned PUT")
+
+            # Some APIs return the id even without a presigned URL
+            if public_id:
+                print(f"✅ Slant file registered: job_id={job_id} publicFileServiceId={public_id}")
+                return public_id
+
+            raise RuntimeError(f"Slant handshake succeeded but no public id found: {str(payload)[:900]}")
+
+        last_err = SlantError(r.status_code, r.text, "Slant upload_stl JSON handshake")
+
+    except Exception as e:
+        last_err = e
+
+    # ---------- Fail ----------
+    raise RuntimeError(f"Slant upload failed after multipart + JSON fallback. Last error: {last_err}")
+
 
 
 def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
