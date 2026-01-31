@@ -18,19 +18,20 @@ services:
       - key: ORDER_DATA_PATH
         value: /data/order_data.json
 
-      # Slant API base
+      # IMPORTANT: must be your public Render URL so Slant can download /stl/<job>.stl
+      - key: PUBLIC_BASE_URL
+        value: https://krezz-server.onrender.com
+
       - key: SLANT_BASE_URL
         value: https://slant3dapi.com/v2/api
-
-      # Turn this ON for launch
-      - key: SLANT_AUTO_SUBMIT
-        value: "1"
-
-      # Optional: extra logging
       - key: SLANT_DEBUG
         value: "1"
 
-      # keep secrets in Render dashboard (sync: false)
+      # Turn ON real submission
+      - key: SLANT_AUTO_SUBMIT
+        value: "1"
+
+      # secrets in Render dashboard
       - key: SLANT_API_KEY
         sync: false
       - key: SLANT_PLATFORM_ID
