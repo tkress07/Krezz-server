@@ -18,27 +18,24 @@ services:
       - key: ORDER_DATA_PATH
         value: /data/order_data.json
 
-      # IMPORTANT: Your Render UI screenshot uses PUBLIC_BASE_URL (this file matches that)
-      # Example: https://krezz-server.onrender.com
-      - key: PUBLIC_BASE_URL
-        value: https://krezz-server.onrender.com
-
+      # Slant API base
       - key: SLANT_BASE_URL
         value: https://slant3dapi.com/v2/api
+
+      # Turn this ON for launch
+      - key: SLANT_AUTO_SUBMIT
+        value: "1"
+
+      # Optional: extra logging
       - key: SLANT_DEBUG
         value: "1"
 
-      # safety: keep this OFF until your smoke tests pass
-      - key: SLANT_AUTO_SUBMIT
-        value: "0"
-
-      # secrets in Render dashboard (do not commit)
+      # keep secrets in Render dashboard (sync: false)
       - key: SLANT_API_KEY
         sync: false
       - key: SLANT_PLATFORM_ID
         sync: false
-      - key: SLANT_WEBHOOK_SECRET
-        sync: false
+
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_ENDPOINT_SECRET
