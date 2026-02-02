@@ -6,6 +6,7 @@ import json
 import time
 import tempfile
 import threading
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -97,7 +98,7 @@ class Config:
         slant_filaments_endpoint = env_str("SLANT_FILAMENTS_ENDPOINT", f"{slant_base_url}/filaments")
         slant_orders_endpoint = env_str("SLANT_ORDERS_ENDPOINT", f"{slant_base_url}/orders")
 
-        # ✅ default longer; your old 30s is too short for Slant downloading STL + processing
+        # Slant can take time to download STL + process
         slant_timeout_sec = int(env_str("SLANT_TIMEOUT_SEC", "180") or 180)
 
         slant_enabled = bool(slant_api_key)
@@ -139,7 +140,7 @@ class Config:
 CFG = Config.load()
 stripe.api_key = CFG.stripe_secret_key
 
-# Requests session (slightly faster + keep-alive)
+# Requests session (keep-alive)
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "KrezzServer/1.0"})
 
@@ -154,7 +155,6 @@ class OrderStore:
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def _lock(self):
-        # lock file used for both read + write to prevent races across workers
         lf = open(self.lock_path, "w")
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         return lf
@@ -213,10 +213,6 @@ class OrderStore:
             lf.close()
 
     def update(self, order_id: str, fn) -> Tuple[Dict[str, Any], bool]:
-        """
-        Atomically read-modify-write one order under the same lock.
-        Returns: (updated_order, did_change)
-        """
         lf = self._lock()
         try:
             data = self._read_unlocked()
@@ -253,6 +249,7 @@ def slant_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         "Authorization": f"Bearer {CFG.slant_api_key}",
         "Accept": "application/json",
     }
+    # Some APIs support platform id in a header; you also pass platformId param below.
     if pid:
         h["X-Platform-Id"] = pid
     if extra:
@@ -264,8 +261,52 @@ def slant_params() -> Dict[str, str]:
     return {"platformId": pid} if pid else {}
 
 def slant_timeout() -> Tuple[int, int]:
-    # ✅ connect timeout 10s, read timeout CFG.slant_timeout_sec
     return (10, CFG.slant_timeout_sec)
+
+def _slant_rate_headers(r: requests.Response) -> Dict[str, str]:
+    return {k: v for k, v in r.headers.items() if k.lower().startswith("x-ratelimit")}
+
+def _slant_req_id(r: requests.Response) -> Optional[str]:
+    return (
+        r.headers.get("x-request-id")
+        or r.headers.get("cf-ray")
+        or r.headers.get("x-amzn-requestid")
+        or r.headers.get("x-correlation-id")
+    )
+
+def _slant_log_response(where: str, r: requests.Response, ctx: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Always log errors. Log successes when SLANT_DEBUG=true.
+    """
+    if not CFG.slant_debug and r.status_code < 400:
+        return
+    body = (r.text or "")
+    msg = {
+        "where": where,
+        "status": r.status_code,
+        "request_id": _slant_req_id(r),
+        "rate": _slant_rate_headers(r),
+        "ctx": ctx or {},
+        "body_snippet": body[:1200],
+    }
+    print("🧪 SLANT_HTTP", json.dumps(msg, ensure_ascii=False, default=str))
+
+def _safe_json(r: requests.Response) -> Dict[str, Any]:
+    try:
+        return r.json() if (r.text or "").strip() else {}
+    except Exception:
+        return {"_raw": (r.text or "")[:4000]}
+
+def _set_slant_step(order_id: str, step: str, extra: Optional[Dict[str, Any]] = None) -> None:
+    def _fn(order: Dict[str, Any]):
+        sl = order.get("slant") or {}
+        sl["step"] = step
+        sl["step_at"] = utc_iso()
+        if extra:
+            sl.update(extra)
+        order["slant"] = sl
+        return order, True
+    STORE.update(order_id, _fn)
 
 _FILAMENT_CACHE = {"ts": 0.0, "data": None}
 _FILAMENT_CACHE_TTL_SEC = 600
@@ -281,10 +322,12 @@ def slant_get_filaments_cached() -> List[dict]:
         params=slant_params(),
         timeout=slant_timeout(),
     )
+    _slant_log_response("Slant GET /filaments", r)
+
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant get_filaments")
 
-    payload = r.json() if r.text else {}
+    payload = _safe_json(r)
     data = payload.get("data") or []
     _FILAMENT_CACHE["ts"] = now
     _FILAMENT_CACHE["data"] = data
@@ -297,6 +340,7 @@ def resolve_filament_id(shipping_info: dict) -> str:
 
     filaments = slant_get_filaments_cached()
 
+    # Best match
     for f in filaments:
         if not f.get("available", True):
             continue
@@ -304,12 +348,14 @@ def resolve_filament_id(shipping_info: dict) -> str:
             if f.get("publicId"):
                 return f["publicId"]
 
+    # Fallback: any in profile
     for f in filaments:
         if not f.get("available", True):
             continue
         if (f.get("profile") or "").upper() == want_profile and f.get("publicId"):
             return f["publicId"]
 
+    # Last fallback: first available
     if filaments and filaments[0].get("publicId"):
         return filaments[0]["publicId"]
 
@@ -344,7 +390,7 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     }
 
     if CFG.slant_debug:
-        print("🧪 Slant create file:", {"endpoint": CFG.slant_files_endpoint, "platformId": pid, "URL": stl_url})
+        print("🧪 Slant create file request:", {"endpoint": CFG.slant_files_endpoint, "platformId": pid, "stl_url": stl_url})
 
     r = HTTP.post(
         CFG.slant_files_endpoint,
@@ -353,11 +399,12 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
         json=payload,
         timeout=slant_timeout(),
     )
+    _slant_log_response("Slant POST /files", r, ctx={"job_id": job_id, "stl_url": stl_url})
+
     if r.status_code >= 400:
-        print(f"❌ Slant /files error: {r.status_code} {r.text}")
         raise SlantError(r.status_code, r.text, "Slant create_file_by_url")
 
-    resp = r.json() if r.text else {}
+    resp = _safe_json(r)
     pfsid = parse_slant_file_public_id(resp)
     print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={pfsid}")
     return pfsid
@@ -435,10 +482,12 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
         json=payload,
         timeout=slant_timeout(),
     )
+    _slant_log_response("Slant POST /orders", r, ctx={"internalOrderId": order_id, "items_count": len(slant_items)})
+
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant POST /orders (draft)")
 
-    resp = r.json() if r.text else {}
+    resp = _safe_json(r)
     data_obj = resp.get("data") if isinstance(resp, dict) else None
     public_order_id = None
     if isinstance(data_obj, dict):
@@ -458,9 +507,12 @@ def slant_process_order(public_order_id: str) -> dict:
     if r.status_code == 404:
         r = HTTP.post(url2, params=slant_params(), headers=slant_headers(), timeout=slant_timeout())
 
+    _slant_log_response("Slant POST /orders process", r, ctx={"publicOrderId": public_order_id})
+
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant process_order")
-    return r.json() if r.text else {"success": True}
+
+    return _safe_json(r) if (r.text or "").strip() else {"success": True}
 
 
 # ----------------------------
@@ -472,8 +524,9 @@ def _mark_slant_enqueued(order_id: str) -> bool:
         if sl.get("enqueued_at"):
             return order, False
         sl["enqueued_at"] = utc_iso()
+        sl["step"] = "enqueued"
+        sl["step_at"] = utc_iso()
         order["slant"] = sl
-        # don’t flip to "submitted" yet; just indicate queued
         if order.get("status") in ("paid", "created"):
             order["status"] = "slant_queued"
         return order, True
@@ -481,10 +534,15 @@ def _mark_slant_enqueued(order_id: str) -> bool:
     _, changed = STORE.update(order_id, _fn)
     return changed
 
-def _set_slant_failed(order_id: str, err: str) -> None:
+def _set_slant_failed(order_id: str, err: str, tb: str = "") -> None:
     def _fn(order: Dict[str, Any]):
         order["slant_error"] = err
+        order["slant_error_trace"] = (tb or "")[:8000]
         order["status"] = "slant_failed"
+        sl = order.get("slant") or {}
+        sl["step"] = "failed"
+        sl["step_at"] = utc_iso()
+        order["slant"] = sl
         return order, True
 
     STORE.update(order_id, _fn)
@@ -493,13 +551,15 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     order = STORE.get(order_id) or {}
     status = order.get("status")
 
-    # ✅ Idempotency guard: if already done, don't redo
+    # Idempotency guard
     if status in ("submitted_to_slant", "slant_drafted"):
         print(f"🟡 Slant already done for order_id={order_id} status={status}, skipping.")
         return
 
     if not CFG.slant_enabled:
         raise RuntimeError("Slant disabled: SLANT_API_KEY missing")
+
+    _set_slant_step(order_id, "submitting_started")
 
     def _mark_submitting(order_obj: Dict[str, Any]):
         order_obj["status"] = "slant_submitting"
@@ -515,8 +575,10 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     if not items:
         raise RuntimeError("ORDER_DATA has no items for this order_id (cannot submit).")
 
+    _set_slant_step(order_id, "uploading_files")
+
     # Upload files if needed
-    for idx, it in enumerate(items):
+    for it in items:
         job_id = it.get("job_id")
         if not job_id:
             raise RuntimeError("Item missing job_id")
@@ -524,14 +586,17 @@ def submit_paid_order_to_slant(order_id: str) -> None:
         if not it.get("publicFileServiceId"):
             stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
             it["publicFileServiceId"] = slant_upload_stl(job_id, stl_path)
+            _set_slant_step(order_id, "file_uploaded", {"last_job_id": job_id, "last_publicFileServiceId": it["publicFileServiceId"]})
 
-            # persist after each file upload (helps resume)
-            def _persist_item(order_obj: Dict[str, Any]):
+            # persist after each file upload
+            def _persist_items(order_obj: Dict[str, Any]):
                 order_obj["items"] = items
                 order_obj["status"] = "slant_files_uploaded"
                 return order_obj, True
 
-            STORE.update(order_id, _persist_item)
+            STORE.update(order_id, _persist_items)
+
+    _set_slant_step(order_id, "drafting_order")
 
     # Draft + process order
     public_order_id = slant_draft_order(order_id, shipping, items)
@@ -539,6 +604,8 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     def _persist_draft(order_obj: Dict[str, Any]):
         sl = order_obj.get("slant") or {}
         sl["publicOrderId"] = public_order_id
+        sl["step"] = "order_drafted"
+        sl["step_at"] = utc_iso()
         order_obj["slant"] = sl
         order_obj["status"] = "slant_drafted"
         order_obj["items"] = items
@@ -546,26 +613,34 @@ def submit_paid_order_to_slant(order_id: str) -> None:
 
     STORE.update(order_id, _persist_draft)
 
+    _set_slant_step(order_id, "processing_order", {"publicOrderId": public_order_id})
+
     process_resp = slant_process_order(public_order_id)
 
     def _persist_processed(order_obj: Dict[str, Any]):
         sl = order_obj.get("slant") or {}
         sl["processResponse"] = process_resp
+        sl["step"] = "submitted"
+        sl["step_at"] = utc_iso()
         order_obj["slant"] = sl
         order_obj["status"] = "submitted_to_slant"
         return order_obj, True
 
     STORE.update(order_id, _persist_processed)
 
-    print(f"✅ Slant submission complete: order_id={order_id}")
+    print(f"✅ Slant submission complete: order_id={order_id} publicOrderId={public_order_id}")
 
 def submit_to_slant_async(order_id: str) -> None:
     def _run():
+        _set_slant_step(order_id, "async_started")
+        print(f"🧵 Slant async started: order_id={order_id}")
         try:
             submit_paid_order_to_slant(order_id)
+            print(f"🧵 Slant async finished: order_id={order_id}")
         except Exception as e:
-            print(f"❌ Slant async exception: {e}")
-            _set_slant_failed(order_id, str(e))
+            tb = traceback.format_exc()
+            print(f"❌ Slant async exception: {e}\n{tb}")
+            _set_slant_failed(order_id, str(e), tb)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -590,6 +665,22 @@ def health():
         "public_base_url": CFG.public_base_url or None,
         "upload_dir": CFG.upload_dir,
         "orders": STORE.count(),
+    })
+
+@app.get("/debug/whoami")
+def debug_whoami():
+    k = CFG.slant_api_key or ""
+    return jsonify({
+        "ok": True,
+        "time": utc_iso(),
+        "render_service_id": os.getenv("RENDER_SERVICE_ID"),
+        "render_service_name": os.getenv("RENDER_SERVICE_NAME"),
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "public_base_url": CFG.public_base_url or None,
+        "slant_key_set": bool(k),
+        "slant_key_len": len(k),
+        "slant_key_prefix": (k[:8] + "...") if k else None,
+        "has_slant_platform_id": bool((CFG.slant_platform_id or "").strip()),
     })
 
 @app.route("/debug/env")
@@ -637,13 +728,12 @@ def serve_stl(job_id):
     if not os.path.exists(stl_path):
         return abort(404)
 
-    # ✅ conditional=True improves range / caching behavior for Slant's 206 requests
     return send_file(
         stl_path,
         mimetype="model/stl",
         as_attachment=False,
         download_name=f"{job_id}.stl",
-        conditional=True,
+        conditional=True,  # helps range requests (206)
     )
 
 @app.route("/create-checkout-session", methods=["POST"])
@@ -695,7 +785,8 @@ def create_checkout_session():
         return jsonify({"url": session.url, "order_id": order_id})
 
     except Exception as e:
-        print(f"❌ Error in checkout session: {e}")
+        tb = traceback.format_exc()
+        print(f"❌ Error in checkout session: {e}\n{tb}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/webhook", methods=["POST"])
@@ -720,13 +811,11 @@ def stripe_webhook():
             print("❌ Missing order_id in Stripe metadata")
             return jsonify(success=True)
 
-        # ✅ store payment info + idempotency
         def _apply_payment(order_obj: Dict[str, Any]):
             payment = order_obj.get("payment") or {}
             prior_session_id = payment.get("stripe_session_id")
             stripe_session_id = session.get("id")
 
-            # track event ids (avoid re-processing same event)
             seen = order_obj.get("stripe_event_ids") or []
             if event_id in seen:
                 return order_obj, False
@@ -734,9 +823,10 @@ def stripe_webhook():
             seen = (seen + [event_id])[-20:]
             order_obj["stripe_event_ids"] = seen
 
-            # If we already processed this session id, don’t re-run
-            if prior_session_id and prior_session_id == stripe_session_id and order_obj.get("status") in ("paid", "slant_queued", "slant_submitting", "submitted_to_slant"):
-                return order_obj, True  # changed (event list) but payment already applied
+            if prior_session_id and prior_session_id == stripe_session_id and order_obj.get("status") in (
+                "paid", "slant_queued", "slant_submitting", "submitted_to_slant"
+            ):
+                return order_obj, True
 
             order_obj["status"] = "paid"
             order_obj["payment"] = {
@@ -749,12 +839,11 @@ def stripe_webhook():
             }
             return order_obj, True
 
-        updated_order, _ = STORE.update(order_id, _apply_payment)
+        STORE.update(order_id, _apply_payment)
         print(f"✅ Payment confirmed for order_id: {order_id}")
 
-        # ✅ DO NOT block the webhook waiting for Slant
+        # Non-blocking Slant submission
         if CFG.slant_enabled and CFG.slant_auto_submit:
-            # only enqueue once
             if _mark_slant_enqueued(order_id):
                 print(f"➡️ Queueing Slant submit: order_id={order_id}")
                 submit_to_slant_async(order_id)
@@ -778,6 +867,7 @@ def get_order_data(order_id):
         "shipping": data.get("shipping", {}),
         "slant": data.get("slant", {}),
         "slant_error": data.get("slant_error"),
+        "slant_error_trace": data.get("slant_error_trace"),
     })
 
 @app.route("/debug/slant/filaments", methods=["GET"])
@@ -795,16 +885,17 @@ def debug_slant_upload(job_id):
         pfsid = slant_upload_stl(job_id, stl_path)
         return jsonify({"ok": True, "job_id": job_id, "publicFileServiceId": pfsid})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        tb = traceback.format_exc()
+        return jsonify({"ok": False, "error": str(e), "trace": tb[:4000]}), 500
 
 @app.route("/debug/slant/submit/<order_id>", methods=["POST"])
 def debug_slant_submit(order_id):
     try:
-        # run inline for debugging only
         submit_paid_order_to_slant(order_id)
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        tb = traceback.format_exc()
+        return jsonify({"ok": False, "error": str(e), "trace": tb[:4000]}), 500
 
 if __name__ == "__main__":
     port = int(env_str("PORT", "10000"))
