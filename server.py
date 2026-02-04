@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import fcntl
 import requests
 import stripe
-from flask import Flask, request, jsonify, send_file, abort, Response, make_response
+from flask import Flask, request, jsonify, abort, Response
 
 app = Flask(__name__)
 
@@ -51,12 +51,6 @@ def normalize_country_iso2(country_val: str) -> str:
         return country_val.strip().upper()
     return "US"
 
-def pick_first(d: dict, keys: List[str], default: str = "") -> str:
-    for k in keys:
-        v = d.get(k)
-        if v is not None and str(v).strip() != "":
-            return str(v)
-    return default
 
 # ----------------------------
 # Config
@@ -82,8 +76,11 @@ class Config:
     slant_debug: bool
     slant_auto_submit: bool
 
-    # NEW: choose which JSON key Slant expects for the STL URL
+    # NEW: control which url field to try first
     slant_file_url_field: str
+
+    # NEW: allow “real order” debug routes
+    enable_dangerous_debug: bool
 
     @staticmethod
     def load() -> "Config":
@@ -107,14 +104,15 @@ class Config:
         slant_filaments_endpoint = env_str("SLANT_FILAMENTS_ENDPOINT", f"{slant_base_url}/filaments")
         slant_orders_endpoint = env_str("SLANT_ORDERS_ENDPOINT", f"{slant_base_url}/orders")
 
-        slant_timeout_sec = int(env_str("SLANT_TIMEOUT_SEC", "180") or 180)
+        # Slant can take time to download STL + process
+        slant_timeout_sec = int(env_str("SLANT_TIMEOUT_SEC", "600") or 600)
 
         slant_enabled = bool(slant_api_key)
         slant_debug = env_bool("SLANT_DEBUG", False)
         slant_auto_submit = env_bool("SLANT_AUTO_SUBMIT", False)
 
-        # Default to fileURL; can override to fileUrl if needed
-        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "fileURL").strip() or "fileURL"
+        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "fileUrl")  # try first
+        enable_dangerous_debug = env_bool("ENABLE_DANGEROUS_DEBUG", False)
 
         cfg = Config(
             stripe_secret_key=stripe_secret_key,
@@ -133,6 +131,7 @@ class Config:
             slant_debug=slant_debug,
             slant_auto_submit=slant_auto_submit,
             slant_file_url_field=slant_file_url_field,
+            enable_dangerous_debug=enable_dangerous_debug,
         )
 
         print("✅ Boot config:")
@@ -147,6 +146,7 @@ class Config:
         print("   SLANT_API_KEY:", mask_secret(cfg.slant_api_key))
         print("   SLANT_PLATFORM_ID:", mask_secret(cfg.slant_platform_id))
         print("   SLANT_FILE_URL_FIELD:", cfg.slant_file_url_field)
+        print("   ENABLE_DANGEROUS_DEBUG:", cfg.enable_dangerous_debug)
         return cfg
 
 
@@ -155,6 +155,7 @@ stripe.api_key = CFG.stripe_secret_key
 
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "KrezzServer/1.1"})
+
 
 # ----------------------------
 # Order storage (safe across multiple workers)
@@ -243,6 +244,7 @@ class OrderStore:
 
 STORE = OrderStore(CFG.order_data_path)
 
+
 # ----------------------------
 # Slant client
 # ----------------------------
@@ -273,35 +275,27 @@ def _slant_rate_headers(r: requests.Response) -> Dict[str, str]:
     return {k: v for k, v in r.headers.items() if k.lower().startswith("x-ratelimit")}
 
 def _slant_req_id(r: requests.Response) -> Optional[str]:
+    # include more possibilities
     return (
         r.headers.get("x-request-id")
+        or r.headers.get("x-requestid")
         or r.headers.get("cf-ray")
         or r.headers.get("x-amzn-requestid")
         or r.headers.get("x-correlation-id")
     )
 
 def _slant_log_response(where: str, r: requests.Response, ctx: Optional[Dict[str, Any]] = None) -> None:
-    # Always log errors; log successes only if debug enabled
     if not CFG.slant_debug and r.status_code < 400:
         return
-
     body = (r.text or "")
-    hdr_subset = {}
-    for k in ("x-request-id", "cf-ray", "content-type", "content-length"):
-        if k in {kk.lower(): vv for kk, vv in r.headers.items()}:
-            # rebuild original-cased value lookup
-            for kk, vv in r.headers.items():
-                if kk.lower() == k:
-                    hdr_subset[kk] = vv
-
     msg = {
         "where": where,
         "status": r.status_code,
         "request_id": _slant_req_id(r),
         "rate": _slant_rate_headers(r),
-        "resp_headers": hdr_subset,
         "ctx": ctx or {},
         "body_snippet": body[:1200],
+        "headers_hint": {k: r.headers.get(k) for k in ["content-type", "date", "server"] if k in (k.lower() for k in r.headers.keys())},
     }
     print("🧪 SLANT_HTTP", json.dumps(msg, ensure_ascii=False, default=str))
 
@@ -322,7 +316,6 @@ def _set_slant_step(order_id: str, step: str, extra: Optional[Dict[str, Any]] = 
         return order, True
     STORE.update(order_id, _fn)
 
-# Filament cache
 _FILAMENT_CACHE = {"ts": 0.0, "data": None}
 _FILAMENT_CACHE_TTL_SEC = 600
 
@@ -368,8 +361,9 @@ def resolve_filament_id(shipping_info: dict) -> str:
         if (f.get("profile") or "").upper() == want_profile and f.get("publicId"):
             return f["publicId"]
 
-    if filaments and filaments[0].get("publicId"):
-        return filaments[0]["publicId"]
+    for f in filaments:
+        if f.get("available", True) and f.get("publicId"):
+            return f["publicId"]
 
     raise RuntimeError("No filament available (Slant filaments list returned none with publicId).")
 
@@ -384,55 +378,112 @@ def parse_slant_file_public_id(payload: dict) -> str:
         raise RuntimeError(f"Slant response missing file public id: {str(payload)[:1200]}")
     return public_id
 
+def probe_public_url(url: str) -> Dict[str, Any]:
+    """
+    Verifies your STL URL returns a clean 200 + Content-Length.
+    (This catches Range/206/redirects/403 early before calling Slant.)
+    """
+    out: Dict[str, Any] = {"url": url}
+    try:
+        hr = HTTP.head(url, timeout=(10, 30), allow_redirects=True)
+        out["head_status"] = hr.status_code
+        out["head_len"] = hr.headers.get("content-length")
+        out["head_type"] = hr.headers.get("content-type")
+    except Exception as e:
+        out["head_error"] = str(e)
+
+    try:
+        # small read to confirm 200 and not range
+        gr = HTTP.get(url, timeout=(10, 30), stream=True, allow_redirects=True, headers={"Range": "bytes=0-1023"})
+        out["get_status"] = gr.status_code
+        out["get_type"] = gr.headers.get("content-type")
+        out["get_len"] = gr.headers.get("content-length")
+        # if server ignores range correctly, status should be 200 (not 206)
+        # read a tiny chunk
+        next(gr.iter_content(chunk_size=1024), b"")
+        gr.close()
+    except Exception as e:
+        out["get_error"] = str(e)
+
+    return out
+
 def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     pid = (CFG.slant_platform_id or "").strip()
     if not pid:
         raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime.")
 
-    # IMPORTANT CHANGE:
-    # - send exactly ONE URL field (configurable)
-    # - keep platformId in query params (slant_params)
-    payload = {
-        "name": f"{job_id}.stl",
-        "type": "STL",
-        CFG.slant_file_url_field: stl_url,
-    }
+    # IMPORTANT: send only ONE url field at a time (Slant may not like duplicates)
+    candidates = [CFG.slant_file_url_field, "fileUrl", "url", "fileURL", "downloadUrl"]
+    seen = []
+    for field in candidates:
+        if field in seen:
+            continue
+        seen.append(field)
 
-    if CFG.slant_debug:
-        print("🧪 Slant create file request:", {
-            "endpoint": CFG.slant_files_endpoint,
-            "platformId": pid,
-            "url_field": CFG.slant_file_url_field,
-            "stl_url": stl_url
-        })
+        payload = {
+            "platformId": pid,      # keep in body AND params for compatibility
+            "name": f"{job_id}.stl",
+            "type": "STL",
+            field: stl_url,
+        }
 
-    r = HTTP.post(
-        CFG.slant_files_endpoint,
-        params=slant_params(),
-        headers=slant_headers({"Content-Type": "application/json"}),
-        json=payload,
-        timeout=slant_timeout(),
-    )
-    _slant_log_response("Slant POST /files", r, ctx={"job_id": job_id, "stl_url": stl_url, "url_field": CFG.slant_file_url_field})
+        if CFG.slant_debug:
+            print("🧪 Slant create file request:", {
+                "endpoint": CFG.slant_files_endpoint,
+                "platformId": pid,
+                "url_field": field,
+                "stl_url": stl_url
+            })
 
-    if r.status_code >= 400:
-        raise SlantError(r.status_code, r.text, "Slant create_file_by_url")
+        r = HTTP.post(
+            CFG.slant_files_endpoint,
+            params=slant_params(),
+            headers=slant_headers({"Content-Type": "application/json"}),
+            json=payload,
+            timeout=slant_timeout(),
+        )
+        _slant_log_response("Slant POST /files", r, ctx={"job_id": job_id, "stl_url": stl_url, "url_field": field})
 
-    resp = _safe_json(r)
-    pfsid = parse_slant_file_public_id(resp)
-    print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={pfsid}")
-    return pfsid
+        if r.status_code < 400:
+            resp = _safe_json(r)
+            pfsid = parse_slant_file_public_id(resp)
+            print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={pfsid}")
+            return pfsid
+
+        # If 4xx, don't blindly retry fields—surface the real error
+        if 400 <= r.status_code < 500:
+            raise SlantError(r.status_code, r.text, f"Slant create_file_by_url (url_field={field})")
+
+        # If 500, try the next field (sometimes their backend expects a specific field)
+        if CFG.slant_debug:
+            print(f"🟠 Slant 500 on url_field={field}, trying next candidate…")
+
+    # If we tried all fields
+    raise SlantError(500, "All url fields failed (see logs)", "Slant create_file_by_url")
 
 def slant_upload_stl(job_id: str, stl_path: str) -> str:
     if not os.path.exists(stl_path):
         raise RuntimeError(f"STL not found on server: {stl_path}")
 
     if not CFG.public_base_url:
-        raise RuntimeError("PUBLIC_BASE_URL is missing. Set it so Slant can download the STL.")
+        raise RuntimeError("PUBLIC_BASE_URL is missing. Set it so Slant can download /stl-full/<job>.stl")
 
-    # IMPORTANT CHANGE:
-    # Use the Slant-safe endpoint that always returns 200 (no Range / no 206)
+    # NEW: use “full” endpoint that never returns 206
     stl_url = f"{CFG.public_base_url}/stl-full/{job_id}.stl"
+
+    # NEW: verify URL is good BEFORE calling Slant
+    probe = probe_public_url(stl_url)
+    if CFG.slant_debug:
+        print("🧪 STL PROBE", json.dumps(probe, ensure_ascii=False))
+
+    # Require that range requests do NOT yield 206 (we want clean 200)
+    # If your server returns 206 here, Slant ingestion is likely to fail.
+    if probe.get("get_status") == 206:
+        raise RuntimeError(f"STL URL still returns 206 (partial content). Slant may fail. Probe={probe}")
+
+    if probe.get("head_status") not in (200, 204) and probe.get("get_status") != 200:
+        raise RuntimeError(f"STL URL not healthy for Slant download. Probe={probe}")
+
     return slant_create_file_by_url(job_id, stl_url)
 
 def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
@@ -442,11 +493,11 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
 
     email = shipping.get("email") or "unknown@test.com"
     full_name = shipping.get("fullName") or shipping.get("name") or "Customer"
-    line1 = pick_first(shipping, ["addressLine", "line1"], "")
-    line2 = pick_first(shipping, ["addressLine2", "line2"], "")
+    line1 = shipping.get("addressLine") or shipping.get("line1") or ""
+    line2 = shipping.get("addressLine2") or shipping.get("line2") or ""
     city = shipping.get("city") or ""
     state = shipping.get("state") or ""
-    zip_code = pick_first(shipping, ["zipCode", "zip"], "")
+    zip_code = shipping.get("zipCode") or shipping.get("zip") or ""
     country = normalize_country_iso2(shipping.get("country") or "US")
 
     filament_id = resolve_filament_id(shipping)
@@ -466,9 +517,7 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
         })
 
     if not slant_items:
-        raise RuntimeError(
-            "Order has no valid Slant items. Each item must have publicFileServiceId."
-        )
+        raise RuntimeError("Order has no valid Slant items (missing publicFileServiceId).")
 
     payload = {
         "platformId": pid,
@@ -529,6 +578,7 @@ def slant_process_order(public_order_id: str) -> dict:
 
     return _safe_json(r) if (r.text or "").strip() else {"success": True}
 
+
 # ----------------------------
 # Async Slant submission
 # ----------------------------
@@ -558,6 +608,7 @@ def _set_slant_failed(order_id: str, err: str, tb: str = "") -> None:
         sl["step_at"] = utc_iso()
         order["slant"] = sl
         return order, True
+
     STORE.update(order_id, _fn)
 
 def submit_paid_order_to_slant(order_id: str) -> None:
@@ -599,11 +650,16 @@ def submit_paid_order_to_slant(order_id: str) -> None:
             def _persist_items(order_obj: Dict[str, Any]):
                 order_obj["items"] = items
                 order_obj["status"] = "slant_files_uploaded"
+                sl = order_obj.get("slant") or {}
+                sl["step"] = "file_uploaded"
+                sl["step_at"] = utc_iso()
+                sl["last_job_id"] = job_id
+                sl["last_publicFileServiceId"] = it["publicFileServiceId"]
+                order_obj["slant"] = sl
                 return order_obj, True
             STORE.update(order_id, _persist_items)
 
     _set_slant_step(order_id, "drafting_order")
-
     public_order_id = slant_draft_order(order_id, shipping, items)
 
     def _persist_draft(order_obj: Dict[str, Any]):
@@ -618,7 +674,6 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     STORE.update(order_id, _persist_draft)
 
     _set_slant_step(order_id, "processing_order", {"publicOrderId": public_order_id})
-
     process_resp = slant_process_order(public_order_id)
 
     def _persist_processed(order_obj: Dict[str, Any]):
@@ -648,18 +703,15 @@ def submit_to_slant_async(order_id: str) -> None:
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
+
 # ----------------------------
 # Routes
 # ----------------------------
-@app.get("/")
+@app.route("/")
 def index():
     return "✅ Krezz server is live (Stripe + Slant)."
 
-@app.get("/robots.txt")
-def robots():
-    return Response("User-agent: *\nDisallow:\n", mimetype="text/plain")
-
-@app.get("/health")
+@app.route("/health")
 def health():
     return jsonify({
         "ok": True,
@@ -671,10 +723,9 @@ def health():
         "public_base_url": CFG.public_base_url or None,
         "upload_dir": CFG.upload_dir,
         "orders": STORE.count(),
-        "slant_file_url_field": CFG.slant_file_url_field,
     })
 
-@app.post("/upload")
+@app.route("/upload", methods=["POST"])
 def upload_stl():
     job_id = request.form.get("job_id")
     file = request.files.get("file")
@@ -686,42 +737,66 @@ def upload_stl():
     print(f"✅ Uploaded STL job_id={job_id} -> {save_path}")
     return jsonify({"success": True, "path": save_path})
 
-# Keep your existing STL route (supports ranges, fine for browsers/apps)
+# Keep your old /stl route if you want, but Slant should use /stl-full
 @app.route("/stl/<job_id>.stl", methods=["GET", "HEAD"])
-def serve_stl(job_id: str):
+def serve_stl(job_id):
+    # legacy route—can still return 206 depending on server/range headers
     stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
     if not os.path.exists(stl_path):
         return abort(404)
-
-    return send_file(
-        stl_path,
-        mimetype="model/stl",
-        as_attachment=False,
-        download_name=f"{job_id}.stl",
-        conditional=True,  # range-friendly
-    )
-
-# NEW: Slant-safe route that ALWAYS returns 200 (no Range / no 206)
-@app.route("/stl-full/<job_id>.stl", methods=["GET", "HEAD"])
-def serve_stl_full(job_id: str):
-    stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
-    if not os.path.exists(stl_path):
-        return abort(404)
-
-    # Ignore Range headers by using conditional=False
-    resp = make_response(send_file(
-        stl_path,
-        mimetype="application/octet-stream",
-        as_attachment=False,
-        download_name=f"{job_id}.stl",
-        conditional=False,  # IMPORTANT: disables Range support -> returns 200
-    ))
-    # Some ingest systems behave better when ranges are explicitly disabled
-    resp.headers["Accept-Ranges"] = "none"
-    resp.headers["Cache-Control"] = "public, max-age=3600"
+    # basic streaming response (still might honor Range in some stacks)
+    size = os.path.getsize(stl_path)
+    def gen():
+        with open(stl_path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+    resp = Response(gen(), mimetype="application/octet-stream")
+    resp.headers["Content-Length"] = str(size)
+    resp.headers["Content-Disposition"] = f'inline; filename="{job_id}.stl"'
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
-@app.post("/create-checkout-session")
+@app.route("/stl-full/<job_id>.stl", methods=["GET", "HEAD"])
+def serve_stl_full(job_id):
+    """
+    Slant-safe STL download endpoint:
+    - Always returns 200 for GET
+    - Provides Content-Length
+    - Disables Range behavior via headers and by ignoring Range requests
+    """
+    stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
+    if not os.path.exists(stl_path):
+        return abort(404)
+
+    size = os.path.getsize(stl_path)
+
+    if request.method == "HEAD":
+        resp = Response(b"", status=200, mimetype="application/octet-stream")
+        resp.headers["Content-Length"] = str(size)
+        resp.headers["Content-Disposition"] = f'inline; filename="{job_id}.stl"'
+        resp.headers["Accept-Ranges"] = "none"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    def gen():
+        with open(stl_path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    resp = Response(gen(), status=200, mimetype="application/octet-stream")
+    resp.headers["Content-Length"] = str(size)
+    resp.headers["Content-Disposition"] = f'inline; filename="{job_id}.stl"'
+    resp.headers["Accept-Ranges"] = "none"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+@app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
     try:
         data = request.get_json(silent=True) or {}
@@ -774,7 +849,7 @@ def create_checkout_session():
         print(f"❌ Error in checkout session: {e}\n{tb}")
         return jsonify({"error": str(e)}), 500
 
-@app.post("/webhook")
+@app.route("/webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature")
@@ -827,8 +902,8 @@ def stripe_webhook():
 
     return jsonify(success=True)
 
-@app.get("/order-data/<order_id>")
-def get_order_data(order_id: str):
+@app.route("/order-data/<order_id>", methods=["GET"])
+def get_order_data(order_id):
     data = STORE.get(order_id)
     if not data:
         return jsonify({"error": "Order ID not found"}), 404
@@ -843,8 +918,7 @@ def get_order_data(order_id: str):
         "slant_error_trace": data.get("slant_error_trace"),
     })
 
-# Debug endpoints
-@app.get("/debug/slant/ping")
+@app.route("/debug/slant/ping", methods=["GET"])
 def debug_slant_ping():
     try:
         filaments = slant_get_filaments_cached()
@@ -852,8 +926,8 @@ def debug_slant_ping():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.post("/debug/slant/upload/<job_id>")
-def debug_slant_upload(job_id: str):
+@app.route("/debug/slant/upload/<job_id>", methods=["POST"])
+def debug_slant_upload(job_id):
     try:
         stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
         pfsid = slant_upload_stl(job_id, stl_path)
@@ -862,14 +936,62 @@ def debug_slant_upload(job_id: str):
         tb = traceback.format_exc()
         return jsonify({"ok": False, "error": str(e), "trace": tb[:4000]}), 500
 
-@app.post("/debug/slant/submit/<order_id>")
-def debug_slant_submit(order_id: str):
+@app.route("/debug/slant/submit/<order_id>", methods=["POST"])
+def debug_slant_submit(order_id):
     try:
         submit_paid_order_to_slant(order_id)
         return jsonify({"ok": True})
     except Exception as e:
         tb = traceback.format_exc()
         return jsonify({"ok": False, "error": str(e), "trace": tb[:4000]}), 500
+
+@app.route("/debug/slant/oneclick", methods=["POST"])
+def debug_slant_oneclick():
+    """
+    DANGEROUS: creates a real Slant order if your Slant account is live-billed.
+    Guarded by ENABLE_DANGEROUS_DEBUG=true.
+    Body:
+    {
+      "job_id": "...",
+      "shipping": {...},
+      "item": {"name":"Krezz Mold","quantity":1,"SKU":"..."}
+    }
+    """
+    if not CFG.enable_dangerous_debug:
+        return jsonify({"ok": False, "error": "ENABLE_DANGEROUS_DEBUG is false"}), 403
+
+    data = request.get_json(silent=True) or {}
+    job_id = (data.get("job_id") or "").strip()
+    shipping = data.get("shipping") or {}
+    item = data.get("item") or {}
+
+    if not job_id:
+        return jsonify({"ok": False, "error": "Missing job_id"}), 400
+
+    order_id = str(uuid.uuid4())
+    items = [{
+        "job_id": job_id,
+        "name": item.get("name", "Krezz Mold"),
+        "quantity": int(item.get("quantity", 1)),
+        "SKU": item.get("SKU") or job_id,
+        "price": int(item.get("price", 7500)),
+    }]
+
+    STORE.upsert(order_id, {
+        "items": items,
+        "shipping": shipping,
+        "status": "paid",  # treat as paid for debug
+        "created_at": utc_iso(),
+    })
+
+    try:
+        submit_paid_order_to_slant(order_id)
+        return jsonify({"ok": True, "order_id": order_id, "order": STORE.get(order_id)})
+    except Exception as e:
+        tb = traceback.format_exc()
+        _set_slant_failed(order_id, str(e), tb)
+        return jsonify({"ok": False, "order_id": order_id, "error": str(e), "trace": tb[:4000]}), 500
+
 
 if __name__ == "__main__":
     port = int(env_str("PORT", "10000"))
