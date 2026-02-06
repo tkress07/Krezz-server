@@ -34,9 +34,9 @@ def env_bool(name: str, default: bool = False) -> bool:
         return default
     return v in ("1", "true", "yes", "y", "on")
 
-def safe_int(x: Any, default: int = 0) -> int:
+def env_int(name: str, default: int) -> int:
     try:
-        return int(x)
+        return int((os.getenv(name) or "").strip() or default)
     except Exception:
         return default
 
@@ -58,31 +58,18 @@ def normalize_country_iso2(country_val: str) -> str:
         return country_val.strip().upper()
     return "US"
 
-def best_email_from_checkout_session(session: dict) -> str:
-    # Stripe Checkout session may provide email in multiple locations
-    email = ""
-    cd = session.get("customer_details") or {}
-    if isinstance(cd, dict):
-        email = (cd.get("email") or "").strip().lower()
-    if not email:
-        email = (session.get("customer_email") or "").strip().lower()
-    return email
-
 # ----------------------------
 # Config
 # ----------------------------
 @dataclass(frozen=True)
 class Config:
-    # Stripe
     stripe_secret_key: str
     stripe_endpoint_secret: str
 
-    # Public URLs / storage
     public_base_url: str
     upload_dir: str
     order_data_path: str
 
-    # Slant
     slant_api_key: str
     slant_platform_id: str
     slant_base_url: str
@@ -95,13 +82,16 @@ class Config:
     slant_debug: bool
     slant_auto_submit: bool
 
-    # Safety + test-mode behavior
+    # Safety: prevent test Stripe from placing real Slant orders
     slant_require_live_stripe: bool
-    slant_submit_on_test_stripe: bool
-    slant_test_email_allowlist: List[str]
 
-    # Optional: if you want to force a specific file-url field name for Slant /files
-    slant_file_url_field: str
+    # Optional: allow test Stripe to place real Slant orders
+    slant_allow_test_stripe: bool
+    slant_test_order_allowlist: List[str]
+
+    # KEY FIX: Slant file creation field + payload mode
+    slant_file_url_field: str         # e.g. "URL"
+    slant_files_payload_mode: str     # "json" or "form" or "auto"
 
     @staticmethod
     def load() -> "Config":
@@ -125,27 +115,25 @@ class Config:
         slant_filaments_endpoint = env_str("SLANT_FILAMENTS_ENDPOINT", f"{slant_base_url}/filaments")
         slant_orders_endpoint = env_str("SLANT_ORDERS_ENDPOINT", f"{slant_base_url}/orders")
 
-        slant_timeout_sec = safe_int(env_str("SLANT_TIMEOUT_SEC", "240"), 240)
+        slant_timeout_sec = env_int("SLANT_TIMEOUT_SEC", 240)
 
         slant_enabled = bool(slant_api_key)
         slant_debug = env_bool("SLANT_DEBUG", False)
         slant_auto_submit = env_bool("SLANT_AUTO_SUBMIT", False)
 
-        # --- Key change ---
-        # If you set SLANT_SUBMIT_ON_TEST_STRIPE=true, the server can place real Slant orders
-        # even when Stripe is in TEST mode (livemode=False).
-        slant_submit_on_test_stripe = env_bool("SLANT_SUBMIT_ON_TEST_STRIPE", False)
-
-        # Backward compatibility: you can still set SLANT_REQUIRE_LIVE_STRIPE=false
-        # to allow Slant submits from test Stripe events.
         slant_require_live_stripe = env_bool("SLANT_REQUIRE_LIVE_STRIPE", True)
 
-        # Optional allowlist for test-mode submits (HIGHLY recommended)
-        allow_raw = env_str("SLANT_TEST_EMAIL_ALLOWLIST", "")
-        slant_test_email_allowlist = [e.strip().lower() for e in allow_raw.split(",") if e.strip()]
+        # If you REALLY want real Slant orders while Stripe is still test
+        slant_allow_test_stripe = env_bool("SLANT_ALLOW_TEST_STRIPE", False)
 
-        # Optional: force Slant /files payload field name (otherwise we try common variants)
-        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "fileUrl").strip() or "fileUrl"
+        allowlist_raw = env_str("SLANT_TEST_ORDER_ALLOWLIST", "")
+        slant_test_order_allowlist = [x.strip() for x in allowlist_raw.split(",") if x.strip()]
+
+        # KEY FIX: default to "URL" and form mode (matches your error)
+        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "URL") or "URL"
+        slant_files_payload_mode = env_str("SLANT_FILES_PAYLOAD_MODE", "auto").lower()
+        if slant_files_payload_mode not in ("auto", "json", "form"):
+            slant_files_payload_mode = "auto"
 
         cfg = Config(
             stripe_secret_key=stripe_secret_key,
@@ -164,9 +152,10 @@ class Config:
             slant_debug=slant_debug,
             slant_auto_submit=slant_auto_submit,
             slant_require_live_stripe=slant_require_live_stripe,
-            slant_submit_on_test_stripe=slant_submit_on_test_stripe,
-            slant_test_email_allowlist=slant_test_email_allowlist,
+            slant_allow_test_stripe=slant_allow_test_stripe,
+            slant_test_order_allowlist=slant_test_order_allowlist,
             slant_file_url_field=slant_file_url_field,
+            slant_files_payload_mode=slant_files_payload_mode,
         )
 
         print("✅ Boot config:")
@@ -177,20 +166,21 @@ class Config:
         print("   SLANT_DEBUG:", cfg.slant_debug)
         print("   SLANT_AUTO_SUBMIT:", cfg.slant_auto_submit)
         print("   SLANT_REQUIRE_LIVE_STRIPE:", cfg.slant_require_live_stripe)
-        print("   SLANT_SUBMIT_ON_TEST_STRIPE:", cfg.slant_submit_on_test_stripe)
-        print("   SLANT_TEST_EMAIL_ALLOWLIST set:", bool(cfg.slant_test_email_allowlist))
+        print("   SLANT_ALLOW_TEST_STRIPE:", cfg.slant_allow_test_stripe)
+        print("   SLANT_TEST_ORDER_ALLOWLIST:", cfg.slant_test_order_allowlist)
+        print("   SLANT_FILE_URL_FIELD:", cfg.slant_file_url_field)
+        print("   SLANT_FILES_PAYLOAD_MODE:", cfg.slant_files_payload_mode)
         print("   SLANT_BASE_URL:", cfg.slant_base_url)
         print("   SLANT_TIMEOUT_SEC:", cfg.slant_timeout_sec)
         print("   SLANT_API_KEY:", mask_secret(cfg.slant_api_key))
         print("   SLANT_PLATFORM_ID:", mask_secret(cfg.slant_platform_id))
-        print("   SLANT_FILE_URL_FIELD:", cfg.slant_file_url_field)
         return cfg
 
 CFG = Config.load()
 stripe.api_key = CFG.stripe_secret_key
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "KrezzServer/1.3"})
+HTTP.headers.update({"User-Agent": "KrezzServer/1.4"})
 
 # ----------------------------
 # Order storage (safe across workers)
@@ -283,11 +273,10 @@ STORE = OrderStore(CFG.order_data_path)
 # ----------------------------
 class SlantError(RuntimeError):
     def __init__(self, status: int, body: str, where: str, headers: Optional[Dict[str, str]] = None):
-        hdr = ""
+        mini = {}
         if headers:
             mini = {k: v for k, v in headers.items() if k.lower() in ("content-type", "x-request-id", "cf-ray")}
-            hdr = f" headers={mini}"
-        super().__init__(f"{where}: status={status}{hdr} body={body[:1600]}")
+        super().__init__(f"{where}: status={status} headers={mini} body={body[:1600]}")
         self.status = status
         self.body = body
         self.where = where
@@ -314,10 +303,6 @@ def _safe_json(r: requests.Response) -> Dict[str, Any]:
     except Exception:
         return {"_raw": (r.text or "")[:4000]}
 
-def _slant_log(where: str, obj: Dict[str, Any]) -> None:
-    if CFG.slant_debug:
-        print(f"🧪 {where} {json.dumps(obj, ensure_ascii=False, default=str)[:4000]}")
-
 def _set_slant_step(order_id: str, step: str, extra: Optional[Dict[str, Any]] = None) -> None:
     def _fn(order: Dict[str, Any]):
         sl = order.get("slant") or {}
@@ -338,19 +323,7 @@ def slant_get_filaments_cached() -> List[dict]:
     if _FILAMENT_CACHE["data"] is not None and (now - _FILAMENT_CACHE["ts"]) < _FILAMENT_CACHE_TTL_SEC:
         return _FILAMENT_CACHE["data"]
 
-    r = HTTP.get(
-        CFG.slant_filaments_endpoint,
-        headers=slant_headers(),
-        timeout=slant_timeout(),
-    )
-
-    _slant_log("SLANT_HTTP", {
-        "where": "GET /filaments",
-        "status": r.status_code,
-        "headers": dict(r.headers),
-        "body_snippet": (r.text or "")[:1200],
-    })
-
+    r = HTTP.get(CFG.slant_filaments_endpoint, headers=slant_headers(), timeout=slant_timeout())
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant get_filaments", headers=dict(r.headers))
 
@@ -400,25 +373,58 @@ def stl_probe(url: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"url": url}
     try:
         hr = HTTP.head(url, timeout=(10, 20), allow_redirects=True)
-        out.update({
-            "head_status": hr.status_code,
-            "head_len": hr.headers.get("Content-Length"),
-            "head_type": hr.headers.get("Content-Type"),
-        })
+        out.update({"head_status": hr.status_code, "head_len": hr.headers.get("Content-Length"), "head_type": hr.headers.get("Content-Type")})
     except Exception as e:
         out["head_error"] = str(e)
 
     try:
         gr = HTTP.get(url, timeout=(10, 30), allow_redirects=True)
-        out.update({
-            "get_status": gr.status_code,
-            "get_len": gr.headers.get("Content-Length"),
-            "get_type": gr.headers.get("Content-Type"),
-        })
+        out.update({"get_status": gr.status_code, "get_len": gr.headers.get("Content-Length"), "get_type": gr.headers.get("Content-Type")})
     except Exception as e:
         out["get_error"] = str(e)
 
     return out
+
+def _post_slant_files(payload: Dict[str, Any]) -> requests.Response:
+    """
+    KEY FIX:
+    Some Slant deployments expect form fields instead of JSON.
+    We'll do json/form/auto based on env.
+    """
+    mode = CFG.slant_files_payload_mode
+
+    if mode == "json":
+        return HTTP.post(
+            CFG.slant_files_endpoint,
+            headers=slant_headers({"Content-Type": "application/json"}),
+            json=payload,
+            timeout=slant_timeout(),
+        )
+
+    if mode == "form":
+        # Let requests set the content-type for form encoding.
+        return HTTP.post(
+            CFG.slant_files_endpoint,
+            headers=slant_headers(),
+            data={k: str(v) for k, v in payload.items()},
+            timeout=slant_timeout(),
+        )
+
+    # auto: try JSON first, then form if Slant claims URL missing
+    r = HTTP.post(
+        CFG.slant_files_endpoint,
+        headers=slant_headers({"Content-Type": "application/json"}),
+        json=payload,
+        timeout=slant_timeout(),
+    )
+    if r.status_code == 400 and "URL is a required field" in (r.text or ""):
+        r = HTTP.post(
+            CFG.slant_files_endpoint,
+            headers=slant_headers(),
+            data={k: str(v) for k, v in payload.items()},
+            timeout=slant_timeout(),
+        )
+    return r
 
 def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     pid = (CFG.slant_platform_id or "").strip()
@@ -428,70 +434,59 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     probe = stl_probe(stl_url)
     print("🧪 STL PROBE", json.dumps(probe, ensure_ascii=False, default=str))
 
+    url_field = CFG.slant_file_url_field or "URL"
+
+    # Try a small set of known shapes, but ALWAYS include the configured url_field.
+    attempts: List[Dict[str, Any]] = []
+
     base = {"platformId": pid, "name": f"{job_id}.stl"}
 
-    # Try the configured field first, then common variants
-    url_keys = [CFG.slant_file_url_field, "fileUrl", "fileURL", "url", "URL", "downloadUrl"]
-    url_keys = list(dict.fromkeys([k for k in url_keys if k]))  # dedupe + keep order
+    # Primary: exactly what Slant is complaining about: URL
+    p1 = dict(base)
+    p1[url_field] = stl_url
+    p1["type"] = "STL"
+    attempts.append(p1)
 
-    type_variants = [
-        None,
-        ("type", "STL"),
-        ("fileType", "STL"),
-        ("fileType", "stl"),
-        ("extension", "stl"),
-    ]
+    # Fallback variants (some Slant stacks are picky)
+    for extra_field in ("fileURL", "fileUrl", "url"):
+        p = dict(base)
+        p[extra_field] = stl_url
+        p["type"] = "STL"
+        attempts.append(p)
 
-    last_err: Optional[str] = None
+    last_err = None
 
-    for url_key in url_keys:
-        for tv in type_variants:
-            payload = dict(base)
-            payload[url_key] = stl_url
-            if tv:
-                payload[tv[0]] = tv[1]
+    for i, payload in enumerate(attempts, start=1):
+        print("🧪 Slant create file attempt", i, {
+            "endpoint": CFG.slant_files_endpoint,
+            "platformId": pid,
+            "keys": list(payload.keys()),
+            "url_field_used": [k for k in payload.keys() if k.lower().endswith("url") or k in ("URL",)],
+        })
 
-            print("🧪 Slant create file request:", {
-                "endpoint": CFG.slant_files_endpoint,
-                "platformId": pid,
-                "url_field": url_key,
-                "type_field": tv[0] if tv else None,
-                "type_value": tv[1] if tv else None,
-                "stl_url": stl_url,
-            })
+        r = _post_slant_files(payload)
 
-            r = HTTP.post(
-                CFG.slant_files_endpoint,
-                headers=slant_headers({"Content-Type": "application/json"}),
-                json=payload,
-                timeout=slant_timeout(),
-            )
+        mini_headers = {k: v for k, v in r.headers.items() if k.lower() in ("content-type", "x-request-id", "cf-ray")}
+        print("🧪 SLANT_HTTP", json.dumps({
+            "where": "Slant POST /files",
+            "status": r.status_code,
+            "mini_headers": mini_headers,
+            "body_snippet": (r.text or "")[:1400],
+        }, ensure_ascii=False, default=str))
 
-            mini_headers = {k: v for k, v in r.headers.items()
-                            if k.lower() in ("content-type", "x-request-id", "cf-ray")}
-            print("🧪 SLANT_HTTP", json.dumps({
-                "where": "Slant POST /files",
-                "status": r.status_code,
-                "mini_headers": mini_headers,
-                "body_snippet": (r.text or "")[:1400],
-                "attempt": {"url_field": url_key, "type_field": tv[0] if tv else None,
-                            "type_value": tv[1] if tv else None},
-            }, ensure_ascii=False, default=str))
+        if r.status_code < 400:
+            resp = _safe_json(r)
+            pfsid = parse_slant_file_public_id(resp)
+            print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={pfsid}")
+            return pfsid
 
-            if r.status_code < 400:
-                resp = _safe_json(r)
-                pfsid = parse_slant_file_public_id(resp)
-                print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={pfsid}")
-                return pfsid
-
-            last_err = f"status={r.status_code} body={(r.text or '')[:800]}"
+        last_err = f"status={r.status_code} body={(r.text or '')[:800]}"
 
     raise SlantError(500, last_err or "Unknown error", "Slant create_file_by_url exhausted attempts")
 
 def slant_upload_stl(job_id: str, stl_path: str) -> str:
     if not os.path.exists(stl_path):
         raise RuntimeError(f"STL not found on server: {stl_path}")
-
     if not CFG.public_base_url:
         raise RuntimeError("PUBLIC_BASE_URL is missing. Set it so Slant can download /stl-full/<job>.stl")
 
@@ -564,12 +559,6 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
         timeout=slant_timeout(),
     )
 
-    _slant_log("SLANT_HTTP", {
-        "where": "Slant POST /orders (draft)",
-        "status": r.status_code,
-        "body_snippet": (r.text or "")[:1400],
-    })
-
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant POST /orders (draft)", headers=dict(r.headers))
 
@@ -592,12 +581,6 @@ def slant_process_order(public_order_id: str) -> dict:
     r = HTTP.post(url1, headers=slant_headers(), timeout=slant_timeout())
     if r.status_code == 404:
         r = HTTP.post(url2, headers=slant_headers(), timeout=slant_timeout())
-
-    _slant_log("SLANT_HTTP", {
-        "where": "Slant POST /orders process",
-        "status": r.status_code,
-        "body_snippet": (r.text or "")[:1400],
-    })
 
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant process_order", headers=dict(r.headers))
@@ -653,10 +636,7 @@ def submit_paid_order_to_slant(order_id: str) -> None:
         if not it.get("publicFileServiceId"):
             stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
             it["publicFileServiceId"] = slant_upload_stl(job_id, stl_path)
-            _set_slant_step(order_id, "file_uploaded", {
-                "last_job_id": job_id,
-                "last_publicFileServiceId": it["publicFileServiceId"],
-            })
+            _set_slant_step(order_id, "file_uploaded", {"last_job_id": job_id, "last_publicFileServiceId": it["publicFileServiceId"]})
 
             def _persist_items(order_obj: Dict[str, Any]):
                 order_obj["items"] = items
@@ -739,7 +719,7 @@ def upload_stl():
     print(f"✅ Uploaded STL job_id={job_id} -> {save_path}")
     return jsonify({"success": True, "path": save_path})
 
-# 200-only STL endpoint (NO range / NO conditional)
+# 200-only STL endpoint
 @app.route("/stl-full/<job_id>.stl", methods=["GET", "HEAD"])
 def serve_stl_full(job_id: str):
     stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
@@ -767,7 +747,6 @@ def debug_stl_info(job_id: str):
     size = os.path.getsize(stl_path)
     out: Dict[str, Any] = {"ok": True, "job_id": job_id, "path": stl_path, "size_bytes": size}
 
-    # quick binary STL sanity check: size == 84 + tri_count*50
     try:
         with open(stl_path, "rb") as f:
             header = f.read(80)
@@ -821,14 +800,10 @@ def create_checkout_session():
             "quantity": int(it.get("quantity", 1)),
         } for it in normalized_items]
 
-        # If your app already has the email, you can pass it in shippingInfo.email so Stripe prefills it
-        customer_email = (shipping_info.get("email") or "").strip() or None
-
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
-            customer_email=customer_email,
             success_url=f"krezzapp://order-confirmed?order_id={order_id}",
             cancel_url="https://krezzapp.com/cancel",
             metadata={"order_id": order_id},
@@ -865,9 +840,6 @@ def stripe_webhook():
             print("❌ Missing order_id in Stripe metadata")
             return jsonify(success=True)
 
-        session_livemode = bool(session.get("livemode", livemode))
-        email = best_email_from_checkout_session(session)
-
         def _apply_payment(order_obj: Dict[str, Any]):
             seen = order_obj.get("stripe_event_ids") or []
             if event_id in seen:
@@ -880,35 +852,29 @@ def stripe_webhook():
                 "amount_total": session.get("amount_total"),
                 "currency": session.get("currency"),
                 "created": datetime.utcfromtimestamp(session["created"]).isoformat() + "Z",
-                "email": email or "unknown",
+                "email": session.get("customer_email", "unknown"),
                 "status": "paid",
-                "livemode": bool(session_livemode),
+                "livemode": bool(session.get("livemode", livemode)),
             }
             return order_obj, True
 
         STORE.update(order_id, _apply_payment)
         print(f"✅ Payment confirmed for order_id: {order_id}")
 
-        # ----------------------------
-        # Slant submission gate (UPDATED)
-        # ----------------------------
         if CFG.slant_enabled and CFG.slant_auto_submit:
-            allow_test = (CFG.slant_submit_on_test_stripe or (not CFG.slant_require_live_stripe))
-
-            if (not session_livemode) and (not allow_test):
-                print("🟡 Blocking Slant auto-submit because Stripe is TEST mode. "
-                      "Set SLANT_SUBMIT_ON_TEST_STRIPE=true OR SLANT_REQUIRE_LIVE_STRIPE=false to allow.")
-            else:
-                # Optional allowlist only enforced for TEST mode
-                if (not session_livemode) and CFG.slant_test_email_allowlist:
-                    if email not in CFG.slant_test_email_allowlist:
-                        print(f"🟡 Blocking TEST-mode Slant submit: email '{email or 'unknown'}' not in allowlist.")
-                    else:
-                        print(f"➡️ Queueing Slant submit (TEST allowlisted): order_id={order_id}")
-                        submit_to_slant_async(order_id)
-                else:
-                    print(f"➡️ Queueing Slant submit: order_id={order_id} livemode={session_livemode}")
+            is_live = bool(session.get("livemode", livemode))
+            if CFG.slant_require_live_stripe and not is_live:
+                # allow if explicitly allowed
+                if CFG.slant_allow_test_stripe or (order_id in CFG.slant_test_order_allowlist):
+                    print(f"➡️ Queueing Slant submit (TEST allowlisted): order_id={order_id}")
                     submit_to_slant_async(order_id)
+                else:
+                    print("🟡 Blocking Slant auto-submit because Stripe is TEST mode. "
+                          "Set SLANT_REQUIRE_LIVE_STRIPE=false OR SLANT_ALLOW_TEST_STRIPE=true "
+                          "OR add order_id to SLANT_TEST_ORDER_ALLOWLIST.")
+            else:
+                print(f"➡️ Queueing Slant submit: order_id={order_id}")
+                submit_to_slant_async(order_id)
         else:
             print(f"🟡 SLANT_AUTO_SUBMIT={int(CFG.slant_auto_submit)}, skipping Slant submission.")
 
@@ -951,7 +917,6 @@ def debug_slant_upload(job_id):
 @app.route("/debug/slant/submit/<order_id>", methods=["POST"])
 def debug_slant_submit(order_id):
     try:
-        # Manual backstop if async threads are flaky on your host
         submit_paid_order_to_slant(order_id)
         return jsonify({"ok": True})
     except Exception as e:
