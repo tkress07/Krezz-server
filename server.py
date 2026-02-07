@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import fcntl
 import requests
 import stripe
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, abort, Response, make_response
 
 app = Flask(__name__)
 
@@ -34,12 +34,6 @@ def env_bool(name: str, default: bool = False) -> bool:
         return default
     return v in ("1", "true", "yes", "y", "on")
 
-def safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
 def mask_secret(s: str, keep: int = 4) -> str:
     if not s:
         return ""
@@ -47,6 +41,12 @@ def mask_secret(s: str, keep: int = 4) -> str:
     if len(s) <= keep * 2:
         return "*" * len(s)
     return f"{s[:keep]}…{s[-keep:]}"
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
 
 def normalize_country_iso2(country_val: str) -> str:
     if not country_val:
@@ -65,12 +65,13 @@ def normalize_country_iso2(country_val: str) -> str:
 class Config:
     stripe_secret_key: str
     stripe_endpoint_secret: str
-    stripe_success_url: str
-    stripe_cancel_url: str
 
     public_base_url: str
     upload_dir: str
     order_data_path: str
+
+    stripe_success_url: str
+    stripe_cancel_url: str
 
     slant_api_key: str
     slant_platform_id: str
@@ -85,9 +86,14 @@ class Config:
     slant_auto_submit: bool
     slant_require_live_stripe: bool
 
-    # NEW: Slant file upload field controls
-    slant_file_url_field: str      # default "URL" (caps)
-    slant_use_download_endpoint: bool  # if True, use /stl-download instead of /stl-full for Slant pulls
+    # key name Slant expects for URL field (your logs show it wants "URL")
+    slant_file_url_field: str
+
+    # choose which STL route Slant uses: "raw" (recommended) or "full"
+    slant_stl_route: str
+
+    # auth mode: only api-key by default (recommended)
+    slant_send_bearer: bool
 
     @staticmethod
     def load() -> "Config":
@@ -97,15 +103,23 @@ class Config:
             raise ValueError("Missing STRIPE_SECRET_KEY and/or STRIPE_ENDPOINT_SECRET")
 
         public_base_url = env_str("PUBLIC_BASE_URL", "").rstrip("/")
+        if not public_base_url:
+            raise ValueError("Missing PUBLIC_BASE_URL (e.g. https://krezz-server.onrender.com)")
+
         upload_dir = env_str("UPLOAD_DIR", "/data/uploads")
         os.makedirs(upload_dir, exist_ok=True)
 
         order_data_path = env_str("ORDER_DATA_PATH", "/data/order_data.json")
         os.makedirs(os.path.dirname(order_data_path), exist_ok=True)
 
-        # Stripe redirect URLs (optional; if blank we'll fallback to deep link + web cancel)
-        stripe_success_url = env_str("STRIPE_SUCCESS_URL", "")
-        stripe_cancel_url = env_str("STRIPE_CANCEL_URL", "")
+        stripe_success_url = env_str(
+            "STRIPE_SUCCESS_URL",
+            f"{public_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
+        )
+        stripe_cancel_url = env_str(
+            "STRIPE_CANCEL_URL",
+            f"{public_base_url}/cancel",
+        )
 
         slant_api_key = env_str("SLANT_API_KEY")
         slant_platform_id = env_str("SLANT_PLATFORM_ID")
@@ -121,20 +135,25 @@ class Config:
         slant_auto_submit = env_bool("SLANT_AUTO_SUBMIT", False)
         slant_require_live_stripe = env_bool("SLANT_REQUIRE_LIVE_STRIPE", True)
 
-        # NEW: based on your logs, Slant wants URL with caps.
-        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "URL") or "URL"
+        # IMPORTANT: your error says "URL is required" -> default to "URL"
+        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "URL")
 
-        # NEW: optional toggle—use /stl-download for Slant if their downloader is picky
-        slant_use_download_endpoint = env_bool("SLANT_USE_DOWNLOAD_ENDPOINT", False)
+        # IMPORTANT: use raw endpoint by default (non-streaming, content-length)
+        slant_stl_route = env_str("SLANT_STL_ROUTE", "raw").lower().strip()  # raw|full
+        if slant_stl_route not in ("raw", "full"):
+            slant_stl_route = "raw"
+
+        # IMPORTANT: do NOT send Bearer unless you know you need it
+        slant_send_bearer = env_bool("SLANT_SEND_BEARER", False)
 
         cfg = Config(
             stripe_secret_key=stripe_secret_key,
             stripe_endpoint_secret=stripe_endpoint_secret,
-            stripe_success_url=stripe_success_url,
-            stripe_cancel_url=stripe_cancel_url,
             public_base_url=public_base_url,
             upload_dir=upload_dir,
             order_data_path=order_data_path,
+            stripe_success_url=stripe_success_url,
+            stripe_cancel_url=stripe_cancel_url,
             slant_api_key=slant_api_key,
             slant_platform_id=slant_platform_id,
             slant_base_url=slant_base_url,
@@ -147,23 +166,26 @@ class Config:
             slant_auto_submit=slant_auto_submit,
             slant_require_live_stripe=slant_require_live_stripe,
             slant_file_url_field=slant_file_url_field,
-            slant_use_download_endpoint=slant_use_download_endpoint,
+            slant_stl_route=slant_stl_route,
+            slant_send_bearer=slant_send_bearer,
         )
 
         print("✅ Boot config:")
-        print("   PUBLIC_BASE_URL:", cfg.public_base_url or "(missing)")
+        print("   PUBLIC_BASE_URL:", cfg.public_base_url)
         print("   UPLOAD_DIR:", cfg.upload_dir)
         print("   ORDER_DATA_PATH:", cfg.order_data_path)
-        print("   STRIPE_SUCCESS_URL:", cfg.stripe_success_url or "(not set)")
-        print("   STRIPE_CANCEL_URL:", cfg.stripe_cancel_url or "(not set)")
+        print("   STRIPE_SUCCESS_URL:", cfg.stripe_success_url)
+        print("   STRIPE_CANCEL_URL:", cfg.stripe_cancel_url)
         print("   SLANT_ENABLED:", cfg.slant_enabled)
         print("   SLANT_DEBUG:", cfg.slant_debug)
         print("   SLANT_AUTO_SUBMIT:", cfg.slant_auto_submit)
         print("   SLANT_REQUIRE_LIVE_STRIPE:", cfg.slant_require_live_stripe)
         print("   SLANT_BASE_URL:", cfg.slant_base_url)
+        print("   SLANT_FILES_ENDPOINT:", cfg.slant_files_endpoint)
         print("   SLANT_TIMEOUT_SEC:", cfg.slant_timeout_sec)
         print("   SLANT_FILE_URL_FIELD:", cfg.slant_file_url_field)
-        print("   SLANT_USE_DOWNLOAD_ENDPOINT:", cfg.slant_use_download_endpoint)
+        print("   SLANT_STL_ROUTE:", cfg.slant_stl_route)
+        print("   SLANT_SEND_BEARER:", cfg.slant_send_bearer)
         print("   SLANT_API_KEY:", mask_secret(cfg.slant_api_key))
         print("   SLANT_PLATFORM_ID:", mask_secret(cfg.slant_platform_id))
         return cfg
@@ -172,7 +194,7 @@ CFG = Config.load()
 stripe.api_key = CFG.stripe_secret_key
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "KrezzServer/1.3"})
+HTTP.headers.update({"User-Agent": "KrezzServer/1.4"})
 
 # ----------------------------
 # Order storage (safe across workers)
@@ -248,6 +270,7 @@ class OrderStore:
             order = data.get(order_id)
             if not isinstance(order, dict):
                 order = {"items": [], "shipping": {}, "status": "created", "created_at": utc_iso()}
+
             new_order, changed = fn(dict(order))
             data[order_id] = new_order
             if changed:
@@ -264,25 +287,31 @@ STORE = OrderStore(CFG.order_data_path)
 # ----------------------------
 class SlantError(RuntimeError):
     def __init__(self, status: int, body: str, where: str, headers: Optional[Dict[str, str]] = None):
-        hdr = ""
+        mini = {}
         if headers:
-            mini = {k: v for k, v in headers.items()
-                    if k.lower() in ("content-type", "x-request-id", "cf-ray", "date")}
-            hdr = f" headers={mini}"
-        super().__init__(f"{where}: status={status}{hdr} body={body[:1600]}")
+            for k in ("content-type", "x-request-id", "cf-ray"):
+                if k in {h.lower(): h for h in headers}.keys():
+                    pass
+            mini = {k: v for k, v in headers.items() if k.lower() in ("content-type", "x-request-id", "cf-ray")}
+        super().__init__(f"{where}: status={status} headers={mini} body={(body or '')[:1600]}")
         self.status = status
         self.body = body
         self.where = where
 
 def slant_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    # Keep it SIMPLE: api-key only by default
     h = {
         "Accept": "application/json",
-        "Authorization": f"Bearer {CFG.slant_api_key}",
         "api-key": CFG.slant_api_key,
     }
     pid = (CFG.slant_platform_id or "").strip()
     if pid:
         h["X-Platform-Id"] = pid
+
+    # only send Bearer if you explicitly enable it
+    if CFG.slant_send_bearer:
+        h["Authorization"] = f"Bearer {CFG.slant_api_key}"
+
     if extra:
         h.update(extra)
     return h
@@ -300,16 +329,16 @@ def _slant_log(where: str, obj: Dict[str, Any]) -> None:
     if CFG.slant_debug:
         print(f"🧪 {where} {json.dumps(obj, ensure_ascii=False, default=str)[:4000]}")
 
-def _set_slant_step(order_id: str, step: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    def _fn(order: Dict[str, Any]):
-        sl = order.get("slant") or {}
-        sl["step"] = step
-        sl["step_at"] = utc_iso()
-        if extra:
-            sl.update(extra)
-        order["slant"] = sl
-        return order, True
-    STORE.update(order_id, _fn)
+def parse_slant_file_public_id(payload: dict) -> str:
+    data_obj = payload.get("data") if isinstance(payload, dict) else None
+    public_id = None
+    if isinstance(data_obj, dict):
+        public_id = data_obj.get("publicFileServiceId") or data_obj.get("publicId")
+    if not public_id and isinstance(payload, dict):
+        public_id = payload.get("publicFileServiceId") or payload.get("publicId")
+    if not public_id:
+        raise RuntimeError(f"Slant response missing file public id: {str(payload)[:1200]}")
+    return public_id
 
 # ---- Filaments cache ----
 _FILAMENT_CACHE = {"ts": 0.0, "data": None}
@@ -320,24 +349,18 @@ def slant_get_filaments_cached() -> List[dict]:
     if _FILAMENT_CACHE["data"] is not None and (now - _FILAMENT_CACHE["ts"]) < _FILAMENT_CACHE_TTL_SEC:
         return _FILAMENT_CACHE["data"]
 
-    r = HTTP.get(
-        CFG.slant_filaments_endpoint,
-        headers=slant_headers(),
-        timeout=slant_timeout(),
-    )
-
-    if CFG.slant_debug:
-        _slant_log("SLANT_HTTP", {
-            "where": "GET /filaments",
-            "status": r.status_code,
-            "body_snippet": (r.text or "")[:1200],
-        })
-
+    r = HTTP.get(CFG.slant_filaments_endpoint, headers=slant_headers(), timeout=slant_timeout())
+    _slant_log("SLANT_HTTP", {
+        "where": "GET /filaments",
+        "status": r.status_code,
+        "headers": dict(r.headers),
+        "body_snippet": (r.text or "")[:1200],
+    })
     if r.status_code >= 400:
-        raise SlantError(r.status_code, r.text, "Slant get_filaments", headers=dict(r.headers))
+        raise SlantError(r.status_code, r.text, "Slant GET /filaments", headers=dict(r.headers))
 
     payload = _safe_json(r)
-    data = payload.get("data") or []
+    data = payload.get("data") or payload.get("filaments") or []
     _FILAMENT_CACHE["ts"] = now
     _FILAMENT_CACHE["data"] = data
     return data
@@ -367,17 +390,6 @@ def resolve_filament_id(shipping_info: dict) -> str:
 
     raise RuntimeError("No filament available (Slant filaments returned none with publicId).")
 
-def parse_slant_file_public_id(payload: dict) -> str:
-    data_obj = payload.get("data") if isinstance(payload, dict) else None
-    public_id = None
-    if isinstance(data_obj, dict):
-        public_id = data_obj.get("publicFileServiceId") or data_obj.get("publicId")
-    if not public_id and isinstance(payload, dict):
-        public_id = payload.get("publicFileServiceId") or payload.get("publicId")
-    if not public_id:
-        raise RuntimeError(f"Slant response missing file public id: {str(payload)[:1200]}")
-    return public_id
-
 def stl_probe(url: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"url": url}
     try:
@@ -403,91 +415,58 @@ def stl_probe(url: str) -> Dict[str, Any]:
     return out
 
 def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
-    """
-    FIXED: Slant /files expects URL (caps) in your logs.
-    Then it likely needs a filename-ish field. We try a small, controlled set.
-    """
     pid = (CFG.slant_platform_id or "").strip()
     if not pid:
-        raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime.")
+        raise RuntimeError("SLANT_PLATFORM_ID missing/blank.")
 
-    # probe from your server POV; if this fails Slant will fail too
+    # probe from your server
     probe = stl_probe(stl_url)
     print("🧪 STL PROBE", json.dumps(probe, ensure_ascii=False, default=str))
 
-    url_key = (CFG.slant_file_url_field or "URL").strip() or "URL"
-    filename_fields = ["filename", "fileName", "name"]
-    type_variants = [
-        None,
-        ("fileType", "STL"),
-        ("type", "STL"),
-        ("extension", "stl"),
-    ]
+    payload = {
+        # keep platformId in body too (some versions want it)
+        "platformId": pid,
+        "name": f"{job_id}.stl",
+        "filename": f"{job_id}.stl",
+        CFG.slant_file_url_field: stl_url,   # typically "URL"
+    }
 
-    last_err: Optional[str] = None
+    _slant_log("Slant create file request", {
+        "endpoint": CFG.slant_files_endpoint,
+        "payload_keys": list(payload.keys()),
+        "url_field": CFG.slant_file_url_field,
+        "stl_url": stl_url,
+    })
 
-    for fn_field in filename_fields:
-        for tv in type_variants:
-            payload: Dict[str, Any] = {
-                "platformId": pid,
-                url_key: stl_url,
-                fn_field: f"{job_id}.stl",
-            }
-            # Some APIs are picky—also provide a plain "name" if we're not already using it
-            if fn_field != "name":
-                payload["name"] = f"{job_id}.stl"
+    r = HTTP.post(
+        CFG.slant_files_endpoint,
+        headers=slant_headers({"Content-Type": "application/json"}),
+        json=payload,
+        timeout=slant_timeout(),
+    )
 
-            if tv:
-                payload[tv[0]] = tv[1]
+    _slant_log("SLANT_HTTP", {
+        "where": "POST /files",
+        "status": r.status_code,
+        "headers": dict(r.headers),
+        "body_snippet": (r.text or "")[:1600],
+    })
 
-            print("🧪 Slant create file request:", {
-                "endpoint": CFG.slant_files_endpoint,
-                "platformId": pid,
-                "url_field": url_key,
-                "filename_field": fn_field,
-                "type_field": tv[0] if tv else None,
-                "type_value": tv[1] if tv else None,
-                "stl_url": stl_url,
-            })
+    if r.status_code >= 400:
+        raise SlantError(r.status_code, r.text, "Slant POST /files", headers=dict(r.headers))
 
-            r = HTTP.post(
-                CFG.slant_files_endpoint,
-                headers=slant_headers({"Content-Type": "application/json"}),
-                json=payload,
-                timeout=slant_timeout(),
-            )
-
-            mini_headers = {k: v for k, v in r.headers.items()
-                            if k.lower() in ("content-type", "x-request-id", "cf-ray", "date")}
-            print("🧪 SLANT_HTTP", json.dumps({
-                "where": "Slant POST /files",
-                "status": r.status_code,
-                "mini_headers": mini_headers,
-                "body_snippet": (r.text or "")[:2000],
-                "attempt": {"url_field": url_key, "filename_field": fn_field,
-                            "type_field": tv[0] if tv else None, "type_value": tv[1] if tv else None},
-            }, ensure_ascii=False, default=str))
-
-            if r.status_code < 400:
-                resp = _safe_json(r)
-                pfsid = parse_slant_file_public_id(resp)
-                print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={pfsid}")
-                return pfsid
-
-            last_err = f"status={r.status_code} body={(r.text or '')[:1200]}"
-
-    raise SlantError(500, last_err or "Unknown error", "Slant create_file_by_url exhausted attempts")
+    resp = _safe_json(r)
+    pfsid = parse_slant_file_public_id(resp)
+    print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={pfsid}")
+    return pfsid
 
 def slant_upload_stl(job_id: str, stl_path: str) -> str:
     if not os.path.exists(stl_path):
         raise RuntimeError(f"STL not found on server: {stl_path}")
 
-    if not CFG.public_base_url:
-        raise RuntimeError("PUBLIC_BASE_URL is missing. Set it so Slant can download the STL.")
-
-    # Choose endpoint for Slant download behavior
-    if CFG.slant_use_download_endpoint:
-        stl_url = f"{CFG.public_base_url}/stl-download/{job_id}.stl"
+    # IMPORTANT: use RAW endpoint by default (better for external downloaders)
+    if CFG.slant_stl_route == "raw":
+        stl_url = f"{CFG.public_base_url}/stl-raw/{job_id}.stl"
     else:
         stl_url = f"{CFG.public_base_url}/stl-full/{job_id}.stl"
 
@@ -496,7 +475,7 @@ def slant_upload_stl(job_id: str, stl_path: str) -> str:
 def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
     pid = (CFG.slant_platform_id or "").strip()
     if not pid:
-        raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime.")
+        raise RuntimeError("SLANT_PLATFORM_ID missing/blank.")
 
     email = shipping.get("email") or "unknown@test.com"
     full_name = shipping.get("fullName") or shipping.get("name") or "Customer"
@@ -559,12 +538,12 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
         timeout=slant_timeout(),
     )
 
-    if CFG.slant_debug:
-        print("🧪 SLANT_HTTP", json.dumps({
-            "where": "Slant POST /orders",
-            "status": r.status_code,
-            "body_snippet": (r.text or "")[:2000],
-        }, ensure_ascii=False, default=str))
+    _slant_log("SLANT_HTTP", {
+        "where": "POST /orders (draft)",
+        "status": r.status_code,
+        "headers": dict(r.headers),
+        "body_snippet": (r.text or "")[:1600],
+    })
 
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant POST /orders (draft)", headers=dict(r.headers))
@@ -589,12 +568,12 @@ def slant_process_order(public_order_id: str) -> dict:
     if r.status_code == 404:
         r = HTTP.post(url2, headers=slant_headers(), timeout=slant_timeout())
 
-    if CFG.slant_debug:
-        print("🧪 SLANT_HTTP", json.dumps({
-            "where": "Slant POST /orders process",
-            "status": r.status_code,
-            "body_snippet": (r.text or "")[:2000],
-        }, ensure_ascii=False, default=str))
+    _slant_log("SLANT_HTTP", {
+        "where": "POST /orders process",
+        "status": r.status_code,
+        "headers": dict(r.headers),
+        "body_snippet": (r.text or "")[:1600],
+    })
 
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant process_order", headers=dict(r.headers))
@@ -609,10 +588,6 @@ def _set_slant_failed(order_id: str, err: str, tb: str = "") -> None:
         order["slant_error"] = err
         order["slant_error_trace"] = (tb or "")[:8000]
         order["status"] = "slant_failed"
-        sl = order.get("slant") or {}
-        sl["step"] = "failed"
-        sl["step_at"] = utc_iso()
-        order["slant"] = sl
         return order, True
     STORE.update(order_id, _fn)
 
@@ -627,8 +602,6 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     if not CFG.slant_enabled:
         raise RuntimeError("Slant disabled: SLANT_API_KEY missing")
 
-    _set_slant_step(order_id, "submitting_started")
-
     def _mark_submitting(order_obj: Dict[str, Any]):
         order_obj["status"] = "slant_submitting"
         return order_obj, True
@@ -640,8 +613,6 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     if not items:
         raise RuntimeError("ORDER_DATA has no items for this order_id (cannot submit).")
 
-    _set_slant_step(order_id, "uploading_files")
-
     for it in items:
         job_id = it.get("job_id")
         if not job_id:
@@ -650,10 +621,6 @@ def submit_paid_order_to_slant(order_id: str) -> None:
         if not it.get("publicFileServiceId"):
             stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
             it["publicFileServiceId"] = slant_upload_stl(job_id, stl_path)
-            _set_slant_step(order_id, "file_uploaded", {
-                "last_job_id": job_id,
-                "last_publicFileServiceId": it["publicFileServiceId"],
-            })
 
             def _persist_items(order_obj: Dict[str, Any]):
                 order_obj["items"] = items
@@ -661,30 +628,26 @@ def submit_paid_order_to_slant(order_id: str) -> None:
                 return order_obj, True
             STORE.update(order_id, _persist_items)
 
-    _set_slant_step(order_id, "drafting_order")
     public_order_id = slant_draft_order(order_id, shipping, items)
 
     def _persist_draft(order_obj: Dict[str, Any]):
+        order_obj["status"] = "slant_drafted"
         sl = order_obj.get("slant") or {}
         sl["publicOrderId"] = public_order_id
-        sl["step"] = "order_drafted"
-        sl["step_at"] = utc_iso()
+        sl["drafted_at"] = utc_iso()
         order_obj["slant"] = sl
-        order_obj["status"] = "slant_drafted"
         order_obj["items"] = items
         return order_obj, True
     STORE.update(order_id, _persist_draft)
 
-    _set_slant_step(order_id, "processing_order", {"publicOrderId": public_order_id})
     process_resp = slant_process_order(public_order_id)
 
     def _persist_processed(order_obj: Dict[str, Any]):
+        order_obj["status"] = "submitted_to_slant"
         sl = order_obj.get("slant") or {}
         sl["processResponse"] = process_resp
-        sl["step"] = "submitted"
-        sl["step_at"] = utc_iso()
+        sl["submitted_at"] = utc_iso()
         order_obj["slant"] = sl
-        order_obj["status"] = "submitted_to_slant"
         return order_obj, True
     STORE.update(order_id, _persist_processed)
 
@@ -692,7 +655,6 @@ def submit_paid_order_to_slant(order_id: str) -> None:
 
 def submit_to_slant_async(order_id: str) -> None:
     def _run():
-        _set_slant_step(order_id, "async_started")
         print(f"🧵 Slant async started: order_id={order_id}")
         try:
             submit_paid_order_to_slant(order_id)
@@ -702,6 +664,64 @@ def submit_to_slant_async(order_id: str) -> None:
             print(f"❌ Slant async exception: {e}\n{tb}")
             _set_slant_failed(order_id, str(e), tb)
     threading.Thread(target=_run, daemon=True).start()
+
+# ----------------------------
+# STL serving (RAW + Range support)
+# ----------------------------
+def _read_stl_bytes(job_id: str) -> Tuple[str, bytes]:
+    stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
+    if not os.path.exists(stl_path):
+        abort(404)
+    with open(stl_path, "rb") as f:
+        data = f.read()
+    return stl_path, data
+
+def _range_response(data: bytes, filename: str) -> Response:
+    total = len(data)
+    range_header = request.headers.get("Range")
+
+    base_headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
+    }
+
+    if request.method == "HEAD":
+        resp = Response(status=200)
+        resp.headers.update(base_headers)
+        resp.headers["Content-Length"] = str(total)
+        return resp
+
+    if not range_header:
+        resp = Response(data, status=200)
+        resp.headers.update(base_headers)
+        resp.headers["Content-Length"] = str(total)
+        return resp
+
+    # Parse: Range: bytes=start-end
+    try:
+        units, rng = range_header.split("=", 1)
+        if units.strip().lower() != "bytes":
+            raise ValueError("bad units")
+        start_s, end_s = rng.split("-", 1)
+        start = int(start_s) if start_s else 0
+        end = int(end_s) if end_s else (total - 1)
+        if start < 0 or end < start or end >= total:
+            raise ValueError("bad range")
+    except Exception:
+        # If Range is malformed, fall back to full response
+        resp = Response(data, status=200)
+        resp.headers.update(base_headers)
+        resp.headers["Content-Length"] = str(total)
+        return resp
+
+    chunk = data[start:end + 1]
+    resp = Response(chunk, status=206)
+    resp.headers.update(base_headers)
+    resp.headers["Content-Length"] = str(len(chunk))
+    resp.headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    return resp
 
 # ----------------------------
 # Routes
@@ -718,13 +738,35 @@ def health():
         "slant_enabled": CFG.slant_enabled,
         "slant_auto_submit": CFG.slant_auto_submit,
         "slant_base_url": CFG.slant_base_url,
-        "has_slant_platform_id": bool((CFG.slant_platform_id or "").strip()),
-        "public_base_url": CFG.public_base_url or None,
+        "public_base_url": CFG.public_base_url,
         "upload_dir": CFG.upload_dir,
         "orders": STORE.count(),
-        "slant_file_url_field": CFG.slant_file_url_field,
-        "slant_use_download_endpoint": CFG.slant_use_download_endpoint,
     })
+
+@app.route("/success")
+def success_page():
+    # Stripe will hit this in browser if you use STRIPE_SUCCESS_URL
+    session_id = request.args.get("session_id", "")
+    html = f"""
+    <html><body style="font-family: -apple-system, Arial; padding: 24px;">
+      <h2>✅ Payment successful</h2>
+      <p>Session: {session_id}</p>
+      <p>You can close this window and return to the app.</p>
+      <a href="krezzapp://">Open Krezz App</a>
+    </body></html>
+    """
+    return Response(html, status=200, content_type="text/html; charset=utf-8")
+
+@app.route("/cancel")
+def cancel_page():
+    html = """
+    <html><body style="font-family: -apple-system, Arial; padding: 24px;">
+      <h2>Payment canceled</h2>
+      <p>You can close this window and return to the app to try again.</p>
+      <a href="krezzapp://">Open Krezz App</a>
+    </body></html>
+    """
+    return Response(html, status=200, content_type="text/html; charset=utf-8")
 
 @app.route("/upload", methods=["POST"])
 def upload_stl():
@@ -738,41 +780,23 @@ def upload_stl():
     print(f"✅ Uploaded STL job_id={job_id} -> {save_path}")
     return jsonify({"success": True, "path": save_path})
 
-# 200-only STL endpoint (NO range / NO conditional)
+# old endpoint kept (works for browsers)
 @app.route("/stl-full/<job_id>.stl", methods=["GET", "HEAD"])
 def serve_stl_full(job_id: str):
     stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
     if not os.path.exists(stl_path):
-        return abort(404)
+        abort(404)
+    # streamed version (ok for most things)
+    # NOTE: Slant will use /stl-raw by default, not this.
+    with open(stl_path, "rb") as f:
+        data = f.read()
+    return _range_response(data, f"{job_id}.stl")
 
-    resp = send_file(
-        stl_path,
-        mimetype="model/stl",
-        as_attachment=False,
-        download_name=f"{job_id}.stl",
-        conditional=False,
-        etag=False,
-        last_modified=None,
-    )
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-# NEW: safer “download-like” endpoint (generic content type, attachment, allows conditional)
-@app.route("/stl-download/<job_id>.stl", methods=["GET", "HEAD"])
-def serve_stl_download(job_id: str):
-    stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
-    if not os.path.exists(stl_path):
-        return abort(404)
-
-    resp = send_file(
-        stl_path,
-        mimetype="application/octet-stream",
-        as_attachment=True,
-        download_name=f"{job_id}.stl",
-        conditional=True,
-    )
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+# NEW: non-streaming, content-length, range support (best for Slant)
+@app.route("/stl-raw/<job_id>.stl", methods=["GET", "HEAD"])
+def serve_stl_raw(job_id: str):
+    _, data = _read_stl_bytes(job_id)
+    return _range_response(data, f"{job_id}.stl")
 
 @app.route("/debug/stl/info/<job_id>", methods=["GET"])
 def debug_stl_info(job_id: str):
@@ -797,13 +821,8 @@ def debug_stl_info(job_id: str):
     except Exception as e:
         out["binary_stl_check_error"] = str(e)
 
-    if CFG.public_base_url:
-        out["public_url_full"] = f"{CFG.public_base_url}/stl-full/{job_id}.stl"
-        out["public_url_download"] = f"{CFG.public_base_url}/stl-download/{job_id}.stl"
-    else:
-        out["public_url_full"] = None
-        out["public_url_download"] = None
-
+    out["public_url_raw"] = f"{CFG.public_base_url}/stl-raw/{job_id}.stl"
+    out["public_url_full"] = f"{CFG.public_base_url}/stl-full/{job_id}.stl"
     return jsonify(out)
 
 @app.route("/create-checkout-session", methods=["POST"])
@@ -837,29 +856,16 @@ def create_checkout_session():
             "price_data": {
                 "currency": "usd",
                 "product_data": {"name": it.get("name", "Beard Mold")},
-                # price is assumed to be cents (e.g. 7500)
                 "unit_amount": int(it.get("price", 7500)),
             },
             "quantity": int(it.get("quantity", 1)),
         } for it in normalized_items]
 
-        # Stripe redirect URLs:
-        # If env provides STRIPE_SUCCESS_URL / STRIPE_CANCEL_URL, use those.
-        # Otherwise keep your prior behavior (deeplink success, website cancel).
-        success_url = CFG.stripe_success_url.strip()
-        cancel_url = CFG.stripe_cancel_url.strip()
-
-        if not success_url:
-            success_url = f"krezzapp://order-confirmed?order_id={order_id}"
-        if not cancel_url:
-            cancel_url = "https://krezzapp.com/cancel"
-
         session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
-            success_url=success_url,
-            cancel_url=cancel_url,
+            success_url=CFG.stripe_success_url,
+            cancel_url=CFG.stripe_cancel_url,
             metadata={"order_id": order_id},
         )
 
@@ -915,17 +921,14 @@ def stripe_webhook():
         STORE.update(order_id, _apply_payment)
         print(f"✅ Payment confirmed for order_id: {order_id}")
 
-        # Slant submission gate
         if CFG.slant_enabled and CFG.slant_auto_submit:
             if CFG.slant_require_live_stripe and not bool(session.get("livemode", livemode)):
-                print("🟡 Blocking Slant auto-submit because Stripe is TEST mode. "
-                      "Set SLANT_REQUIRE_LIVE_STRIPE=false OR switch Stripe keys to LIVE when ready.")
+                print("🟡 Blocking Slant auto-submit because Stripe is TEST mode.")
             else:
                 print(f"➡️ Queueing Slant submit: order_id={order_id}")
                 submit_to_slant_async(order_id)
         else:
-            print(f"🟡 SLANT_AUTO_SUBMIT={int(CFG.slant_auto_submit)}, skipping Slant submission.")
-
+            print("🟡 Slant auto-submit disabled.")
     return jsonify(success=True)
 
 @app.route("/order-data/<order_id>", methods=["GET"])
