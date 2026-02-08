@@ -278,7 +278,7 @@ def create_checkout_session():
     line_items = []
     for it in items:
         name = it.get("name") or it.get("styleName") or "Krezz Item"
-        price_cents = int(it.get("price_cents") or it.get("priceCents") or 7500)
+        price_cents = int(it.get("price_cents") or it.get("priceCents") or 1000)
         qty = int(it.get("quantity") or 1)
         line_items.append({
             "price_data": {
