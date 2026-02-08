@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import os
-import io
 import json
 import uuid
-import time
 import fcntl
 import threading
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, quote
@@ -66,15 +63,12 @@ STRIPE_SUCCESS_URL = env_str("STRIPE_SUCCESS_URL", f"{PUBLIC_BASE_URL}/success?s
 STRIPE_CANCEL_URL = env_str("STRIPE_CANCEL_URL", f"{PUBLIC_BASE_URL}/cancel")
 
 # PRICE CONTROL
-# - If DEV_PRICE_OVERRIDE_CENTS is set (>0), the server will charge that for *all* items.
-# - Otherwise it uses item.unit_amount_cents if provided, else defaults to DEFAULT_PRICE_CENTS.
-DEFAULT_PRICE_CENTS = env_int("DEFAULT_PRICE_CENTS", 7500)
-DEV_PRICE_OVERRIDE_CENTS = env_int("DEV_PRICE_OVERRIDE_CENTS", 0)
+DEFAULT_PRICE_CENTS = env_int("DEFAULT_PRICE_CENTS", 7500)          # $75
+DEV_PRICE_OVERRIDE_CENTS = env_int("DEV_PRICE_OVERRIDE_CENTS", 0)   # e.g. 1000 = $10
 
 # Deep link back to app
-# Example: APP_URL_SCHEME=krezz  -> krezz://checkout-success?order_id=...
-APP_URL_SCHEME = env_str("APP_URL_SCHEME", "krezz")
-APP_DEEPLINK_PATH = env_str("APP_DEEPLINK_PATH", "checkout-success")  # can be anything your app handles
+APP_URL_SCHEME = env_str("APP_URL_SCHEME", "krezz")                 # must match iOS URL Types
+APP_DEEPLINK_PATH = env_str("APP_DEEPLINK_PATH", "checkout-success")
 
 # Slant
 SLANT_ENABLED = env_bool("SLANT_ENABLED", False)
@@ -89,17 +83,13 @@ SLANT_PLATFORM_ID = env_str("SLANT_PLATFORM_ID", "")
 SLANT_API_KEY = env_str("SLANT_API_KEY", "")
 SLANT_SEND_BEARER = env_bool("SLANT_SEND_BEARER", True)
 
-# How we provide the STL to Slant:
-# - "url": send URL in payload (Slant downloads it)
-# - "multipart": upload file bytes directly (if their API supports it)
-SLANT_UPLOAD_MODE = env_str("SLANT_UPLOAD_MODE", "url").lower()  # url | multipart
-SLANT_FILE_URL_FIELD = env_str("SLANT_FILE_URL_FIELD", "URL")    # we can try variants if needed
+# Slant upload mode
+SLANT_UPLOAD_MODE = env_str("SLANT_UPLOAD_MODE", "url").lower()     # url | multipart
+SLANT_FILE_URL_FIELD = env_str("SLANT_FILE_URL_FIELD", "URL")       # field name Slant expects
 
-# STL serving route choice
-# - "raw": /stl-raw/<job_id>.stl with octet-stream + attachment headers
-SLANT_STL_ROUTE = env_str("SLANT_STL_ROUTE", "raw").lower()  # raw
+# STL serving
+SLANT_STL_ROUTE = env_str("SLANT_STL_ROUTE", "raw").lower()
 
-# Safety / debug
 CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", True)
 
 ensure_dir(UPLOAD_DIR)
@@ -122,7 +112,6 @@ def boot_log() -> None:
     print("   SLANT_DEBUG:", SLANT_DEBUG)
     print("   SLANT_AUTO_SUBMIT:", SLANT_AUTO_SUBMIT)
     print("   SLANT_REQUIRE_LIVE_STRIPE:", SLANT_REQUIRE_LIVE_STRIPE)
-    print("   SLANT_BASE_URL:", SLANT_BASE_URL)
     print("   SLANT_FILES_ENDPOINT:", SLANT_FILES_ENDPOINT)
     print("   SLANT_TIMEOUT_SEC:", SLANT_TIMEOUT_SEC)
     print("   SLANT_FILE_URL_FIELD:", SLANT_FILE_URL_FIELD)
@@ -207,10 +196,8 @@ def upload():
     path = stl_path_for_job(job_id)
 
     if "file" in request.files:
-        f = request.files["file"]
-        f.save(path)
+        request.files["file"].save(path)
     else:
-        # raw body fallback
         body = request.get_data()
         if not body:
             return jsonify({"error": "No file uploaded"}), 400
@@ -231,8 +218,6 @@ def stl_raw(job_id: str):
     if not os.path.exists(path):
         abort(404)
 
-    # Strong “download-like” headers so external services are happier.
-    # (We still serve inline if they just GET it.)
     resp = send_file(
         path,
         mimetype="application/octet-stream",
@@ -254,32 +239,26 @@ def stl_raw(job_id: str):
 def _coerce_items(items: Any) -> List[Dict[str, Any]]:
     if not isinstance(items, list):
         return []
-    out = []
-    for it in items:
-        if isinstance(it, dict):
-            out.append(it)
-    return out
+    return [it for it in items if isinstance(it, dict)]
 
 def _unit_amount_cents_for_item(it: Dict[str, Any]) -> int:
+    # Force a dev price if set
     if DEV_PRICE_OVERRIDE_CENTS and DEV_PRICE_OVERRIDE_CENTS > 0:
         return DEV_PRICE_OVERRIDE_CENTS
 
-    # If client sends a unit amount (for dev), respect it:
-    for k in ("unit_amount_cents", "unitAmountCents", "price_cents", "priceCents"):
-        if k inasl := it.get(k) is not None:
-            pass
-    # (do it safely)
+    # Otherwise allow client-provided cents for dev/testing
     for k in ("unit_amount_cents", "unitAmountCents", "price_cents", "priceCents"):
         v = it.get(k)
         if v is None:
             continue
         try:
-            v = int(v)
-            if v > 0:
-                return v
+            cents = int(v)
+            if cents > 0:
+                return cents
         except Exception:
-            continue
+            pass
 
+    # Fall back to default ($75)
     return DEFAULT_PRICE_CENTS
 
 @app.route("/create-checkout-session", methods=["POST", "OPTIONS"])
@@ -291,8 +270,7 @@ def create_checkout_session():
         return jsonify({"error": "STRIPE_SECRET_KEY not set"}), 500
 
     payload = request.get_json(silent=True) or {}
-    keys = list(payload.keys())
-    print(f"📥 /create-checkout-session payload: {{'keys': {keys}}}")
+    print(f"📥 /create-checkout-session payload: {{'keys': {list(payload.keys())}}}")
 
     order_id = (payload.get("order_id") or payload.get("orderId") or str(uuid.uuid4())).strip()
     items = _coerce_items(payload.get("items"))
@@ -301,7 +279,6 @@ def create_checkout_session():
     if not items:
         return jsonify({"error": "Missing items"}), 400
 
-    # Persist initial order record
     save_order(order_id, {
         "order_id": order_id,
         "created_at": utc_iso(),
@@ -325,7 +302,6 @@ def create_checkout_session():
             "quantity": qty,
         })
 
-    # include order_id in the success redirect too (helps app)
     success_url = f"{PUBLIC_BASE_URL}/success?session_id={{CHECKOUT_SESSION_ID}}&order_id={quote(order_id)}"
     cancel_url = f"{PUBLIC_BASE_URL}/cancel?order_id={quote(order_id)}"
 
@@ -378,15 +354,14 @@ def slant_headers() -> Dict[str, str]:
     if SLANT_SEND_BEARER:
         h["Authorization"] = f"Bearer {SLANT_API_KEY}"
     else:
-        # fallback patterns in case they support these
         h["Authorization"] = SLANT_API_KEY
         h["x-api-key"] = SLANT_API_KEY
     return h
 
 def slant_create_file_by_url(job_id: str, stl_url: str) -> Dict[str, Any]:
-    # Try a few likely field names; keep your configured one first.
     url_fields = [SLANT_FILE_URL_FIELD, "url", "fileUrl", "fileURL", "URL"]
-    url_fields = [f for i, f in enumerate(url_fields) if f and f not in url_fields[:i]]
+    seen = set()
+    url_fields = [f for f in url_fields if f and not (f in seen or seen.add(f))]
 
     last_err: Optional[Tuple[int, str]] = None
     for field in url_fields:
@@ -396,8 +371,9 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> Dict[str, Any]:
             "filename": f"{job_id}.stl",
             field: stl_url,
         }
+
         if SLANT_DEBUG:
-            print("🧪 Slant create file request", {"endpoint": SLANT_FILES_ENDPOINT, "payload_keys": list(payload.keys()), "url_field": field, "stl_url": stl_url})
+            print("🧪 Slant create file request", {"endpoint": SLANT_FILES_ENDPOINT, "payload_keys": list(payload.keys()), "url_field": field})
 
         r = requests.post(
             SLANT_FILES_ENDPOINT,
@@ -417,47 +393,12 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> Dict[str, Any]:
 
         last_err = (r.status_code, r.text)
 
-        # If auth is wrong, don't keep retrying fields
         if r.status_code in (401, 403):
             raise SlantError(r.status_code, r.text, "Slant POST /files (auth)")
 
     if last_err:
         raise SlantError(last_err[0], last_err[1], "Slant POST /files (url mode)")
     raise SlantError(500, "No response", "Slant POST /files (url mode)")
-
-def slant_create_file_multipart(job_id: str, file_path: str) -> Dict[str, Any]:
-    # If their API supports direct upload, this often works:
-    # POST /files with multipart form-data
-    with open(file_path, "rb") as f:
-        files = {
-            "file": (f"{job_id}.stl", f, "application/octet-stream")
-        }
-        data = {
-            "platformId": SLANT_PLATFORM_ID,
-            "name": f"{job_id}.stl",
-            "filename": f"{job_id}.stl",
-        }
-        if SLANT_DEBUG:
-            print("🧪 Slant multipart upload", {"endpoint": SLANT_FILES_ENDPOINT, "data_keys": list(data.keys())})
-
-        r = requests.post(
-            SLANT_FILES_ENDPOINT,
-            data=data,
-            files=files,
-            headers=slant_headers(),
-            timeout=SLANT_TIMEOUT_SEC,
-        )
-
-        if SLANT_DEBUG:
-            print("🧪 SLANT_HTTP", {"where": "POST /files (multipart)", "status": r.status_code, "body_snippet": r.text[:300]})
-
-        if 200 <= r.status_code < 300:
-            try:
-                return r.json()
-            except Exception:
-                return {"raw": r.text}
-
-        raise SlantError(r.status_code, r.text, "Slant POST /files (multipart)")
 
 def submit_paid_order_to_slant(order_id: str) -> None:
     order = get_order(order_id)
@@ -476,19 +417,14 @@ def submit_paid_order_to_slant(order_id: str) -> None:
         if not job_id:
             continue
 
-        file_path = stl_path_for_job(str(job_id).upper())
+        jid = str(job_id).upper()
+        file_path = stl_path_for_job(jid)
         if not os.path.exists(file_path):
             print("❌ Slant submit: STL not found:", file_path)
             continue
 
-        if SLANT_UPLOAD_MODE == "multipart":
-            resp = slant_create_file_multipart(str(job_id).upper(), file_path)
-        else:
-            # URL mode
-            stl_url = f"{PUBLIC_BASE_URL}/stl-raw/{str(job_id).upper()}.stl"
-            resp = slant_create_file_by_url(str(job_id).upper(), stl_url)
-
-        # store response per item
+        stl_url = f"{PUBLIC_BASE_URL}/stl-raw/{jid}.stl"
+        resp = slant_create_file_by_url(jid, stl_url)
         it["slant_file_response"] = resp
 
     update_order(order_id, {"items": items, "slant_submitted_at": utc_iso(), "slant_status": "submitted"})
@@ -503,8 +439,7 @@ def queue_slant_submit(order_id: str) -> None:
             print("❌ Slant async exception:", str(e))
             update_order(order_id, {"slant_status": "error", "slant_error": str(e)})
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    threading.Thread(target=_run, daemon=True).start()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -512,7 +447,6 @@ def webhook():
     sig_header = request.headers.get("Stripe-Signature", "")
 
     if not sig_header:
-        # This is the exact cause of “No signatures found…” in many setups.
         print("❌ Webhook missing Stripe-Signature header")
         return ("bad", 400)
 
@@ -562,7 +496,6 @@ def webhook():
 # ----------------------------
 
 def build_deeplink(order_id: str, session_id: str) -> str:
-    # No braces, no spaces, fully valid URL
     qs = urlencode({"order_id": order_id, "session_id": session_id})
     return f"{APP_URL_SCHEME}://{APP_DEEPLINK_PATH}?{qs}"
 
@@ -595,10 +528,7 @@ def success():
   <p>Order: <code>{order_id}</code></p>
   <p>Session: <code>{session_id}</code></p>
 
-  <p class="muted">If the button doesn’t open the app, your iOS app must register the URL scheme <b>{APP_URL_SCHEME}</b>.</p>
-
   <script>
-    // Auto-attempt opening the app after a brief moment
     setTimeout(function() {{
       window.location.href = "{deeplink}";
     }}, 350);
