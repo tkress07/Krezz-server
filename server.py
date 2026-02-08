@@ -17,7 +17,7 @@ import requests
 import stripe
 from flask import Flask, request, jsonify, send_file, abort, make_response
 
-APP_VERSION = "KrezzServer/1.5"
+APP_VERSION = "KrezzServer/1.6"
 
 app = Flask(__name__)
 
@@ -60,6 +60,11 @@ def normalize_country_iso2(country_val: str) -> str:
         return country_val.strip().upper()
     return "US"
 
+def req_id() -> str:
+    # best-effort request correlation id
+    rid = request.headers.get("X-Request-Id") or request.headers.get("X-Request-ID")
+    return (rid or str(uuid.uuid4()))[:64]
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -92,6 +97,10 @@ class Config:
     slant_stl_route: str               # "raw" or "full"
     slant_send_bearer: bool            # send Authorization: Bearer
 
+    # new:
+    require_stl_before_checkout: bool   # blocks checkout if STL missing
+    auto_submit_on_upload_if_paid: bool # if paid_waiting_for_stl, upload triggers slant
+
     @staticmethod
     def load() -> "Config":
         stripe_secret_key = env_str("STRIPE_SECRET_KEY")
@@ -109,8 +118,6 @@ class Config:
         order_data_path = env_str("ORDER_DATA_PATH", "/data/order_data.json")
         os.makedirs(os.path.dirname(order_data_path), exist_ok=True)
 
-        # Stripe redirect URLs (server pages)
-        # You can override in Render env vars if desired.
         success_tmpl = env_str(
             "STRIPE_SUCCESS_URL",
             f"{public_base_url}/success?order_id={{ORDER_ID}}&session_id={{CHECKOUT_SESSION_ID}}",
@@ -135,9 +142,12 @@ class Config:
         slant_auto_submit = env_bool("SLANT_AUTO_SUBMIT", False)
         slant_require_live_stripe = env_bool("SLANT_REQUIRE_LIVE_STRIPE", True)
 
-        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "URL")  # your logs show "URL"
-        slant_stl_route = env_str("SLANT_STL_ROUTE", "raw").lower()    # "raw" recommended
-        slant_send_bearer = env_bool("SLANT_SEND_BEARER", True)        # MUST be True to avoid 401
+        slant_file_url_field = env_str("SLANT_FILE_URL_FIELD", "URL")
+        slant_stl_route = env_str("SLANT_STL_ROUTE", "raw").lower()
+        slant_send_bearer = env_bool("SLANT_SEND_BEARER", True)
+
+        require_stl_before_checkout = env_bool("REQUIRE_STL_BEFORE_CHECKOUT", True)
+        auto_submit_on_upload_if_paid = env_bool("AUTO_SUBMIT_ON_UPLOAD_IF_PAID", True)
 
         cfg = Config(
             stripe_secret_key=stripe_secret_key,
@@ -161,6 +171,8 @@ class Config:
             slant_file_url_field=slant_file_url_field,
             slant_stl_route=slant_stl_route,
             slant_send_bearer=slant_send_bearer,
+            require_stl_before_checkout=require_stl_before_checkout,
+            auto_submit_on_upload_if_paid=auto_submit_on_upload_if_paid,
         )
 
         print("✅ Boot config:")
@@ -170,7 +182,6 @@ class Config:
         print("   STRIPE_SUCCESS_URL:", cfg.stripe_success_url_tmpl)
         print("   STRIPE_CANCEL_URL:", cfg.stripe_cancel_url_tmpl)
         print("   SLANT_ENABLED:", cfg.slant_enabled)
-        print("   SLANT_DEBUG:", cfg.slant_debug)
         print("   SLANT_AUTO_SUBMIT:", cfg.slant_auto_submit)
         print("   SLANT_REQUIRE_LIVE_STRIPE:", cfg.slant_require_live_stripe)
         print("   SLANT_BASE_URL:", cfg.slant_base_url)
@@ -179,6 +190,8 @@ class Config:
         print("   SLANT_FILE_URL_FIELD:", cfg.slant_file_url_field)
         print("   SLANT_STL_ROUTE:", cfg.slant_stl_route)
         print("   SLANT_SEND_BEARER:", cfg.slant_send_bearer)
+        print("   REQUIRE_STL_BEFORE_CHECKOUT:", cfg.require_stl_before_checkout)
+        print("   AUTO_SUBMIT_ON_UPLOAD_IF_PAID:", cfg.auto_submit_on_upload_if_paid)
         print("   SLANT_API_KEY:", mask_secret(cfg.slant_api_key))
         print("   SLANT_PLATFORM_ID:", mask_secret(cfg.slant_platform_id))
         return cfg
@@ -194,6 +207,12 @@ def build_success_url(order_id: str) -> str:
 
 def build_cancel_url(order_id: str) -> str:
     return CFG.stripe_cancel_url_tmpl.replace("{ORDER_ID}", order_id)
+
+def stl_path_for(job_id: str) -> str:
+    return os.path.join(CFG.upload_dir, f"{job_id}.stl")
+
+def stl_exists(job_id: str) -> bool:
+    return os.path.exists(stl_path_for(job_id))
 
 # ----------------------------
 # Order storage (file + lock)
@@ -300,10 +319,8 @@ class SlantError(RuntimeError):
 def slant_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     h: Dict[str, str] = {"Accept": "application/json"}
     if CFG.slant_api_key:
-        # Slant explicitly told you Bearer is required (your 401 error)
         if CFG.slant_send_bearer:
             h["Authorization"] = f"Bearer {CFG.slant_api_key}"
-        # Some endpoints also accept api-key; safe to include
         h["api-key"] = CFG.slant_api_key
 
     pid = (CFG.slant_platform_id or "").strip()
@@ -328,20 +345,12 @@ def _slant_log(where: str, obj: Dict[str, Any]) -> None:
         print(f"🧪 {where} {json.dumps(obj, ensure_ascii=False, default=str)[:4000]}")
 
 def parse_slant_file_public_id(payload: dict) -> str:
-    # handle multiple shapes
     data_obj = payload.get("data") if isinstance(payload, dict) else None
     candidates = []
     if isinstance(data_obj, dict):
-        candidates += [
-            data_obj.get("publicFileServiceId"),
-            data_obj.get("publicId"),
-            data_obj.get("id"),
-        ]
-    candidates += [
-        payload.get("publicFileServiceId") if isinstance(payload, dict) else None,
-        payload.get("publicId") if isinstance(payload, dict) else None,
-        payload.get("id") if isinstance(payload, dict) else None,
-    ]
+        candidates += [data_obj.get("publicFileServiceId"), data_obj.get("publicId"), data_obj.get("id")]
+    if isinstance(payload, dict):
+        candidates += [payload.get("publicFileServiceId"), payload.get("publicId"), payload.get("id")]
     for c in candidates:
         if c:
             return str(c)
@@ -372,7 +381,6 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
         "platformId": pid,
         "name": f"{job_id}.stl",
         "filename": f"{job_id}.stl",
-        # The key that mattered in your earlier logs:
         CFG.slant_file_url_field: stl_url,  # typically "URL"
     }
 
@@ -390,7 +398,6 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
         timeout=slant_timeout(),
     )
 
-    # ALWAYS log response
     print("🧪 SLANT_HTTP", json.dumps({
         "where": "POST /files",
         "status": r.status_code,
@@ -406,13 +413,10 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={file_id}")
     return file_id
 
-def slant_upload_stl(job_id: str, stl_path: str) -> str:
-    if not os.path.exists(stl_path):
-        raise RuntimeError(f"STL not found on server: {stl_path}")
-
-    if not CFG.public_base_url:
-        raise RuntimeError("PUBLIC_BASE_URL missing (needed so Slant can fetch STL).")
-
+def slant_upload_stl(job_id: str) -> str:
+    p = stl_path_for(job_id)
+    if not os.path.exists(p):
+        raise RuntimeError(f"STL not found on server: {p}")
     route = "stl-raw" if CFG.slant_stl_route == "raw" else "stl-full"
     stl_url = f"{CFG.public_base_url}/{route}/{job_id}.stl"
     return slant_create_file_by_url(job_id, stl_url)
@@ -427,11 +431,7 @@ def slant_get_filaments_cached() -> List[dict]:
         return _FILAMENT_CACHE["data"]
 
     r = HTTP.get(CFG.slant_filaments_endpoint, headers=slant_headers(), timeout=slant_timeout())
-    _slant_log("SLANT_HTTP", {
-        "where": "GET /filaments",
-        "status": r.status_code,
-        "body_snippet": (r.text or "")[:1200],
-    })
+    _slant_log("SLANT_HTTP", {"where": "GET /filaments", "status": r.status_code, "body_snippet": (r.text or "")[:1200]})
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant GET /filaments", headers=dict(r.headers))
 
@@ -525,18 +525,8 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
         "metadata": {"internalOrderId": order_id},
     }
 
-    r = HTTP.post(
-        CFG.slant_orders_endpoint,
-        headers=slant_headers({"Content-Type": "application/json"}),
-        json=payload,
-        timeout=slant_timeout(),
-    )
-
-    print("🧪 SLANT_HTTP", json.dumps({
-        "where": "POST /orders (draft)",
-        "status": r.status_code,
-        "body_snippet": (r.text or "")[:1400],
-    }, ensure_ascii=False, default=str))
+    r = HTTP.post(CFG.slant_orders_endpoint, headers=slant_headers({"Content-Type": "application/json"}), json=payload, timeout=slant_timeout())
+    print("🧪 SLANT_HTTP", json.dumps({"where": "POST /orders (draft)", "status": r.status_code, "body_snippet": (r.text or "")[:1400]}, ensure_ascii=False))
 
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant POST /orders (draft)", headers=dict(r.headers))
@@ -563,11 +553,7 @@ def slant_process_order(public_order_id: str) -> dict:
     if r.status_code == 404:
         r = HTTP.post(url2, headers=slant_headers(), timeout=slant_timeout())
 
-    print("🧪 SLANT_HTTP", json.dumps({
-        "where": "POST /orders process",
-        "status": r.status_code,
-        "body_snippet": (r.text or "")[:1400],
-    }, ensure_ascii=False, default=str))
+    print("🧪 SLANT_HTTP", json.dumps({"where": "POST /orders process", "status": r.status_code, "body_snippet": (r.text or "")[:1400]}, ensure_ascii=False))
 
     if r.status_code >= 400:
         raise SlantError(r.status_code, r.text, "Slant process_order", headers=dict(r.headers))
@@ -609,6 +595,16 @@ def _set_slant_failed(order_id: str, err: str, tb: str = "") -> None:
         return order, True
     STORE.update(order_id, _fn)
 
+def missing_stls_for_items(items: List[dict]) -> List[str]:
+    missing: List[str] = []
+    for it in items or []:
+        jid = (it.get("job_id") or "").strip()
+        if not jid:
+            continue
+        if not stl_exists(jid):
+            missing.append(jid)
+    return missing
+
 def submit_paid_order_to_slant(order_id: str) -> None:
     order = STORE.get(order_id) or {}
     status = order.get("status")
@@ -625,27 +621,29 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     if not items:
         raise RuntimeError("ORDER_DATA has no items for this order_id (cannot submit).")
 
+    # Hard stop if STL missing (prevents your current crash)
+    missing = missing_stls_for_items(items)
+    if missing:
+        raise RuntimeError(f"Missing STL(s) on server for job_id(s): {missing}")
+
     _set_slant_step(order_id, "uploading_files")
     _set_order_status(order_id, "slant_submitting")
 
+    # upload files to slant (by URL)
     for it in items:
-        job_id = it.get("job_id")
+        job_id = (it.get("job_id") or "").strip()
         if not job_id:
             raise RuntimeError("Item missing job_id")
 
         if not it.get("publicFileServiceId"):
-            stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
-            it["publicFileServiceId"] = slant_upload_stl(job_id, stl_path)
+            it["publicFileServiceId"] = slant_upload_stl(job_id)
+            _set_slant_step(order_id, "file_uploaded", {"last_job_id": job_id, "last_publicFileServiceId": it["publicFileServiceId"]})
 
-            _set_slant_step(order_id, "file_uploaded", {
-                "last_job_id": job_id,
-                "last_publicFileServiceId": it["publicFileServiceId"],
-            })
-
-            def _persist_items(order_obj: Dict[str, Any]):
-                order_obj["items"] = items
-                return order_obj, True
-            STORE.update(order_id, _persist_items)
+    # persist updated items
+    def _persist_items(order_obj: Dict[str, Any]):
+        order_obj["items"] = items
+        return order_obj, True
+    STORE.update(order_id, _persist_items)
 
     _set_slant_step(order_id, "drafting_order")
     public_order_id = slant_draft_order(order_id, shipping, items)
@@ -708,7 +706,6 @@ def success():
     order_id = (request.args.get("order_id") or "").strip()
 
     receipt_url = ""
-    # Fallback: if order_id missing, try to pull from Stripe session metadata
     try:
         if session_id:
             s = stripe.checkout.Session.retrieve(session_id, expand=["payment_intent.charges"])
@@ -725,7 +722,6 @@ def success():
 
     app_url = f"krezzapp://order-confirmed?order_id={order_id}&session_id={session_id}"
 
-    # HTML-escape user-controlled strings
     esc_order = html.escape(order_id or "")
     esc_sess = html.escape(session_id or "")
     esc_app  = html.escape(app_url)
@@ -757,8 +753,6 @@ def success():
   </p>
 
   <script>
-    // iOS often blocks automatic deep-links unless the user taps,
-    // but we still try once.
     setTimeout(function() {{
       window.location.href = "{esc_app}";
     }}, 350);
@@ -787,25 +781,52 @@ def cancel():
 # --- uploads + STL serving ---
 @app.route("/upload", methods=["POST"])
 def upload_stl():
-    job_id = request.form.get("job_id")
+    """
+    Accepts:
+      - job_id (required)
+      - file (required)
+      - order_id (optional but recommended)
+    If order_id is provided and the order was paid_waiting_for_stl, we can auto-submit to Slant
+    once all required STLs exist.
+    """
+    job_id = (request.form.get("job_id") or "").strip()
+    order_id = (request.form.get("order_id") or "").strip()
     file = request.files.get("file")
+
     if not job_id or not file:
         return jsonify({"error": "Missing job_id or file"}), 400
 
-    save_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
+    save_path = stl_path_for(job_id)
     file.save(save_path)
-    print(f"✅ Uploaded STL job_id={job_id} -> {save_path}")
-    return jsonify({"success": True, "path": save_path})
+    print(f"✅ Uploaded STL job_id={job_id} -> {save_path} order_id={order_id or 'none'}")
 
-# RAW (recommended for Slant): octet-stream, full response, no range/conditional
+    # If we know the order, record upload info + possibly auto-submit
+    if order_id:
+        def _note_upload(order_obj: Dict[str, Any]):
+            u = order_obj.get("uploads") or []
+            u.append({"job_id": job_id, "path": save_path, "at": utc_iso()})
+            order_obj["uploads"] = u[-50:]
+            return order_obj, True
+        STORE.update(order_id, _note_upload)
+
+        if CFG.slant_enabled and CFG.slant_auto_submit and CFG.auto_submit_on_upload_if_paid:
+            order = STORE.get(order_id) or {}
+            if order.get("status") == "paid_waiting_for_stl":
+                missing = missing_stls_for_items(order.get("items") or [])
+                if not missing:
+                    print(f"➡️ Upload completed missing STLs resolved; queueing Slant submit: order_id={order_id}")
+                    submit_to_slant_async(order_id)
+
+    return jsonify({"success": True, "job_id": job_id, "path": save_path})
+
 @app.route("/stl-raw/<job_id>.stl", methods=["GET", "HEAD"])
 def serve_stl_raw(job_id: str):
-    stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
-    if not os.path.exists(stl_path):
+    p = stl_path_for(job_id)
+    if not os.path.exists(p):
         return abort(404)
 
     resp = send_file(
-        stl_path,
+        p,
         mimetype="application/octet-stream",
         as_attachment=False,
         download_name=f"{job_id}.stl",
@@ -816,15 +837,14 @@ def serve_stl_raw(job_id: str):
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
-# FULL: model/stl
 @app.route("/stl-full/<job_id>.stl", methods=["GET", "HEAD"])
 def serve_stl_full(job_id: str):
-    stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
-    if not os.path.exists(stl_path):
+    p = stl_path_for(job_id)
+    if not os.path.exists(p):
         return abort(404)
 
     resp = send_file(
-        stl_path,
+        p,
         mimetype="model/stl",
         as_attachment=False,
         download_name=f"{job_id}.stl",
@@ -837,16 +857,15 @@ def serve_stl_full(job_id: str):
 
 @app.route("/debug/stl/info/<job_id>", methods=["GET"])
 def debug_stl_info(job_id: str):
-    stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
-    if not os.path.exists(stl_path):
-        return jsonify({"ok": False, "error": "not found"}), 404
-
-    size = os.path.getsize(stl_path)
+    p = stl_path_for(job_id)
+    if not os.path.exists(p):
+        return jsonify({"ok": False, "error": "not found", "path": p}), 404
+    size = os.path.getsize(p)
     route = "stl-raw" if CFG.slant_stl_route == "raw" else "stl-full"
     return jsonify({
         "ok": True,
         "job_id": job_id,
-        "path": stl_path,
+        "path": p,
         "size_bytes": size,
         "public_url": f"{CFG.public_base_url}/{route}/{job_id}.stl",
     })
@@ -854,6 +873,11 @@ def debug_stl_info(job_id: str):
 # --- checkout session ---
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
+    """
+    IMPORTANT CHANGE:
+      If REQUIRE_STL_BEFORE_CHECKOUT=true (default),
+      this will return 409 if any job_id STL is missing.
+    """
     try:
         data = request.get_json(silent=True) or {}
         print("📥 /create-checkout-session payload:", {"keys": list(data.keys())})
@@ -863,14 +887,30 @@ def create_checkout_session():
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
-        order_id = data.get("order_id") or str(uuid.uuid4())
+        order_id = (data.get("order_id") or "").strip() or str(uuid.uuid4())
 
+        # Normalize items WITHOUT inventing new job_ids silently
         normalized_items = []
         for it in items:
-            job_id = it.get("job_id") or it.get("jobId") or it.get("id") or str(uuid.uuid4())
+            job_id = (it.get("job_id") or it.get("jobId") or "").strip()
+            if not job_id:
+                return jsonify({
+                    "error": "Missing job_id on item. You must use the SAME job_id you uploaded as the STL filename.",
+                    "hint": "Upload STL first with /upload (job_id), then send that same job_id in /create-checkout-session."
+                }), 400
+
             it["job_id"] = job_id
             it["quantity"] = int(it.get("quantity", 1))
             normalized_items.append(it)
+
+        if CFG.require_stl_before_checkout:
+            missing = missing_stls_for_items(normalized_items)
+            if missing:
+                return jsonify({
+                    "error": "STL not uploaded yet for one or more items",
+                    "missing_job_ids": missing,
+                    "hint": "Make sure iOS uses the same job_id for upload AND checkout."
+                }), 409
 
         STORE.upsert(order_id, {
             "items": normalized_items,
@@ -888,14 +928,17 @@ def create_checkout_session():
             "quantity": int(it.get("quantity", 1)),
         } for it in normalized_items]
 
+        # Prevent duplicate sessions if client hits endpoint twice
+        idem_key = f"checkout_{order_id}"
+
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
-            # IMPORTANT: Stripe redirects here after payment
             success_url=build_success_url(order_id),
             cancel_url=build_cancel_url(order_id),
             metadata={"order_id": order_id},
+            idempotency_key=idem_key,
         )
 
         print(f"✅ Created checkout session: {session.id} order_id={order_id}")
@@ -956,8 +999,16 @@ def stripe_webhook():
             if CFG.slant_require_live_stripe and not bool(session.get("livemode", livemode)):
                 print("🟡 Blocking Slant auto-submit (Stripe TEST). Set SLANT_REQUIRE_LIVE_STRIPE=false to allow test.")
             else:
-                print(f"➡️ Queueing Slant submit: order_id={order_id}")
-                submit_to_slant_async(order_id)
+                # NEW: if STL missing, mark waiting instead of crashing
+                order = STORE.get(order_id) or {}
+                missing = missing_stls_for_items(order.get("items") or [])
+                if missing:
+                    print(f"🟡 Paid but missing STL(s): {missing} -> setting paid_waiting_for_stl")
+                    _set_order_status(order_id, "paid_waiting_for_stl", {"missing_stls": missing})
+                    _set_slant_step(order_id, "waiting_for_stl", {"missing_stls": missing})
+                else:
+                    print(f"➡️ Queueing Slant submit: order_id={order_id}")
+                    submit_to_slant_async(order_id)
         else:
             print(f"🟡 SLANT_AUTO_SUBMIT={int(CFG.slant_auto_submit)} skipping Slant submission.")
 
@@ -975,9 +1026,11 @@ def get_order_data(order_id):
         "payment": data.get("payment", {}),
         "items": data.get("items", []),
         "shipping": data.get("shipping", {}),
+        "uploads": data.get("uploads", []),
         "slant": data.get("slant", {}),
         "slant_error": data.get("slant_error"),
         "slant_error_trace": data.get("slant_error_trace"),
+        "missing_stls": data.get("missing_stls"),
     })
 
 # --- debug helpers ---
@@ -992,8 +1045,7 @@ def debug_slant_ping():
 @app.route("/debug/slant/upload/<job_id>", methods=["POST"])
 def debug_slant_upload(job_id):
     try:
-        stl_path = os.path.join(CFG.upload_dir, f"{job_id}.stl")
-        pfsid = slant_upload_stl(job_id, stl_path)
+        pfsid = slant_upload_stl(job_id)
         return jsonify({"ok": True, "job_id": job_id, "publicFileServiceId": pfsid})
     except Exception as e:
         tb = traceback.format_exc()
@@ -1007,6 +1059,18 @@ def debug_slant_submit(order_id):
     except Exception as e:
         tb = traceback.format_exc()
         return jsonify({"ok": False, "error": str(e), "trace": tb[:4000]}), 500
+
+@app.route("/debug/order/missing-stl/<order_id>", methods=["GET"])
+def debug_order_missing_stl(order_id):
+    order = STORE.get(order_id) or {}
+    items = order.get("items") or []
+    missing = missing_stls_for_items(items)
+    return jsonify({
+        "ok": True,
+        "order_id": order_id,
+        "missing_job_ids": missing,
+        "upload_dir": CFG.upload_dir,
+    })
 
 if __name__ == "__main__":
     port = int(env_str("PORT", "10000"))
