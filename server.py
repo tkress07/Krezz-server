@@ -374,21 +374,26 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     if not pid:
         raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime.")
 
+    # Optional sanity probe (you already do this)
     probe = stl_probe_head(stl_url)
     print("🧪 STL PROBE", json.dumps(probe, ensure_ascii=False, default=str))
 
+    # ✅ Slant docs: POST /files body requires: URL, name, platformId, type (stl). ownerId optional.
     payload = {
+        "URL": stl_url,            # MUST be exactly "URL" per docs
+        "name": job_id,            # docs say name does not need .stl
         "platformId": pid,
-        "name": f"{job_id}.stl",
-        "filename": f"{job_id}.stl",
-        CFG.slant_file_url_field: stl_url,  # typically "URL"
+        "type": "stl",             # REQUIRED per docs
     }
+
+    # ownerId is optional; include only if you have it configured
+    owner_id = getattr(CFG, "slant_owner_id", None) or getattr(CFG, "slant_ownerId", None)
+    if owner_id:
+        payload["ownerId"] = str(owner_id)
 
     print("🧪 Slant create file request", json.dumps({
         "endpoint": CFG.slant_files_endpoint,
-        "payload_keys": list(payload.keys()),
-        "url_field": CFG.slant_file_url_field,
-        "stl_url": stl_url
+        "payload": payload,                 # print actual payload now (helps a ton)
     }, ensure_ascii=False))
 
     r = HTTP.post(
@@ -409,16 +414,31 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
         raise SlantError(r.status_code, r.text, "Slant POST /files", headers=dict(r.headers))
 
     resp = _safe_json(r)
-    file_id = parse_slant_file_public_id(resp)
+
+    # Slant responses typically include publicFileServiceId at the top level
+    file_id = (
+        (resp or {}).get("publicFileServiceId")
+        or (resp or {}).get("id")
+        or (resp or {}).get("data", {}).get("publicFileServiceId")
+        or (resp or {}).get("data", {}).get("id")
+    )
+
+    if not file_id:
+        # If Slant changed response shape, make the failure obvious
+        raise RuntimeError(f"Slant POST /files succeeded but no file id found. resp={resp}")
+
     print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={file_id}")
     return file_id
+
 
 def slant_upload_stl(job_id: str) -> str:
     p = stl_path_for(job_id)
     if not os.path.exists(p):
         raise RuntimeError(f"STL not found on server: {p}")
+
     route = "stl-raw" if CFG.slant_stl_route == "raw" else "stl-full"
     stl_url = f"{CFG.public_base_url}/{route}/{job_id}.stl"
+
     return slant_create_file_by_url(job_id, stl_url)
 
 # --- Filaments cache ---
