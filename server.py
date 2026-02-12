@@ -318,18 +318,16 @@ class SlantError(RuntimeError):
 
 def slant_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     h: Dict[str, str] = {"Accept": "application/json"}
-    if CFG.slant_api_key:
-        if CFG.slant_send_bearer:
-            h["Authorization"] = f"Bearer {CFG.slant_api_key}"
-        h["api-key"] = CFG.slant_api_key
 
-    pid = (CFG.slant_platform_id or "").strip()
-    if pid:
-        h["X-Platform-Id"] = pid
+    api_key = (CFG.slant_api_key or "").strip()
+    if api_key:
+        # Slant docs show Bearer auth
+        h["Authorization"] = f"Bearer {api_key}"
 
     if extra:
         h.update(extra)
     return h
+
 
 def slant_timeout() -> Tuple[int, int]:
     return (10, CFG.slant_timeout_sec)
