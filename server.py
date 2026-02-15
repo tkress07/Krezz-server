@@ -817,6 +817,41 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
     raise last_err or RuntimeError("Slant draft failed for unknown reason.")
 
 
+def slant_process_order(public_order_id: str) -> dict:
+    """
+    Submit/process a drafted Slant order.
+
+    Slant docs mention:
+      POST /orders/:publicOrderId/process
+    Some accounts may accept:
+      POST /orders/:publicOrderId
+    We try /process first, then fallback if 404.
+    """
+    url1 = f"{CFG.slant_orders_endpoint}/{public_order_id}/process"
+    url2 = f"{CFG.slant_orders_endpoint}/{public_order_id}"
+
+    r = HTTP.post(url1, headers=slant_headers(), timeout=slant_timeout())
+    if r.status_code == 404:
+        r = HTTP.post(url2, headers=slant_headers(), timeout=slant_timeout())
+
+    print(
+        "🧪 SLANT_HTTP",
+        json.dumps(
+            {
+                "where": "POST /orders process",
+                "status": r.status_code,
+                "body_snippet": (r.text or "")[:1400],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    if r.status_code >= 400:
+        raise SlantError(r.status_code, r.text, "Slant process_order", headers=dict(r.headers))
+
+    return _safe_json(r) if (r.text or "").strip() else {"success": True}
+
+
 # ----------------------------
 # Slant submission (async)
 # ----------------------------
