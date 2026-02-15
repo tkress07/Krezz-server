@@ -699,7 +699,7 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
     filament_id = resolve_filament_id(shipping)
 
     slant_items = []
-    for it in items:
+    for it in items or []:
         pfsid = it.get("publicFileServiceId")
         if not pfsid:
             continue
@@ -710,7 +710,8 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
                 "filamentId": filament_id,
                 "quantity": int(it.get("quantity", 1)),
                 "name": it.get("name", "Krezz Mold"),
-                "SKU": it.get("SKU") or it.get("sku") or it.get("job_id", ""),
+                # Slant examples tend to use lowercase "sku", but we’ll accept either on input.
+                "sku": it.get("SKU") or it.get("sku") or it.get("job_id", ""),
             }
         )
 
@@ -732,7 +733,7 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
         }
     }
 
-    # ✅ Everett question: try platformId at root first, then inside customer
+    # ✅ Everett: platformId can be required under customer on some accounts.
     payload_root = {
         "platformId": pid,
         "customer": customer_details,
@@ -747,6 +748,8 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
     }
 
     last_err: Optional[Exception] = None
+
+    # Try root first, then customer (your logs show customer is the one that works)
     for label, payload in (("root_platformId", payload_root), ("customer_platformId", payload_customer)):
         r = HTTP.post(
             CFG.slant_orders_endpoint,
@@ -754,6 +757,7 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
             json=payload,
             timeout=slant_timeout(),
         )
+
         print(
             "🧪 SLANT_HTTP",
             json.dumps(
@@ -766,46 +770,51 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
             ),
         )
 
-        if r.status_code < 400:
-            resp = _safe_json(r)
-            data_obj = resp.get("data") if isinstance(resp, dict) else None
-            public_order_id = None
+        if r.status_code >= 400:
+            last_err = SlantError(
+                r.status_code,
+                r.text,
+                f"Slant POST /orders (draft) [{label}]",
+                headers=dict(r.headers),
+            )
+            continue
+
+        resp = _safe_json(r)
+
+        # ✅ FIX: Slant often returns publicId inside data.order.publicId (your log shows this)
+        public_order_id = None
+        if isinstance(resp, dict):
+            data_obj = resp.get("data")
             if isinstance(data_obj, dict):
-                public_order_id = data_obj.get("publicId") or data_obj.get("publicOrderId") or data_obj.get("id")
-            if not public_order_id and isinstance(resp, dict):
-                public_order_id = resp.get("publicId") or resp.get("publicOrderId") or resp.get("id")
+                order_obj = data_obj.get("order")
+                if isinstance(order_obj, dict):
+                    public_order_id = (
+                        order_obj.get("publicId")
+                        or order_obj.get("publicOrderId")
+                        or order_obj.get("id")
+                    )
+
+                if not public_order_id:
+                    public_order_id = (
+                        data_obj.get("publicId")
+                        or data_obj.get("publicOrderId")
+                        or data_obj.get("id")
+                    )
 
             if not public_order_id:
-                raise RuntimeError(f"Draft succeeded but no public order id returned: {str(resp)[:1600]}")
+                public_order_id = (
+                    resp.get("publicId")
+                    or resp.get("publicOrderId")
+                    or resp.get("id")
+                )
 
-            print(f"✅ Slant order drafted: publicOrderId={public_order_id} via {label}")
-            return str(public_order_id)
+        if not public_order_id:
+            raise RuntimeError(f"Draft succeeded but no public order id returned: {str(resp)[:1600]}")
 
-        last_err = SlantError(r.status_code, r.text, f"Slant POST /orders (draft) [{label}]", headers=dict(r.headers))
+        print(f"✅ Slant order drafted: publicOrderId={public_order_id} via {label}")
+        return str(public_order_id)
 
     raise last_err or RuntimeError("Slant draft failed for unknown reason.")
-
-
-def slant_process_order(public_order_id: str) -> dict:
-    url1 = f"{CFG.slant_orders_endpoint}/{public_order_id}/process"
-    url2 = f"{CFG.slant_orders_endpoint}/{public_order_id}"
-
-    r = HTTP.post(url1, headers=slant_headers(), timeout=slant_timeout())
-    if r.status_code == 404:
-        r = HTTP.post(url2, headers=slant_headers(), timeout=slant_timeout())
-
-    print(
-        "🧪 SLANT_HTTP",
-        json.dumps(
-            {"where": "POST /orders process", "status": r.status_code, "body_snippet": (r.text or "")[:1400]},
-            ensure_ascii=False,
-        ),
-    )
-
-    if r.status_code >= 400:
-        raise SlantError(r.status_code, r.text, "Slant process_order", headers=dict(r.headers))
-
-    return _safe_json(r) if (r.text or "").strip() else {"success": True}
 
 
 # ----------------------------
