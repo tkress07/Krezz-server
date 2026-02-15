@@ -781,7 +781,7 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
 
         resp = _safe_json(r)
 
-        # ✅ FIX: Slant often returns publicId inside data.order.publicId (your log shows this)
+        # ✅ Slant often returns publicId inside data.order.publicId
         public_order_id = None
         if isinstance(resp, dict):
             data_obj = resp.get("data")
@@ -817,15 +817,17 @@ def slant_draft_order(order_id: str, shipping: dict, items: list) -> str:
     raise last_err or RuntimeError("Slant draft failed for unknown reason.")
 
 
+# ----------------------------
+# ✅ Slant process/submit drafted order
+# ----------------------------
 def slant_process_order(public_order_id: str) -> dict:
     """
     Submit/process a drafted Slant order.
 
-    Slant docs mention:
+    Primary:
       POST /orders/:publicOrderId/process
-    Some accounts may accept:
+    Fallback (some setups/docs):
       POST /orders/:publicOrderId
-    We try /process first, then fallback if 404.
     """
     url1 = f"{CFG.slant_orders_endpoint}/{public_order_id}/process"
     url2 = f"{CFG.slant_orders_endpoint}/{public_order_id}"
