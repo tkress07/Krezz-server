@@ -1412,6 +1412,7 @@ def verify_slant_webhook_signature(raw_body: bytes) -> Tuple[bool, str]:
     return True, "ok"
 
 
+@app.route("/slant/webhook", methods=["POST"])
 @app.route("/slant-webhook", methods=["POST"])
 def slant_webhook():
     raw = request.get_data(cache=False) or b""
