@@ -1380,36 +1380,42 @@ def stripe_webhook():
 
 # --- Slant webhook (order.shipped) ---
 def verify_slant_webhook_signature(raw_body: bytes) -> Tuple[bool, str]:
-    secret = (CFG.slant_webhook_secret or "").strip()
+    secret = (getattr(CFG, "slant_webhook_secret", "") or "").strip()
     if not secret:
         return False, "SLANT_WEBHOOK_SECRET not set"
 
     timestamp = (request.headers.get("X-Webhook-Timestamp") or "").strip()
-    signature = (request.headers.get("X-Webhook-Signature-256") or "").strip()
-    if not timestamp or not signature:
-        return False, "Missing X-Webhook-Timestamp or X-Webhook-Signature-256"
+    sig_header = (request.headers.get("X-Webhook-Signature-256") or "").strip()
 
-    expected = signature.replace("sha256=", "").strip()
+    if not timestamp or not sig_header:
+        return False, "Missing X-Webhook-Timestamp or X-Webhook-Signature-256"
 
     try:
         ts = int(timestamp)
     except Exception:
         return False, "Bad timestamp"
 
-    # Slant docs show ms timestamps; allow seconds too
+    # allow ms or seconds
     ts_ms = ts * 1000 if ts < 10_000_000_000 else ts
     now_ms = int(time.time() * 1000)
     age_ms = now_ms - ts_ms
-    if age_ms < 0 or age_ms > 5 * 60 * 1000:
+
+    # ✅ allow small clock skew (up to 30s in the future)
+    if age_ms < -30_000 or age_ms > 5 * 60 * 1000:
         return False, "Timestamp too old"
 
     signed_payload = timestamp.encode("utf-8") + b"." + (raw_body or b"")
     computed = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
 
-    if not hmac.compare_digest(computed, expected):
-        return False, "Bad signature"
+    # ✅ support "sha256=..." and also multiple values separated by commas
+    candidates = [s.strip() for s in sig_header.split(",") if s.strip()]
+    for cand in candidates:
+        expected = cand.replace("sha256=", "").strip()
+        if hmac.compare_digest(computed, expected):
+            return True, "ok"
 
-    return True, "ok"
+    return False, "Bad signature"
+
 
 
 @app.route("/slant/webhook", methods=["POST"])
