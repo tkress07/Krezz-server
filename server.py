@@ -1216,6 +1216,7 @@ def debug_stl_info(job_id: str):
 
 
 # --- checkout session ---
+# --- checkout session ---
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
     try:
@@ -1228,6 +1229,11 @@ def create_checkout_session():
             return jsonify({"error": "No items provided"}), 400
 
         order_id = (data.get("order_id") or "").strip() or str(uuid.uuid4())
+
+        # ✅ Pull email from shippingInfo (this is what Stripe needs for receipts)
+        email = (shipping_info.get("email") or "").strip() or None
+        if email:
+            shipping_info["email"] = email  # keep it stored too
 
         normalized_items = []
         for it in items:
@@ -1285,17 +1291,25 @@ def create_checkout_session():
 
         idem_key = f"checkout_{order_id}"
 
-        session = stripe.checkout.Session.create(
+        session_kwargs = dict(
             payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
             success_url=build_success_url(order_id),
             cancel_url=build_cancel_url(order_id),
             metadata={"order_id": order_id},
+            client_reference_id=order_id,  # optional but helpful
             idempotency_key=idem_key,
         )
 
-        print(f"✅ Created checkout session: {session.id} order_id={order_id}")
+        # ✅ This is the key change for receipts:
+        if email:
+            session_kwargs["customer_email"] = email
+            session_kwargs["payment_intent_data"] = {"receipt_email": email}
+
+        session = stripe.checkout.Session.create(**session_kwargs)
+
+        print(f"✅ Created checkout session: {session.id} order_id={order_id} email={email or 'none'}")
         return jsonify({"url": session.url, "order_id": order_id})
 
     except Exception as e:
@@ -1335,7 +1349,15 @@ def stripe_webhook():
             order_obj["stripe_event_ids"] = (seen + [event_id])[-20:]
 
             cd = session.get("customer_details") or {}
-            email = session.get("customer_email") or cd.get("email") or "unknown"
+            email = (cd.get("email") or session.get("customer_email") or "").strip()
+
+            if not email:
+                ship = order_obj.get("shipping") or {}
+                email = (ship.get("email") or "").strip()
+
+            if not email:
+                email = "unknown"
+
 
             order_obj["status"] = "paid"
             order_obj["payment"] = {
