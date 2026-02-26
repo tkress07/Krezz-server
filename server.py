@@ -245,6 +245,10 @@ class Config:
         print("   SLANT_API_KEY:", mask_secret(cfg.slant_api_key))
         print("   SLANT_PLATFORM_ID:", mask_secret(cfg.slant_platform_id))
         print("   SLANT_WEBHOOK_SECRET:", mask_secret(cfg.slant_webhook_secret))
+        print("   SLANT_DAILY_ORDER_CAP:", cfg.daily_order_cap)
+        print("   DAILY_QUOTA_PATH:", cfg.quota_data_path)
+        print("   DAILY_QUOTA_TZ:", cfg.quota_tz)
+
         return cfg
 
 
@@ -1454,12 +1458,14 @@ def success():
 @app.route("/cancel", methods=["GET"])
 def cancel():
     order_id = (request.args.get("order_id") or "").strip()
-        # ✅ Release quota reservation if user cancels
+
+    # ✅ Release quota reservation if user cancels
     if order_id:
         try:
-            QUOTA.release_reservation(order_id)
-        except Exception:
-            pass
+            released = QUOTA.release_reservation(order_id)
+            print(f"🧮 QUOTA release (cancel): order_id={order_id} released={released}")
+        except Exception as e:
+            print(f"🧯 QUOTA release (cancel) error: {e}")
 
     esc_order = html.escape(order_id)
     page = f"""
@@ -1473,6 +1479,7 @@ def cancel():
 </body></html>
 """
     return make_response(page, 200)
+
 
 
 # --- uploads + STL serving ---
@@ -1634,9 +1641,12 @@ def create_checkout_session():
                     ),
                     409,
                 )
-                        # ✅ NEW: Daily order cap (reserve a slot BEFORE creating Stripe checkout session)
+                # ✅ NEW: Daily order cap (reserve a slot BEFORE creating Stripe checkout session)
         q_ok, q_info = QUOTA.reserve(order_id)
+        print(f"🧮 QUOTA reserve: order_id={order_id} ok={q_ok} info={q_info}")
+
         if not q_ok:
+            print(f"🚫 DAILY CAP HIT: order_id={order_id} info={q_info}")
             return (
                 jsonify(
                     {
@@ -1647,6 +1657,10 @@ def create_checkout_session():
                 ),
                 429,
             )
+
+        quota_day = (q_info.get("day") or "").strip() or QUOTA.day_key()
+        reservation_created = bool(q_info.get("created", False))
+
 
         quota_day = (q_info.get("day") or "").strip() or QUOTA.day_key()
         reservation_created = bool(q_info.get("created", False))
@@ -1706,8 +1720,10 @@ def create_checkout_session():
                 expires_at = getattr(session, "expires_at", None)
 
             QUOTA.attach_session(order_id, session.get("id") or "", expires_at, day=quota_day)
-        except Exception:
-            pass
+            print(f"🧮 QUOTA attach_session: order_id={order_id} session={session.get('id')} expires_at={expires_at}")
+        except Exception as e:
+            print(f"🧯 QUOTA attach_session error: {e}")
+
 
 
         print(f"✅ Created checkout session: {session.id} order_id={order_id} email={email or 'none'}")
