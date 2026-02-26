@@ -11,7 +11,12 @@ import traceback
 import hmac
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # fallback to UTC day boundaries
 from typing import Any, Dict, List, Optional, Tuple
 
 import fcntl
@@ -111,6 +116,14 @@ class Config:
     require_stl_before_checkout: bool
     auto_submit_on_upload_if_paid: bool
 
+    # ✅ NEW: Daily order cap + quota storage
+    daily_order_cap: int
+    quota_data_path: str
+    quota_tz: str
+    quota_reservation_ttl_sec: int
+    quota_prune_days: int
+
+
     @staticmethod
     def load() -> "Config":
         stripe_secret_key = env_str("STRIPE_SECRET_KEY")
@@ -127,6 +140,17 @@ class Config:
 
         order_data_path = env_str("ORDER_DATA_PATH", "/data/order_data.json")
         os.makedirs(os.path.dirname(order_data_path), exist_ok=True)
+
+        # ✅ NEW: Daily quota config (cap orders/day)
+        daily_order_cap = safe_int(env_str("SLANT_DAILY_ORDER_CAP", "100"), 100)
+
+        quota_data_path = env_str("DAILY_QUOTA_PATH", "/data/daily_quota.json")
+        os.makedirs(os.path.dirname(quota_data_path), exist_ok=True)
+
+        quota_tz = env_str("DAILY_QUOTA_TZ", "America/New_York")
+        quota_reservation_ttl_sec = safe_int(env_str("DAILY_QUOTA_RESERVE_TTL_SEC", "86400"), 86400)  # 24h
+        quota_prune_days = safe_int(env_str("DAILY_QUOTA_PRUNE_DAYS", "14"), 14)
+
 
         success_tmpl = env_str(
             "STRIPE_SUCCESS_URL",
@@ -191,6 +215,12 @@ class Config:
             slant_webhook_secret=slant_webhook_secret,
             require_stl_before_checkout=require_stl_before_checkout,
             auto_submit_on_upload_if_paid=auto_submit_on_upload_if_paid,
+            daily_order_cap=daily_order_cap,
+            quota_data_path=quota_data_path,
+            quota_tz=quota_tz,
+            quota_reservation_ttl_sec=quota_reservation_ttl_sec,
+            quota_prune_days=quota_prune_days,
+
         )
 
         print("✅ Boot config:")
@@ -351,8 +381,339 @@ class OrderStore:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
             lf.close()
 
+class DailyQuotaStore:
+    """
+    Tracks a per-day cap using a JSON file + fcntl lock (safe across gunicorn workers).
+
+    Data format:
+    {
+      "YYYY-MM-DD": {
+        "cap": 100,
+        "paid_orders": { "order_id": {"paid_at": "...", "stripe_session_id": "..."} },
+        "reservations": { "order_id": {"reserved_at": "...", "expires_at": 1234567890, "stripe_session_id": "..."} }
+      },
+      ...
+    }
+    """
+
+    def __init__(self, path: str, daily_cap: int, tz_name: str, reservation_ttl_sec: int, prune_days: int):
+        self.path = path
+        self.lock_path = path + ".lock"
+        self.daily_cap = int(daily_cap or 0) if daily_cap else 0
+        self.tz_name = (tz_name or "").strip() or "UTC"
+        self.reservation_ttl_sec = int(reservation_ttl_sec or 86400)
+        self.prune_days = int(prune_days or 14)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def _lock(self):
+        lf = open(self.lock_path, "w")
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        return lf
+
+    def _read_unlocked(self) -> Dict[str, Any]:
+        if not os.path.exists(self.path):
+            return {}
+        with open(self.path, "r") as f:
+            raw = f.read().strip()
+            return json.loads(raw) if raw else {}
+
+    def _write_unlocked(self, data: Dict[str, Any]) -> None:
+        dirpath = os.path.dirname(self.path)
+        os.makedirs(dirpath, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="quota_", suffix=".json", dir=dirpath)
+        try:
+            with os.fdopen(fd, "w") as tmp:
+                json.dump(data, tmp)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_path, self.path)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    def _now_local(self) -> datetime:
+        if ZoneInfo is None:
+            return datetime.utcnow()
+        try:
+            return datetime.now(ZoneInfo(self.tz_name))
+        except Exception:
+            return datetime.utcnow()
+
+    def day_key(self) -> str:
+        # Local day key (defaults to UTC if ZoneInfo missing/bad tz)
+        return self._now_local().strftime("%Y-%m-%d")
+
+    def next_reset_iso(self) -> str:
+        now = self._now_local()
+        # next local midnight
+        nxt = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+        # Return ISO-ish string; if UTC fallback, it's UTC midnight
+        return nxt.isoformat()
+
+    def _ensure_day_obj(self, data: Dict[str, Any], day: str) -> Dict[str, Any]:
+        obj = data.get(day)
+        if not isinstance(obj, dict):
+            obj = {}
+        obj.setdefault("cap", int(self.daily_cap))
+        obj.setdefault("paid_orders", {})
+        obj.setdefault("reservations", {})
+        # always keep current cap value
+        obj["cap"] = int(self.daily_cap)
+        data[day] = obj
+        return obj
+
+    def _cleanup_unlocked(self, data: Dict[str, Any], today_key: str) -> None:
+        # prune old day buckets
+        try:
+            today = datetime.strptime(today_key, "%Y-%m-%d").date()
+        except Exception:
+            return
+
+        keep_after = today - timedelta(days=max(self.prune_days, 1))
+        for day in list(data.keys()):
+            try:
+                d = datetime.strptime(day, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if d < keep_after:
+                data.pop(day, None)
+
+        # expire reservations (all days we kept)
+        now_epoch = int(time.time())
+        for day, obj in list(data.items()):
+            if not isinstance(obj, dict):
+                continue
+            reservations = obj.get("reservations")
+            if not isinstance(reservations, dict):
+                continue
+            for oid, r in list(reservations.items()):
+                exp = None
+                if isinstance(r, dict):
+                    exp = r.get("expires_at")
+                try:
+                    exp_i = int(exp) if exp is not None else None
+                except Exception:
+                    exp_i = None
+                if exp_i is not None and exp_i <= now_epoch:
+                    reservations.pop(oid, None)
+            obj["reservations"] = reservations
+
+    def stats(self, day: Optional[str] = None) -> Dict[str, Any]:
+        day = (day or "").strip() or self.day_key()
+        lf = self._lock()
+        try:
+            data = self._read_unlocked() or {}
+            self._cleanup_unlocked(data, day)
+            obj = self._ensure_day_obj(data, day)
+            paid = obj.get("paid_orders") if isinstance(obj.get("paid_orders"), dict) else {}
+            resv = obj.get("reservations") if isinstance(obj.get("reservations"), dict) else {}
+            return {
+                "day": day,
+                "cap": int(obj.get("cap") or self.daily_cap),
+                "paid_count": len(paid),
+                "reserved_count": len(resv),
+                "remaining_effective": max(0, int(obj.get("cap") or self.daily_cap) - (len(paid) + len(resv))),
+                "next_reset": self.next_reset_iso(),
+            }
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+
+    def reserve(self, order_id: str, day: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Reserve a slot for this order_id (idempotent).
+        Returns (ok, info) where info includes 'created' flag.
+        """
+        order_id = (order_id or "").strip()
+        if not order_id:
+            return False, {"error": "missing_order_id"}
+
+        day = (day or "").strip() or self.day_key()
+        lf = self._lock()
+        try:
+            data = self._read_unlocked() or {}
+            self._cleanup_unlocked(data, day)
+            obj = self._ensure_day_obj(data, day)
+
+            cap = int(obj.get("cap") or self.daily_cap)
+            paid = obj.get("paid_orders")
+            resv = obj.get("reservations")
+            if not isinstance(paid, dict):
+                paid = {}
+            if not isinstance(resv, dict):
+                resv = {}
+
+            # already paid => ok
+            if order_id in paid:
+                return True, {"day": day, "cap": cap, "created": False, "status": "already_paid"}
+
+            # already reserved => ok
+            if order_id in resv:
+                return True, {"day": day, "cap": cap, "created": False, "status": "already_reserved"}
+
+            if cap > 0 and (len(paid) + len(resv)) >= cap:
+                return False, {
+                    "day": day,
+                    "cap": cap,
+                    "paid_count": len(paid),
+                    "reserved_count": len(resv),
+                    "next_reset": self.next_reset_iso(),
+                    "status": "cap_reached",
+                }
+
+            exp = int(time.time()) + int(self.reservation_ttl_sec or 86400)
+            resv[order_id] = {"reserved_at": utc_iso(), "expires_at": exp}
+            obj["reservations"] = resv
+            obj["paid_orders"] = paid
+            data[day] = obj
+            self._write_unlocked(data)
+            return True, {"day": day, "cap": cap, "created": True, "status": "reserved", "expires_at": exp}
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+
+    def attach_session(self, order_id: str, session_id: str, expires_at: Optional[int] = None, day: Optional[str] = None) -> None:
+        """
+        Add Stripe session info to a reservation (best-effort).
+        """
+        order_id = (order_id or "").strip()
+        if not order_id:
+            return
+        day = (day or "").strip() or self.day_key()
+
+        lf = self._lock()
+        try:
+            data = self._read_unlocked() or {}
+            self._cleanup_unlocked(data, day)
+            obj = self._ensure_day_obj(data, day)
+            resv = obj.get("reservations")
+            if not isinstance(resv, dict):
+                resv = {}
+
+            r = resv.get(order_id)
+            if not isinstance(r, dict):
+                return
+
+            if session_id:
+                r["stripe_session_id"] = session_id
+            if expires_at is not None:
+                try:
+                    r["expires_at"] = int(expires_at)
+                except Exception:
+                    pass
+
+            resv[order_id] = r
+            obj["reservations"] = resv
+            data[day] = obj
+            self._write_unlocked(data)
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+
+    def release_reservation(self, order_id: str) -> bool:
+        """
+        Remove a reservation for this order_id (searches all kept days).
+        """
+        order_id = (order_id or "").strip()
+        if not order_id:
+            return False
+
+        lf = self._lock()
+        try:
+            data = self._read_unlocked() or {}
+            changed = False
+            for day, obj in list(data.items()):
+                if not isinstance(obj, dict):
+                    continue
+                resv = obj.get("reservations")
+                if not isinstance(resv, dict):
+                    continue
+                if order_id in resv:
+                    resv.pop(order_id, None)
+                    obj["reservations"] = resv
+                    data[day] = obj
+                    changed = True
+            if changed:
+                self._write_unlocked(data)
+            return changed
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+
+    def mark_paid(self, order_id: str, session_id: str = "", day: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Mark an order as paid for the day bucket (idempotent).
+        Removes any reservation.
+        """
+        order_id = (order_id or "").strip()
+        if not order_id:
+            return False, {"error": "missing_order_id"}
+
+        day = (day or "").strip() or self.day_key()
+        lf = self._lock()
+        try:
+            data = self._read_unlocked() or {}
+            self._cleanup_unlocked(data, day)
+            obj = self._ensure_day_obj(data, day)
+
+            cap = int(obj.get("cap") or self.daily_cap)
+            paid = obj.get("paid_orders")
+            resv = obj.get("reservations")
+            if not isinstance(paid, dict):
+                paid = {}
+            if not isinstance(resv, dict):
+                resv = {}
+
+            if order_id in paid:
+                return True, {"day": day, "cap": cap, "status": "already_paid"}
+
+            # hard cap: paid count cannot exceed cap
+            if cap > 0 and len(paid) >= cap:
+                return False, {
+                    "day": day,
+                    "cap": cap,
+                    "paid_count": len(paid),
+                    "reserved_count": len(resv),
+                    "next_reset": self.next_reset_iso(),
+                    "status": "paid_cap_reached",
+                }
+
+            # remove reservation if exists
+            if order_id in resv:
+                resv.pop(order_id, None)
+
+            paid[order_id] = {"paid_at": utc_iso(), "stripe_session_id": (session_id or "").strip()}
+            obj["paid_orders"] = paid
+            obj["reservations"] = resv
+            data[day] = obj
+            self._write_unlocked(data)
+
+            return True, {
+                "day": day,
+                "cap": cap,
+                "paid_count": len(paid),
+                "reserved_count": len(resv),
+                "status": "paid_recorded",
+            }
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+
+
 
 STORE = OrderStore(CFG.order_data_path)
+
+QUOTA = DailyQuotaStore(
+    path=CFG.quota_data_path,
+    daily_cap=CFG.daily_order_cap,
+    tz_name=CFG.quota_tz,
+    reservation_ttl_sec=CFG.quota_reservation_ttl_sec,
+    prune_days=CFG.quota_prune_days,
+)
+
 
 # ----------------------------
 # Slant client
@@ -1093,6 +1454,13 @@ def success():
 @app.route("/cancel", methods=["GET"])
 def cancel():
     order_id = (request.args.get("order_id") or "").strip()
+        # ✅ Release quota reservation if user cancels
+    if order_id:
+        try:
+            QUOTA.release_reservation(order_id)
+        except Exception:
+            pass
+
     esc_order = html.escape(order_id)
     page = f"""
 <!doctype html>
@@ -1266,6 +1634,23 @@ def create_checkout_session():
                     ),
                     409,
                 )
+                        # ✅ NEW: Daily order cap (reserve a slot BEFORE creating Stripe checkout session)
+        q_ok, q_info = QUOTA.reserve(order_id)
+        if not q_ok:
+            return (
+                jsonify(
+                    {
+                        "error": "Daily order limit reached. Please try again after the reset.",
+                        "code": "DAILY_ORDER_LIMIT",
+                        "quota": q_info,
+                    }
+                ),
+                429,
+            )
+
+        quota_day = (q_info.get("day") or "").strip() or QUOTA.day_key()
+        reservation_created = bool(q_info.get("created", False))
+
 
         STORE.upsert(
             order_id,
@@ -1274,8 +1659,11 @@ def create_checkout_session():
                 "shipping": shipping_info,
                 "status": "created",
                 "created_at": utc_iso(),
+                "quota_day": quota_day,
+                "quota_reserved_at": utc_iso(),
             },
         )
+
 
         line_items = [
             {
@@ -1309,12 +1697,33 @@ def create_checkout_session():
 
         session = stripe.checkout.Session.create(**session_kwargs)
 
+                # ✅ Attach Stripe session details to reservation (so it expires at Stripe's expiry)
+        try:
+            expires_at = None
+            try:
+                expires_at = session.get("expires_at")
+            except Exception:
+                expires_at = getattr(session, "expires_at", None)
+
+            QUOTA.attach_session(order_id, session.get("id") or "", expires_at, day=quota_day)
+        except Exception:
+            pass
+
+
         print(f"✅ Created checkout session: {session.id} order_id={order_id} email={email or 'none'}")
         return jsonify({"url": session.url, "order_id": order_id})
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"❌ Error in checkout session: {e}\n{tb}")
+
+        # ✅ If we reserved a quota slot in this request, release it on failure
+        try:
+            if "reservation_created" in locals() and reservation_created and "order_id" in locals():
+                QUOTA.release_reservation(order_id)
+        except Exception:
+            pass
+
         return jsonify({"error": str(e)}), 500
 
 
@@ -1358,7 +1767,6 @@ def stripe_webhook():
             if not email:
                 email = "unknown"
 
-
             order_obj["status"] = "paid"
             order_obj["payment"] = {
                 "stripe_session_id": session.get("id"),
@@ -1378,8 +1786,19 @@ def stripe_webhook():
 
             return order_obj, True
 
-        STORE.update(order_id, _apply_payment)
+        updated_order, changed = STORE.update(order_id, _apply_payment)
         print(f"✅ Payment confirmed for order_id: {order_id}")
+
+        # ✅ NEW: mark paid against daily quota (idempotent)
+        if changed:
+            q_day = (updated_order.get("quota_day") or "").strip() or QUOTA.day_key()
+            q_ok, q_info = QUOTA.mark_paid(order_id, session_id=(session.get("id") or ""), day=q_day)
+            if not q_ok:
+                # Safety catch (should be rare if you reserve before checkout)
+                print(f"🟠 Paid but daily cap reached; holding fulfillment. info={q_info}")
+                _set_order_status(order_id, "paid_cap_hold", {"quota": q_info})
+                _set_slant_step(order_id, "cap_hold", {"quota": q_info})
+                return jsonify(success=True)
 
         if CFG.slant_enabled and CFG.slant_auto_submit:
             if CFG.slant_require_live_stripe and not bool(session.get("livemode", livemode)):
@@ -1397,7 +1816,28 @@ def stripe_webhook():
         else:
             print(f"🟡 SLANT_AUTO_SUBMIT={int(CFG.slant_auto_submit)} skipping Slant submission.")
 
+    elif event_type == "checkout.session.expired":
+        session = event["data"]["object"]
+        order_id = (session.get("metadata") or {}).get("order_id")
+
+        if order_id:
+            # ✅ NEW: release quota reservation so it doesn't eat a daily slot forever
+            try:
+                QUOTA.release_reservation(order_id)
+            except Exception:
+                pass
+
+            def _mark_expired(order_obj: Dict[str, Any]):
+                order_obj["status"] = "checkout_expired"
+                order_obj["status_at"] = utc_iso()
+                return order_obj, True
+
+            STORE.update(order_id, _mark_expired)
+
+        return jsonify(success=True)
+
     return jsonify(success=True)
+
 
 
 # --- Slant webhook (order.shipped) ---
@@ -1437,7 +1877,6 @@ def verify_slant_webhook_signature(raw_body: bytes) -> Tuple[bool, str]:
             return True, "ok"
 
     return False, "Bad signature"
-
 
 
 @app.route("/slant/webhook", methods=["POST"])
