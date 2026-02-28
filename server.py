@@ -718,6 +718,80 @@ QUOTA = DailyQuotaStore(
     prune_days=CFG.quota_prune_days,
 )
 
+def stl_make_single_solid_inplace(path: str) -> Dict[str, Any]:
+    import os
+    import json
+    import traceback
+    import trimesh
+
+    info: Dict[str, Any] = {"path": path, "changed": False}
+
+    if not os.path.exists(path):
+        info["error"] = "missing_file"
+        return info
+
+    try:
+        loaded = trimesh.load(path, force="mesh", process=False)
+
+        if isinstance(loaded, trimesh.Scene):
+            meshes = [g for g in loaded.dump() if isinstance(g, trimesh.Trimesh)]
+            if not meshes:
+                info["error"] = "scene_has_no_meshes"
+                return info
+            mesh = trimesh.util.concatenate(meshes)
+        else:
+            mesh = loaded
+
+        mesh.process(validate=True)
+
+        comps = mesh.split(only_watertight=False)
+        info["components_before"] = len(comps)
+        info["faces_before_total"] = int(mesh.faces.shape[0])
+
+        if len(comps) <= 1:
+            info["note"] = "already_single_component"
+            return info
+
+        welded = trimesh.boolean.union(comps, engine="manifold", check_volume=False)
+
+        if welded is None:
+            info["error"] = "union_returned_none"
+            return info
+
+        welded.process(validate=True)
+        comps_after = welded.split(only_watertight=False)
+
+        info["components_after"] = len(comps_after)
+        info["faces_after_total"] = int(welded.faces.shape[0])
+
+        backup = path + ".preweld"
+        if not os.path.exists(backup):
+            try:
+                os.replace(path, backup)
+            except Exception:
+                with open(path, "rb") as fsrc, open(backup, "wb") as fdst:
+                    fdst.write(fsrc.read())
+
+        out_bytes = welded.export(file_type="stl")
+
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            if isinstance(out_bytes, (bytes, bytearray)):
+                f.write(out_bytes)
+            else:
+                f.write(str(out_bytes).encode("utf-8"))
+        os.replace(tmp, path)
+
+        info["changed"] = True
+        info["backup"] = backup
+        return info
+
+    except Exception as e:
+        info["error"] = str(e)
+        info["trace"] = traceback.format_exc()[:6000]
+        return info
+
+
 
 # ----------------------------
 # Slant client
@@ -969,9 +1043,40 @@ def slant_upload_stl(job_id: str) -> str:
     if not os.path.exists(p):
         raise RuntimeError(f"STL not found on server: {p}")
 
+    # ✅ Add this block
+    if env_bool("STL_BOOL_WELD_BEFORE_SLANT", True):
+        weld_info = stl_make_single_solid_inplace(p)
+        print("🧩 STL WELD INFO:", json.dumps(weld_info, ensure_ascii=False, default=str)[:4000])
+
     route = "stl-full" if CFG.slant_stl_route == "full" else "stl-raw"
     stl_url = f"{CFG.public_base_url}/{route}/{job_id}.stl"
     return slant_create_file_by_url(job_id, stl_url)
+
+@app.route("/debug/stl/components/<job_id>", methods=["GET"])
+def debug_stl_components(job_id: str):
+    import trimesh
+    p = stl_path_for(job_id)
+    if not os.path.exists(p):
+        return jsonify({"ok": False, "error": "not found", "path": p}), 404
+
+    m = trimesh.load(p, force="mesh", process=False)
+    if isinstance(m, trimesh.Scene):
+        meshes = [g for g in m.dump() if isinstance(g, trimesh.Trimesh)]
+        m = trimesh.util.concatenate(meshes) if meshes else None
+    if m is None:
+        return jsonify({"ok": False, "error": "no mesh found"}), 500
+
+    m.process(validate=True)
+    comps = m.split(only_watertight=False)
+    return jsonify(
+        {
+            "ok": True,
+            "job_id": job_id,
+            "components": len(comps),
+            "faces_total": int(m.faces.shape[0]),
+            "faces_by_component": [int(c.faces.shape[0]) for c in comps[:20]],
+        }
+    )
 
 
 # ----------------------------
