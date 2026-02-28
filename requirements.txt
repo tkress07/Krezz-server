@@ -1,7 +1,4 @@
-Flask
-gunicorn
-requests
+Flask 
+gunicorn 
+requests 
 stripe
-numpy
-trimesh==4.11.2
-manifold3d==3.4.0
