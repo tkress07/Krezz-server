@@ -978,19 +978,52 @@ def slant_upload_stl(job_id: str) -> str:
 # Filament resolution
 # ----------------------------
 def resolve_filament_id(shipping_info: dict) -> str:
+    """
+    Picks a Slant filament id (publicId / filamentId) based on shipping info.
+
+    Priority:
+      1) explicit filament id in shippingInfo
+      2) env default SLANT_DEFAULT_FILAMENT_ID
+      3) match by profile + color (flex match: "black" matches "matte black")
+      4) match by profile only
+      5) match by color only
+      6) fallback: first available
+    """
     shipping_info = shipping_info or {}
 
-    explicit = shipping_info.get("filamentId") or shipping_info.get("filament_id")
-    if explicit:
-        return str(explicit)
+    # 1) Explicit filament id wins (accept multiple key names)
+    explicit = (
+        shipping_info.get("filamentId")
+        or shipping_info.get("filament_id")
+        or shipping_info.get("filament_public_id")
+        or shipping_info.get("filamentPublicId")
+    )
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
 
+    # 2) Env default
     env_default = env_str("SLANT_DEFAULT_FILAMENT_ID", "")
     if env_default:
         return env_default
 
-    material_raw = str(shipping_info.get("material") or "").strip().upper()
-    color_raw = str(shipping_info.get("color") or "").strip().lower()
+    # 3) Read normalized fields if present (or fallback to your current keys)
+    material_val = shipping_info.get("material_profile") or shipping_info.get("material") or ""
+    color_val = shipping_info.get("color_key") or shipping_info.get("color") or ""
 
+    material_raw = str(material_val).strip().upper()
+    color_raw = str(color_val).strip().lower()
+
+    # Normalize common synonyms -> consistent matching
+    aliases = {
+        "grey": "gray",
+        "dark grey": "dark gray",
+        "light grey": "light gray",
+        "matte black": "black",   # treat as "black" for flexible matching
+        "glossy black": "black",
+    }
+    color_raw = aliases.get(color_raw, color_raw)
+
+    # Detect profile
     want_profile = ""
     if "PETG" in material_raw:
         want_profile = "PETG"
@@ -1004,17 +1037,33 @@ def resolve_filament_id(shipping_info: dict) -> str:
     def norm(s: Any) -> str:
         return str(s or "").strip().lower()
 
+    def color_matches(wanted: str, actual: str) -> bool:
+        """
+        Flexible match:
+          - "black" matches "matte black"
+          - "red" matches "bright red"
+        """
+        if not wanted:
+            return True
+        if wanted == actual:
+            return True
+        if wanted in actual:
+            return True
+        return False
+
+    # Prefer profile + color
     if want_profile and color_raw:
         for f in filaments:
             if not _filament_available(f):
                 continue
             prof = norm(_filament_profile(f))
             col = norm(_filament_color(f))
-            if want_profile.lower() in prof and color_raw == col:
+            if want_profile.lower() in prof and color_matches(color_raw, col):
                 fid = _extract_filament_id(f)
                 if fid:
                     return fid
 
+    # Profile only
     if want_profile:
         for f in filaments:
             if not _filament_available(f):
@@ -1025,27 +1074,18 @@ def resolve_filament_id(shipping_info: dict) -> str:
                 if fid:
                     return fid
 
+    # Color only
     if color_raw:
         for f in filaments:
             if not _filament_available(f):
                 continue
             col = norm(_filament_color(f))
-            if color_raw == col:
+            if color_matches(color_raw, col):
                 fid = _extract_filament_id(f)
                 if fid:
                     return fid
 
-    wanted_tokens = ("pla", "black")
-    for f in filaments:
-        if not _filament_available(f):
-            continue
-        name = norm(_filament_name(f))
-        prof = norm(_filament_profile(f))
-        if all(t in (name + " " + prof) for t in wanted_tokens):
-            fid = _extract_filament_id(f)
-            if fid:
-                return fid
-
+    # Final fallback: any available filament
     for f in filaments:
         if not _filament_available(f):
             continue
@@ -1054,7 +1094,6 @@ def resolve_filament_id(shipping_info: dict) -> str:
             return fid
 
     raise RuntimeError("No filament available (could not extract filamentId from Slant filaments).")
-
 
 # ----------------------------
 # Slant orders
