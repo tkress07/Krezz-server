@@ -1748,6 +1748,8 @@ def create_checkout_session():
             session_kwargs["customer_email"] = email
             session_kwargs["payment_intent_data"] = {"receipt_email": email}
 
+            session_kwargs["allow_promotion_codes"] = True
+
         session = stripe.checkout.Session.create(**session_kwargs)
 
                 # ✅ Attach Stripe session details to reservation (so it expires at Stripe's expiry)
