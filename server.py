@@ -1736,29 +1736,19 @@ def create_checkout_session():
             payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
-
-            # ✅ Stripe Tax
-            automatic_tax={"enabled": True},
-
-            # ✅ collect shipping address so Stripe can calculate tax for physical goods
-            shipping_address_collection={
-                "allowed_countries": ["US"]
-            },
-
             success_url=build_success_url(order_id),
             cancel_url=build_cancel_url(order_id),
             metadata={"order_id": order_id},
-            client_reference_id=order_id,
+            client_reference_id=order_id,  # optional but helpful
             idempotency_key=idem_key,
         )
 
-        # ✅ keep your email / receipt logic
+        # ✅ This is the key change for receipts:
         if email:
             session_kwargs["customer_email"] = email
             session_kwargs["payment_intent_data"] = {"receipt_email": email}
 
-        # ✅ allow promo codes whether or not email exists
-        session_kwargs["allow_promotion_codes"] = True
+            session_kwargs["allow_promotion_codes"] = True
 
         session = stripe.checkout.Session.create(**session_kwargs)
 
