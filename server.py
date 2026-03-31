@@ -1631,6 +1631,7 @@ def debug_stl_info(job_id: str):
 
 
 # --- checkout session ---
+
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
     try:
@@ -1786,7 +1787,6 @@ def create_checkout_session():
             pass
 
         return jsonify({"error": str(e)}), 500
-
 
 # --- Stripe webhook ---
 @app.route("/webhook", methods=["POST"])
