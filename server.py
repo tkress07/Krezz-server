@@ -1786,7 +1786,6 @@ def create_checkout_session():
 
         return jsonify({"error": str(e)}), 500
 
-
 # --- Stripe webhook ---
 @app.route("/webhook", methods=["POST"])
 def stripe_webhook():
