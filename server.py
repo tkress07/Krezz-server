@@ -1629,9 +1629,8 @@ def debug_stl_info(job_id: str):
     )
 
 
-
 # --- checkout session ---
-
+# --- checkout session ---
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
     try:
@@ -1645,9 +1644,10 @@ def create_checkout_session():
 
         order_id = (data.get("order_id") or "").strip() or str(uuid.uuid4())
 
+        # ✅ Pull email from shippingInfo (this is what Stripe needs for receipts)
         email = (shipping_info.get("email") or "").strip() or None
         if email:
-            shipping_info["email"] = email
+            shipping_info["email"] = email  # keep it stored too
 
         normalized_items = []
         for it in items:
@@ -1680,7 +1680,7 @@ def create_checkout_session():
                     ),
                     409,
                 )
-
+                # ✅ NEW: Daily order cap (reserve a slot BEFORE creating Stripe checkout session)
         q_ok, q_info = QUOTA.reserve(order_id)
         print(f"🧮 QUOTA reserve: order_id={order_id} ok={q_ok} info={q_info}")
 
@@ -1700,6 +1700,11 @@ def create_checkout_session():
         quota_day = (q_info.get("day") or "").strip() or QUOTA.day_key()
         reservation_created = bool(q_info.get("created", False))
 
+
+        quota_day = (q_info.get("day") or "").strip() or QUOTA.day_key()
+        reservation_created = bool(q_info.get("created", False))
+
+
         STORE.upsert(
             order_id,
             {
@@ -1712,13 +1717,12 @@ def create_checkout_session():
             },
         )
 
+
         line_items = [
             {
                 "price_data": {
                     "currency": "usd",
-                    "product_data": {
-                        "name": it.get("name", "Beard Mold"),
-                    },
+                    "product_data": {"name": it.get("name", "Beard Mold")},
                     "unit_amount": int(it.get("price", 7500)),
                 },
                 "quantity": int(it.get("quantity", 1)),
@@ -1732,27 +1736,23 @@ def create_checkout_session():
             payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
-
-            automatic_tax={"enabled": True},
-            shipping_address_collection={
-                "allowed_countries": ["US"]
-            },
-
             success_url=build_success_url(order_id),
             cancel_url=build_cancel_url(order_id),
             metadata={"order_id": order_id},
-            client_reference_id=order_id,
+            client_reference_id=order_id,  # optional but helpful
             idempotency_key=idem_key,
         )
 
+        # ✅ This is the key change for receipts:
         if email:
             session_kwargs["customer_email"] = email
             session_kwargs["payment_intent_data"] = {"receipt_email": email}
 
-        session_kwargs["allow_promotion_codes"] = True
+            session_kwargs["allow_promotion_codes"] = True
 
         session = stripe.checkout.Session.create(**session_kwargs)
 
+                # ✅ Attach Stripe session details to reservation (so it expires at Stripe's expiry)
         try:
             expires_at = None
             try:
@@ -1760,18 +1760,12 @@ def create_checkout_session():
             except Exception:
                 expires_at = getattr(session, "expires_at", None)
 
-            QUOTA.attach_session(
-                order_id,
-                session.get("id") or "",
-                expires_at,
-                day=quota_day
-            )
-            print(
-                f"🧮 QUOTA attach_session: order_id={order_id} "
-                f"session={session.get('id')} expires_at={expires_at}"
-            )
+            QUOTA.attach_session(order_id, session.get("id") or "", expires_at, day=quota_day)
+            print(f"🧮 QUOTA attach_session: order_id={order_id} session={session.get('id')} expires_at={expires_at}")
         except Exception as e:
             print(f"🧯 QUOTA attach_session error: {e}")
+
+
 
         print(f"✅ Created checkout session: {session.id} order_id={order_id} email={email or 'none'}")
         return jsonify({"url": session.url, "order_id": order_id})
@@ -1780,6 +1774,7 @@ def create_checkout_session():
         tb = traceback.format_exc()
         print(f"❌ Error in checkout session: {e}\n{tb}")
 
+        # ✅ If we reserved a quota slot in this request, release it on failure
         try:
             if "reservation_created" in locals() and reservation_created and "order_id" in locals():
                 QUOTA.release_reservation(order_id)
@@ -1787,6 +1782,7 @@ def create_checkout_session():
             pass
 
         return jsonify({"error": str(e)}), 500
+
 
 # --- Stripe webhook ---
 @app.route("/webhook", methods=["POST"])
