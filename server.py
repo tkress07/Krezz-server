@@ -77,6 +77,17 @@ def req_id() -> str:
     rid = request.headers.get("X-Request-Id") or request.headers.get("X-Request-ID")
     return (rid or str(uuid.uuid4()))[:64]
 
+def stripe_to_dict(obj: Any) -> Any:
+    """
+    Convert StripeObject / ListObject into plain Python dict/list so .get() is safe.
+    """
+    try:
+        if hasattr(obj, "to_dict_recursive"):
+            return obj.to_dict_recursive()
+    except Exception:
+        pass
+    return obj
+
 
 # ----------------------------
 # Config
@@ -1439,17 +1450,21 @@ def success():
     receipt_url = ""
     try:
         if session_id:
-            s = stripe.checkout.Session.retrieve(session_id, expand=["payment_intent.charges"])
+            stripe_session = stripe.checkout.Session.retrieve(
+                session_id,
+                expand=["payment_intent.charges"]
+            )
+            s = stripe_to_dict(stripe_session)
+
             if not order_id:
                 order_id = ((s.get("metadata") or {}).get("order_id") or "").strip()
 
-            pi = s.get("payment_intent")
-            if isinstance(pi, dict):
-                charges = (pi.get("charges") or {}).get("data") or []
-                if charges and isinstance(charges[0], dict):
-                    receipt_url = charges[0].get("receipt_url") or ""
-    except Exception:
-        pass
+            pi = s.get("payment_intent") or {}
+            charges = (pi.get("charges") or {}).get("data") or []
+            if charges and isinstance(charges[0], dict):
+                receipt_url = charges[0].get("receipt_url") or ""
+    except Exception as e:
+        print(f"⚠️ success() receipt lookup failed: {e}")
 
     app_url = f"krezzapp://order-confirmed?order_id={order_id}&session_id={session_id}"
 
@@ -1730,12 +1745,8 @@ def create_checkout_session():
             payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
-
             automatic_tax={"enabled": True},
-            shipping_address_collection={
-                "allowed_countries": ["US"]
-            },
-
+            shipping_address_collection={"allowed_countries": ["US"]},
             success_url=build_success_url(order_id),
             cancel_url=build_cancel_url(order_id),
             metadata={"order_id": order_id},
@@ -1749,30 +1760,28 @@ def create_checkout_session():
 
         session_kwargs["allow_promotion_codes"] = True
 
-        session = stripe.checkout.Session.create(**session_kwargs)
+        stripe_session = stripe.checkout.Session.create(**session_kwargs)
+        session = stripe_to_dict(stripe_session)
 
         try:
-            expires_at = None
-            try:
-                expires_at = session.get("expires_at")
-            except Exception:
-                expires_at = getattr(session, "expires_at", None)
+            expires_at = session.get("expires_at")
+            session_id = session.get("id") or ""
 
             QUOTA.attach_session(
                 order_id,
-                session.get("id") or "",
+                session_id,
                 expires_at,
                 day=quota_day
             )
             print(
                 f"🧮 QUOTA attach_session: order_id={order_id} "
-                f"session={session.get('id')} expires_at={expires_at}"
+                f"session={session_id} expires_at={expires_at}"
             )
         except Exception as e:
             print(f"🧯 QUOTA attach_session error: {e}")
 
-        print(f"✅ Created checkout session: {session.id} order_id={order_id} email={email or 'none'}")
-        return jsonify({"url": session.url, "order_id": order_id})
+        print(f"✅ Created checkout session: {session.get('id')} order_id={order_id} email={email or 'none'}")
+        return jsonify({"url": session.get("url"), "order_id": order_id})
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -1785,7 +1794,6 @@ def create_checkout_session():
             pass
 
         return jsonify({"error": str(e)}), 500
-
 # --- Stripe webhook ---
 @app.route("/webhook", methods=["POST"])
 def stripe_webhook():
@@ -1793,7 +1801,8 @@ def stripe_webhook():
     sig_header = request.headers.get("Stripe-Signature")
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, CFG.stripe_endpoint_secret)
+        stripe_event = stripe.Webhook.construct_event(payload, sig_header, CFG.stripe_endpoint_secret)
+        event = stripe_to_dict(stripe_event)
     except Exception as e:
         print(f"❌ Stripe webhook error: {e}")
         return "Webhook error", 400
@@ -1804,8 +1813,9 @@ def stripe_webhook():
     print(f"📦 Stripe event: {event_type} ({event_id}) livemode={livemode}")
 
     if event_type == "checkout.session.completed":
-        session = event["data"]["object"]
-        order_id = (session.get("metadata") or {}).get("order_id")
+        session = stripe_to_dict(event["data"]["object"])
+        order_id = ((session.get("metadata") or {}).get("order_id") or "").strip()
+
         if not order_id:
             print("❌ Missing order_id in Stripe metadata")
             return jsonify(success=True)
@@ -1814,6 +1824,7 @@ def stripe_webhook():
             seen = order_obj.get("stripe_event_ids") or []
             if event_id in seen:
                 return order_obj, False
+
             order_obj["stripe_event_ids"] = (seen + [event_id])[-20:]
 
             cd = session.get("customer_details") or {}
@@ -1826,18 +1837,25 @@ def stripe_webhook():
             if not email:
                 email = "unknown"
 
+            created_ts = session.get("created")
+            created_iso = utc_iso()
+            try:
+                if created_ts is not None:
+                    created_iso = datetime.utcfromtimestamp(created_ts).isoformat() + "Z"
+            except Exception:
+                pass
+
             order_obj["status"] = "paid"
             order_obj["payment"] = {
                 "stripe_session_id": session.get("id"),
                 "amount_total": session.get("amount_total"),
                 "currency": session.get("currency"),
-                "created": datetime.utcfromtimestamp(session["created"]).isoformat() + "Z",
+                "created": created_iso,
                 "email": email,
                 "status": "paid",
                 "livemode": bool(session.get("livemode", livemode)),
             }
 
-            # ✅ IMPORTANT for your iOS: mark each item as paid
             items = order_obj.get("items") or []
             for it in items:
                 it["status"] = "paid"
@@ -1848,12 +1866,14 @@ def stripe_webhook():
         updated_order, changed = STORE.update(order_id, _apply_payment)
         print(f"✅ Payment confirmed for order_id: {order_id}")
 
-        # ✅ NEW: mark paid against daily quota (idempotent)
         if changed:
             q_day = (updated_order.get("quota_day") or "").strip() or QUOTA.day_key()
-            q_ok, q_info = QUOTA.mark_paid(order_id, session_id=(session.get("id") or ""), day=q_day)
+            q_ok, q_info = QUOTA.mark_paid(
+                order_id,
+                session_id=(session.get("id") or ""),
+                day=q_day
+            )
             if not q_ok:
-                # Safety catch (should be rare if you reserve before checkout)
                 print(f"🟠 Paid but daily cap reached; holding fulfillment. info={q_info}")
                 _set_order_status(order_id, "paid_cap_hold", {"quota": q_info})
                 _set_slant_step(order_id, "cap_hold", {"quota": q_info})
@@ -1876,11 +1896,10 @@ def stripe_webhook():
             print(f"🟡 SLANT_AUTO_SUBMIT={int(CFG.slant_auto_submit)} skipping Slant submission.")
 
     elif event_type == "checkout.session.expired":
-        session = event["data"]["object"]
-        order_id = (session.get("metadata") or {}).get("order_id")
+        session = stripe_to_dict(event["data"]["object"])
+        order_id = ((session.get("metadata") or {}).get("order_id") or "").strip()
 
         if order_id:
-            # ✅ NEW: release quota reservation so it doesn't eat a daily slot forever
             try:
                 QUOTA.release_reservation(order_id)
             except Exception:
@@ -1896,8 +1915,6 @@ def stripe_webhook():
         return jsonify(success=True)
 
     return jsonify(success=True)
-
-
 
 # --- Slant webhook (order.shipped) ---
 def verify_slant_webhook_signature(raw_body: bytes) -> Tuple[bool, str]:
