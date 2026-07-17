@@ -3,41 +3,64 @@ services:
     name: krezz-server
     env: python
     plan: starter
+
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --worker-class gthread --workers 1 --threads 8 --timeout 300
+
+    autoDeploy: true
+
     disk:
       name: data
       mountPath: /data
       sizeGB: 1
+
     envVars:
       - key: FLASK_ENV
         value: production
 
       - key: UPLOAD_DIR
         value: /data/uploads
+
       - key: ORDER_DATA_PATH
         value: /data/order_data.json
 
-      # IMPORTANT: must be your public Render URL so Slant can download /stl/<job>.stl
       - key: PUBLIC_BASE_URL
         value: https://krezz-server.onrender.com
 
       - key: SLANT_BASE_URL
         value: https://slant3dapi.com/v2/api
+
       - key: SLANT_DEBUG
         value: "1"
 
-      # Turn ON real submission
       - key: SLANT_AUTO_SUBMIT
         value: "1"
 
-      # secrets in Render dashboard
+      - key: SLANT_REQUIRE_LIVE_STRIPE
+        value: "1"
+
+      - key: SLANT_STL_ROUTE
+        value: full
+
+      - key: SLANT_TIMEOUT_SEC
+        value: "240"
+
+      - key: REQUIRE_STL_BEFORE_CHECKOUT
+        value: "1"
+
+      - key: AUTO_SUBMIT_ON_UPLOAD_IF_PAID
+        value: "1"
+
+      # Secrets are entered in the Render dashboard.
       - key: SLANT_API_KEY
         sync: false
+
       - key: SLANT_PLATFORM_ID
         sync: false
 
       - key: STRIPE_SECRET_KEY
         sync: false
+
       - key: STRIPE_ENDPOINT_SECRET
         sync: false
