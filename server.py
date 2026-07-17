@@ -10,8 +10,9 @@ import threading
 import traceback
 import hmac
 import hashlib
+import shutil
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -24,7 +25,7 @@ import requests
 import stripe
 from flask import Flask, request, jsonify, send_file, abort, make_response
 
-APP_VERSION = "KrezzServer/2.0.1-direct-upload"
+APP_VERSION = "KrezzServer/2.0.2-monitoring"
 
 app = Flask(__name__)
 
@@ -151,6 +152,11 @@ class Config:
     quota_reservation_ttl_sec: int
     quota_prune_days: int
 
+    # Read-only monitoring endpoint
+    monitor_api_key: str
+    monitor_stuck_minutes: int
+    monitor_lookback_hours: int
+
 
     @staticmethod
     def load() -> "Config":
@@ -218,6 +224,11 @@ class Config:
         require_stl_before_checkout = env_bool("REQUIRE_STL_BEFORE_CHECKOUT", True)
         auto_submit_on_upload_if_paid = env_bool("AUTO_SUBMIT_ON_UPLOAD_IF_PAID", True)
 
+        # Read-only monitoring. The endpoint stays disabled until MONITOR_API_KEY is set.
+        monitor_api_key = env_str("MONITOR_API_KEY")
+        monitor_stuck_minutes = safe_int(env_str("MONITOR_STUCK_MINUTES", "15"), 15)
+        monitor_lookback_hours = safe_int(env_str("MONITOR_LOOKBACK_HOURS", "48"), 48)
+
         cfg = Config(
             stripe_secret_key=stripe_secret_key,
             stripe_endpoint_secret=stripe_endpoint_secret,
@@ -248,6 +259,9 @@ class Config:
             quota_tz=quota_tz,
             quota_reservation_ttl_sec=quota_reservation_ttl_sec,
             quota_prune_days=quota_prune_days,
+            monitor_api_key=monitor_api_key,
+            monitor_stuck_minutes=monitor_stuck_minutes,
+            monitor_lookback_hours=monitor_lookback_hours,
 
         )
 
@@ -276,6 +290,9 @@ class Config:
         print("   SLANT_DAILY_ORDER_CAP:", cfg.daily_order_cap)
         print("   DAILY_QUOTA_PATH:", cfg.quota_data_path)
         print("   DAILY_QUOTA_TZ:", cfg.quota_tz)
+        print("   MONITOR_CONFIGURED:", bool(cfg.monitor_api_key))
+        print("   MONITOR_STUCK_MINUTES:", cfg.monitor_stuck_minutes)
+        print("   MONITOR_LOOKBACK_HOURS:", cfg.monitor_lookback_hours)
 
         return cfg
 
@@ -1900,6 +1917,190 @@ def _start_slant_recovery_worker() -> None:
 
 
 # ----------------------------
+# Read-only production monitoring
+# ----------------------------
+def _parse_utcish(value: Any) -> Optional[datetime]:
+    """Parse the ISO timestamps stored in order_data.json."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def _order_reference_time(order: Dict[str, Any]) -> Optional[datetime]:
+    payment = order.get("payment") or {}
+    slant = order.get("slant") or {}
+    for value in (
+        payment.get("created"),
+        slant.get("step_at"),
+        order.get("status_at"),
+        order.get("created_at"),
+    ):
+        parsed = _parse_utcish(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _monitor_order_summary(order_id: str, order: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    slant = order.get("slant") or {}
+    payment = order.get("payment") or {}
+    ref_time = _order_reference_time(order)
+    age_minutes = None
+    if ref_time is not None:
+        age_minutes = max(0, int((now - ref_time).total_seconds() // 60))
+
+    error_text = str(order.get("slant_error") or slant.get("last_error") or "")
+    return {
+        "order_id": order_id,
+        "status": str(order.get("status") or ""),
+        "slant_step": str(slant.get("step") or ""),
+        "publicOrderId": str(slant.get("publicOrderId") or ""),
+        "payment_status": str(payment.get("status") or ""),
+        "amount_total": payment.get("amount_total"),
+        "age_minutes": age_minutes,
+        "error": error_text[:500],
+    }
+
+
+def _monitor_authorized() -> bool:
+    expected = (CFG.monitor_api_key or "").strip()
+    if not expected:
+        return False
+    supplied = (
+        request.headers.get("X-Monitor-Key")
+        or request.args.get("key")
+        or ""
+    ).strip()
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+def _build_monitor_status() -> Dict[str, Any]:
+    now = datetime.utcnow()
+    lookback_hours = max(1, int(CFG.monitor_lookback_hours or 48))
+    stuck_minutes = max(1, int(CFG.monitor_stuck_minutes or 15))
+    cutoff = now - timedelta(hours=lookback_hours)
+
+    failed: List[Dict[str, Any]] = []
+    stuck: List[Dict[str, Any]] = []
+    waiting_for_stl: List[Dict[str, Any]] = []
+    retrying: List[Dict[str, Any]] = []
+    submitted_recent = 0
+    newest_success_at: Optional[str] = None
+
+    orders = STORE.all_orders()
+    for order_id, order in orders.items():
+        ref_time = _order_reference_time(order)
+        if ref_time is None or ref_time < cutoff:
+            continue
+
+        status = str(order.get("status") or "")
+        slant = order.get("slant") or {}
+        step = str(slant.get("step") or "")
+        payment = order.get("payment") or {}
+        payment_status = str(payment.get("status") or "").lower()
+        paid = bool(payment.get("fulfillment_allowed")) or payment_status in {
+            "paid",
+            "no_payment_required",
+        }
+        public_order_id = str(slant.get("publicOrderId") or "").strip()
+        submitted = status == "submitted_to_slant" or step == "submitted" or bool(public_order_id)
+        summary = _monitor_order_summary(order_id, order, now)
+
+        if submitted:
+            submitted_recent += 1
+            step_at = str(slant.get("step_at") or "")
+            if step_at and (newest_success_at is None or step_at > newest_success_at):
+                newest_success_at = step_at
+            continue
+
+        is_failed = (
+            status == "slant_failed"
+            or step == "failed"
+            or slant.get("retry_exhausted") is True
+        )
+        if is_failed:
+            failed.append(summary)
+            continue
+
+        if status == "paid_waiting_for_stl" or step == "waiting_for_stl":
+            waiting_for_stl.append(summary)
+
+        if step in {
+            "uploading_files",
+            "file_uploaded",
+            "drafting_order",
+            "order_drafted",
+            "processing_order",
+            "retry_wait",
+        } or status == "slant_submitting":
+            retrying.append(summary)
+
+        age_minutes = summary.get("age_minutes")
+        if paid and not submitted and age_minutes is not None and age_minutes >= stuck_minutes:
+            stuck.append(summary)
+
+    failed.sort(key=lambda x: x.get("age_minutes") or 0, reverse=True)
+    stuck.sort(key=lambda x: x.get("age_minutes") or 0, reverse=True)
+    waiting_for_stl.sort(key=lambda x: x.get("age_minutes") or 0, reverse=True)
+    retrying.sort(key=lambda x: x.get("age_minutes") or 0, reverse=True)
+
+    try:
+        disk = shutil.disk_usage(CFG.upload_dir)
+        disk_percent = round((disk.used / disk.total) * 100, 1) if disk.total else 0.0
+        disk_info = {
+            "total_mb": round(disk.total / (1024 * 1024), 1),
+            "used_mb": round(disk.used / (1024 * 1024), 1),
+            "free_mb": round(disk.free / (1024 * 1024), 1),
+            "percent_used": disk_percent,
+            "warning": disk_percent >= 70,
+            "urgent": disk_percent >= 85,
+        }
+    except Exception as exc:
+        disk_info = {"error": str(exc), "warning": True, "urgent": False}
+
+    alerts_present = bool(failed or stuck or disk_info.get("urgent"))
+    return {
+        "ok": not alerts_present,
+        "time": utc_iso(),
+        "version": APP_VERSION,
+        "build_marker": "presigned-direct-upload-monitoring-2026-07-17",
+        "configuration": {
+            "slant_enabled": CFG.slant_enabled,
+            "slant_auto_submit": CFG.slant_auto_submit,
+            "slant_upload_method": "direct_presigned",
+            "slant_recover_pending": env_bool("SLANT_RECOVER_PENDING", False),
+            "monitor_stuck_minutes": stuck_minutes,
+            "monitor_lookback_hours": lookback_hours,
+        },
+        "orders": {
+            "total_saved": len(orders),
+            "submitted_in_lookback": submitted_recent,
+            "failed_count": len(failed),
+            "stuck_count": len(stuck),
+            "waiting_for_stl_count": len(waiting_for_stl),
+            "retrying_count": len(retrying),
+            "failed": failed[:25],
+            "stuck": stuck[:25],
+            "waiting_for_stl": waiting_for_stl[:25],
+            "retrying": retrying[:25],
+            "last_successful_slant_order_at": newest_success_at,
+        },
+        "disk": disk_info,
+    }
+
+
+# ----------------------------
 # Routes
 # ----------------------------
 @app.route("/")
@@ -1926,9 +2127,20 @@ def health():
             "slant_file_url_field": CFG.slant_file_url_field,
             "slant_stl_route": CFG.slant_stl_route,
             "slant_upload_method": "direct_presigned",
-            "build_marker": "presigned-direct-upload-2026-07-17",
+            "build_marker": "presigned-direct-upload-monitoring-2026-07-17",
+            "monitor_configured": bool((CFG.monitor_api_key or "").strip()),
+            "monitor_stuck_minutes": CFG.monitor_stuck_minutes,
+            "monitor_lookback_hours": CFG.monitor_lookback_hours,
         }
     )
+
+
+@app.route("/monitor/status", methods=["GET"])
+def monitor_status():
+    """Read-only operational status. Never retries or changes an order."""
+    if not _monitor_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(_build_monitor_status())
 
 
 # --- success/cancel pages ---
