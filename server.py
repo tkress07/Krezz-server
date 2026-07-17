@@ -25,7 +25,7 @@ import requests
 import stripe
 from flask import Flask, request, jsonify, send_file, abort, make_response
 
-APP_VERSION = "KrezzServer/2.0.2-monitoring"
+APP_VERSION = "KrezzServer/2.0.3-public-monitor"
 
 app = Flask(__name__)
 
@@ -2074,7 +2074,7 @@ def _build_monitor_status() -> Dict[str, Any]:
         "ok": not alerts_present,
         "time": utc_iso(),
         "version": APP_VERSION,
-        "build_marker": "presigned-direct-upload-monitoring-2026-07-17",
+        "build_marker": "presigned-direct-upload-public-monitor-2026-07-17",
         "configuration": {
             "slant_enabled": CFG.slant_enabled,
             "slant_auto_submit": CFG.slant_auto_submit,
@@ -2127,8 +2127,9 @@ def health():
             "slant_file_url_field": CFG.slant_file_url_field,
             "slant_stl_route": CFG.slant_stl_route,
             "slant_upload_method": "direct_presigned",
-            "build_marker": "presigned-direct-upload-monitoring-2026-07-17",
+            "build_marker": "presigned-direct-upload-public-monitor-2026-07-17",
             "monitor_configured": bool((CFG.monitor_api_key or "").strip()),
+            "public_monitor_enabled": True,
             "monitor_stuck_minutes": CFG.monitor_stuck_minutes,
             "monitor_lookback_hours": CFG.monitor_lookback_hours,
         }
@@ -2137,10 +2138,56 @@ def health():
 
 @app.route("/monitor/status", methods=["GET"])
 def monitor_status():
-    """Read-only operational status. Never retries or changes an order."""
+    """Private read-only operational status. Never retries or changes an order."""
     if not _monitor_authorized():
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(_build_monitor_status())
+
+
+@app.route("/monitor/public-status", methods=["GET"])
+def monitor_public_status():
+    """
+    Public, read-only summary for external uptime checkers.
+
+    Deliberately excludes order IDs, customer details, addresses, payment data,
+    error messages, signed URLs, and all other sensitive order information.
+    It never retries, submits, or changes an order.
+    """
+    full = _build_monitor_status()
+    configuration = full.get("configuration") or {}
+    orders = full.get("orders") or {}
+    disk = full.get("disk") or {}
+
+    return jsonify(
+        {
+            "ok": bool(full.get("ok")),
+            "time": full.get("time"),
+            "version": APP_VERSION,
+            "build_marker": "presigned-direct-upload-public-monitor-2026-07-17",
+            "configuration": {
+                "slant_enabled": bool(configuration.get("slant_enabled")),
+                "slant_auto_submit": bool(configuration.get("slant_auto_submit")),
+                "slant_upload_method": configuration.get("slant_upload_method"),
+                "slant_recover_pending": bool(configuration.get("slant_recover_pending")),
+                "monitor_stuck_minutes": configuration.get("monitor_stuck_minutes"),
+                "monitor_lookback_hours": configuration.get("monitor_lookback_hours"),
+            },
+            "orders": {
+                "total_saved": orders.get("total_saved"),
+                "submitted_in_lookback": orders.get("submitted_in_lookback"),
+                "failed_count": orders.get("failed_count"),
+                "stuck_count": orders.get("stuck_count"),
+                "waiting_for_stl_count": orders.get("waiting_for_stl_count"),
+                "retrying_count": orders.get("retrying_count"),
+                "last_successful_slant_order_at": orders.get("last_successful_slant_order_at"),
+            },
+            "disk": {
+                "percent_used": disk.get("percent_used"),
+                "warning": bool(disk.get("warning")),
+                "urgent": bool(disk.get("urgent")),
+            },
+        }
+    )
 
 
 # --- success/cancel pages ---
