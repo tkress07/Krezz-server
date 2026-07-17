@@ -24,7 +24,7 @@ import requests
 import stripe
 from flask import Flask, request, jsonify, send_file, abort, make_response
 
-APP_VERSION = "KrezzServer/1.8"  # bumped (Slant shipped webhook support)
+APP_VERSION = "KrezzServer/1.9"  # automatic Slant retry + recovery
 
 app = Flask(__name__)
 
@@ -346,6 +346,20 @@ class OrderStore:
         try:
             data = self._read_unlocked()
             return len(data)
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+
+    def all_orders(self) -> Dict[str, Dict[str, Any]]:
+        """Return a snapshot of all saved orders for recovery checks."""
+        lf = self._lock()
+        try:
+            data = self._read_unlocked() or {}
+            return {
+                str(order_id): dict(order)
+                for order_id, order in data.items()
+                if isinstance(order, dict)
+            }
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
             lf.close()
@@ -943,8 +957,30 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     if not pid:
         raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime.")
 
-    probe = stl_probe_head(stl_url)
-    print("🧪 STL PROBE", json.dumps(probe, ensure_ascii=False, default=str))
+    # Validate the local file instead of making this Render service call itself.
+    # The old self-HEAD request could time out while the same service was busy.
+    local_path = stl_path_for(job_id)
+    if not os.path.exists(local_path):
+        raise RuntimeError(f"STL not found on server: {local_path}")
+
+    size_bytes = os.path.getsize(local_path)
+    if size_bytes < 84:
+        raise RuntimeError(
+            f"STL appears incomplete: job_id={job_id} size_bytes={size_bytes}"
+        )
+
+    print(
+        "🧪 STL LOCAL CHECK",
+        json.dumps(
+            {
+                "job_id": job_id,
+                "path": local_path,
+                "size_bytes": size_bytes,
+                "public_url": stl_url,
+            },
+            ensure_ascii=False,
+        ),
+    )
 
     payload = {
         CFG.slant_file_url_field: stl_url,
@@ -956,7 +992,11 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
 
     print(
         "🧪 Slant create file request",
-        json.dumps({"endpoint": CFG.slant_files_endpoint, "payload": payload}, ensure_ascii=False, default=str),
+        json.dumps(
+            {"endpoint": CFG.slant_files_endpoint, "payload": payload},
+            ensure_ascii=False,
+            default=str,
+        ),
     )
 
     r = HTTP.post(
@@ -981,14 +1021,19 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
     )
 
     if r.status_code >= 400:
-        raise SlantError(r.status_code, r.text, "Slant POST /files", headers=dict(r.headers))
+        raise SlantError(
+            r.status_code,
+            r.text,
+            "Slant POST /files",
+            headers=dict(r.headers),
+        )
 
     resp = _safe_json(r)
     file_id = parse_slant_file_public_id(resp)
-    if not file_id:
-        raise RuntimeError(f"Could not parse publicFileServiceId from Slant response: {resp}")
-
-    print(f"✅ Slant file created: job_id={job_id} publicFileServiceId={file_id}")
+    print(
+        f"✅ Slant file created: job_id={job_id} "
+        f"publicFileServiceId={file_id}"
+    )
     return file_id
 
 
@@ -1325,14 +1370,24 @@ def _set_slant_step(order_id: str, step: str, extra: Optional[Dict[str, Any]] = 
     STORE.update(order_id, _fn)
 
 
-def _set_slant_failed(order_id: str, err: str, tb: str = "") -> None:
+def _set_slant_failed(
+    order_id: str,
+    err: str,
+    tb: str = "",
+    attempts: int = 0,
+) -> None:
     def _fn(order: Dict[str, Any]):
         order["slant_error"] = err
         order["slant_error_trace"] = (tb or "")[:8000]
         order["status"] = "slant_failed"
+
         sl = order.get("slant") or {}
         sl["step"] = "failed"
         sl["step_at"] = utc_iso()
+        sl["retry_count"] = attempts
+        sl["retry_exhausted"] = True
+        sl["last_error"] = err
+        sl.pop("next_retry_at", None)
         order["slant"] = sl
         return order, True
 
@@ -1354,8 +1409,11 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     order = STORE.get(order_id) or {}
     status = order.get("status")
 
-    if status in ("submitted_to_slant",):
-        print(f"🟡 Slant already done for order_id={order_id} status={status}, skipping.")
+    if status == "submitted_to_slant":
+        print(
+            f"🟡 Slant already done for order_id={order_id} "
+            f"status={status}, skipping."
+        )
         return
 
     if not CFG.slant_enabled:
@@ -1364,15 +1422,20 @@ def submit_paid_order_to_slant(order_id: str) -> None:
     items = order.get("items", []) or []
     shipping = order.get("shipping", {}) or {}
     if not items:
-        raise RuntimeError("ORDER_DATA has no items for this order_id (cannot submit).")
+        raise RuntimeError(
+            "ORDER_DATA has no items for this order_id (cannot submit)."
+        )
 
     missing = missing_stls_for_items(items)
     if missing:
-        raise RuntimeError(f"Missing STL(s) on server for job_id(s): {missing}")
+        raise RuntimeError(
+            f"Missing STL(s) on server for job_id(s): {missing}"
+        )
 
     _set_slant_step(order_id, "uploading_files")
     _set_order_status(order_id, "slant_submitting")
 
+    # Save each successful file ID immediately so retries resume safely.
     for it in items:
         job_id = (it.get("job_id") or "").strip()
         if not job_id:
@@ -1380,22 +1443,56 @@ def submit_paid_order_to_slant(order_id: str) -> None:
 
         if not it.get("publicFileServiceId"):
             it["publicFileServiceId"] = slant_upload_stl(job_id)
-            _set_slant_step(
-                order_id,
-                "file_uploaded",
-                {"last_job_id": job_id, "last_publicFileServiceId": it["publicFileServiceId"]},
+
+            def _persist_one_file(
+                order_obj: Dict[str, Any],
+                saved_items=items,
+                saved_job_id=job_id,
+                saved_file_id=it["publicFileServiceId"],
+            ):
+                order_obj["items"] = saved_items
+                sl = order_obj.get("slant") or {}
+                sl["step"] = "file_uploaded"
+                sl["step_at"] = utc_iso()
+                sl["last_job_id"] = saved_job_id
+                sl["last_publicFileServiceId"] = saved_file_id
+                order_obj["slant"] = sl
+                return order_obj, True
+
+            STORE.update(order_id, _persist_one_file)
+            print(
+                f"💾 Saved Slant file progress: order_id={order_id} "
+                f"job_id={job_id}"
             )
 
-    def _persist_items(order_obj: Dict[str, Any]):
-        order_obj["items"] = items
-        return order_obj, True
+    # Resume an already-drafted order when only the process step failed.
+    latest = STORE.get(order_id) or {}
+    latest_slant = latest.get("slant") or {}
+    public_order_id = str(
+        latest_slant.get("publicOrderId") or ""
+    ).strip()
 
-    STORE.update(order_id, _persist_items)
+    if public_order_id:
+        print(
+            f"↩️ Resuming existing Slant order: "
+            f"order_id={order_id} publicOrderId={public_order_id}"
+        )
+    else:
+        _set_slant_step(order_id, "drafting_order")
+        public_order_id = slant_draft_order(order_id, shipping, items)
 
-    _set_slant_step(order_id, "drafting_order")
-    public_order_id = slant_draft_order(order_id, shipping, items)
+        # Save before processing to reduce duplicate-order risk on retry.
+        _set_slant_step(
+            order_id,
+            "order_drafted",
+            {"publicOrderId": public_order_id},
+        )
 
-    _set_slant_step(order_id, "processing_order", {"publicOrderId": public_order_id})
+    _set_slant_step(
+        order_id,
+        "processing_order",
+        {"publicOrderId": public_order_id},
+    )
     process_resp = slant_process_order(public_order_id)
 
     def _persist_done(order_obj: Dict[str, Any]):
@@ -1404,28 +1501,259 @@ def submit_paid_order_to_slant(order_id: str) -> None:
         sl["processResponse"] = process_resp
         sl["step"] = "submitted"
         sl["step_at"] = utc_iso()
+        sl["retry_exhausted"] = False
+        sl.pop("next_retry_at", None)
+        sl.pop("last_error", None)
+
         order_obj["slant"] = sl
         order_obj["status"] = "submitted_to_slant"
         order_obj["items"] = items
+        order_obj.pop("slant_error", None)
+        order_obj.pop("slant_error_trace", None)
         return order_obj, True
 
     STORE.update(order_id, _persist_done)
 
-    print(f"✅ Slant submission complete: order_id={order_id} publicOrderId={public_order_id}")
+    print(
+        f"✅ Slant submission complete: order_id={order_id} "
+        f"publicOrderId={public_order_id}"
+    )
+
+
+# Attempt 1 is immediate. Later attempts wait 30 sec, 2 min, 5 min, 15 min.
+SLANT_RETRY_DELAYS_SEC = (0, 30, 120, 300, 900)
+SLANT_RETRYABLE_HTTP_STATUSES = {
+    408, 425, 429, 500, 502, 503, 504
+}
+
+_SLANT_ACTIVE_LOCK = threading.Lock()
+_SLANT_ACTIVE_ORDERS: set[str] = set()
+
+
+def _is_retryable_slant_error(exc: Exception) -> bool:
+    if isinstance(exc, SlantError):
+        return exc.status in SLANT_RETRYABLE_HTTP_STATUSES
+
+    if isinstance(
+        exc,
+        (
+            requests.Timeout,
+            requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    ):
+        return True
+
+    message = str(exc).lower()
+    temporary_markers = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "remote end closed",
+    )
+    return any(marker in message for marker in temporary_markers)
+
+
+def _record_retry_wait(
+    order_id: str,
+    attempt_number: int,
+    next_delay_sec: int,
+    err: str,
+) -> None:
+    next_retry_at = (
+        datetime.utcnow() + timedelta(seconds=next_delay_sec)
+    ).isoformat() + "Z"
+
+    def _fn(order: Dict[str, Any]):
+        order["status"] = "paid_pending_fulfillment"
+        order["status_at"] = utc_iso()
+        order["slant_error"] = err
+
+        sl = order.get("slant") or {}
+        sl["step"] = "retry_wait"
+        sl["step_at"] = utc_iso()
+        sl["retry_count"] = attempt_number
+        sl["max_attempts"] = len(SLANT_RETRY_DELAYS_SEC)
+        sl["next_retry_at"] = next_retry_at
+        sl["last_error"] = err
+        sl["retry_exhausted"] = False
+        order["slant"] = sl
+        return order, True
+
+    STORE.update(order_id, _fn)
+
+
+def _sleep_before_retry(order_id: str, delay_sec: int) -> bool:
+    """Return False if another request already completed the order."""
+    deadline = time.time() + max(0, delay_sec)
+
+    while time.time() < deadline:
+        order = STORE.get(order_id) or {}
+        if order.get("status") == "submitted_to_slant":
+            return False
+        time.sleep(min(5, max(0.1, deadline - time.time())))
+
+    return True
 
 
 def submit_to_slant_async(order_id: str) -> None:
-    def _run():
-        print(f"🧵 Slant async started: order_id={order_id}")
-        try:
-            submit_paid_order_to_slant(order_id)
-            print(f"🧵 Slant async finished: order_id={order_id}")
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"❌ Slant async exception: {e}\n{tb}")
-            _set_slant_failed(order_id, str(e), tb)
+    order_id = (order_id or "").strip()
+    if not order_id:
+        return
 
-    threading.Thread(target=_run, daemon=True).start()
+    with _SLANT_ACTIVE_LOCK:
+        if order_id in _SLANT_ACTIVE_ORDERS:
+            print(
+                f"🟡 Slant retry worker already active: order_id={order_id}"
+            )
+            return
+        _SLANT_ACTIVE_ORDERS.add(order_id)
+
+    def _run():
+        print(f"🧵 Slant retry worker started: order_id={order_id}")
+
+        try:
+            for attempt_number, delay_before_attempt in enumerate(
+                SLANT_RETRY_DELAYS_SEC,
+                start=1,
+            ):
+                if delay_before_attempt > 0:
+                    if not _sleep_before_retry(
+                        order_id,
+                        delay_before_attempt,
+                    ):
+                        print(
+                            f"🟡 Retry canceled because order is already "
+                            f"submitted: order_id={order_id}"
+                        )
+                        return
+
+                current = STORE.get(order_id) or {}
+                if current.get("status") == "submitted_to_slant":
+                    return
+
+                print(
+                    f"➡️ Slant attempt {attempt_number}/"
+                    f"{len(SLANT_RETRY_DELAYS_SEC)} "
+                    f"order_id={order_id}"
+                )
+
+                try:
+                    submit_paid_order_to_slant(order_id)
+                    print(
+                        f"🧵 Slant retry worker finished: "
+                        f"order_id={order_id}"
+                    )
+                    return
+
+                except Exception as exc:
+                    last_error = str(exc)
+                    last_trace = traceback.format_exc()
+                    retryable = _is_retryable_slant_error(exc)
+                    is_last_attempt = (
+                        attempt_number == len(SLANT_RETRY_DELAYS_SEC)
+                    )
+
+                    print(
+                        f"❌ Slant attempt {attempt_number} failed: "
+                        f"order_id={order_id} retryable={retryable} "
+                        f"error={exc}\n{last_trace}"
+                    )
+
+                    if not retryable or is_last_attempt:
+                        _set_slant_failed(
+                            order_id,
+                            last_error,
+                            last_trace,
+                            attempts=attempt_number,
+                        )
+                        return
+
+                    next_delay = SLANT_RETRY_DELAYS_SEC[attempt_number]
+                    _record_retry_wait(
+                        order_id,
+                        attempt_number,
+                        next_delay,
+                        last_error,
+                    )
+                    print(
+                        f"⏳ Slant retry scheduled: order_id={order_id} "
+                        f"in={next_delay}s"
+                    )
+
+        finally:
+            with _SLANT_ACTIVE_LOCK:
+                _SLANT_ACTIVE_ORDERS.discard(order_id)
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name=f"slant-retry-{order_id[:8]}",
+    ).start()
+
+
+def _recover_pending_slant_orders() -> None:
+    """
+    Recover paid orders if Render restarted while a retry was waiting or while
+    a Slant request was in progress.
+    """
+    if not (
+        CFG.slant_enabled
+        and CFG.slant_auto_submit
+        and env_bool("SLANT_RECOVER_PENDING", True)
+    ):
+        return
+
+    recoverable_statuses = {
+        "paid",
+        "paid_pending_fulfillment",
+        "slant_submitting",
+        "slant_failed",
+    }
+
+    for order_id, order in STORE.all_orders().items():
+        status = str(order.get("status") or "")
+        if status not in recoverable_statuses:
+            continue
+
+        slant = order.get("slant") or {}
+        if slant.get("step") == "submitted":
+            continue
+        if status == "slant_failed" and slant.get("retry_exhausted") is True:
+            continue
+
+        missing = missing_stls_for_items(order.get("items") or [])
+        if missing:
+            continue
+
+        print(
+            f"♻️ Recovering pending Slant order: "
+            f"order_id={order_id} status={status}"
+        )
+        submit_to_slant_async(order_id)
+
+
+def _start_slant_recovery_worker() -> None:
+    def _worker():
+        # Let Gunicorn finish starting before the first scan.
+        time.sleep(20)
+        while True:
+            try:
+                _recover_pending_slant_orders()
+            except Exception as exc:
+                print(
+                    f"⚠️ Slant recovery scan failed: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+            time.sleep(300)
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name="slant-recovery",
+    ).start()
 
 
 # ----------------------------
@@ -1875,16 +2203,31 @@ def stripe_webhook():
             except Exception:
                 pass
 
-            session_livemode = bool(stripe_field(session, "livemode", livemode))
+            session_livemode = bool(
+                stripe_field(session, "livemode", livemode)
+            )
+            payment_status = str(
+                stripe_field(session, "payment_status", "") or ""
+            ).strip()
+            amount_total = stripe_field(session, "amount_total", 0) or 0
 
-            order_obj["status"] = "paid"
+            # Stripe uses no_payment_required for valid $0 coupon orders.
+            fulfillment_allowed = payment_status in (
+                "paid",
+                "no_payment_required",
+            )
+
+            order_obj["status"] = (
+                "paid" if fulfillment_allowed else "payment_pending"
+            )
             order_obj["payment"] = {
                 "stripe_session_id": stripe_field(session, "id"),
-                "amount_total": stripe_field(session, "amount_total"),
+                "amount_total": amount_total,
                 "currency": stripe_field(session, "currency"),
                 "created": created_iso,
                 "email": email,
-                "status": "paid",
+                "status": payment_status or "unknown",
+                "fulfillment_allowed": fulfillment_allowed,
                 "livemode": session_livemode,
             }
 
@@ -1896,7 +2239,19 @@ def stripe_webhook():
             return order_obj, True
 
         updated_order, changed = STORE.update(order_id, _apply_payment)
-        print(f"✅ Payment confirmed for order_id: {order_id}")
+        payment_info = updated_order.get("payment") or {}
+        print(
+            f"✅ Checkout completed: order_id={order_id} "
+            f"payment_status={payment_info.get('status')} "
+            f"amount_total={payment_info.get('amount_total')}"
+        )
+
+        if not payment_info.get("fulfillment_allowed"):
+            print(
+                f"🟡 Fulfillment blocked because Stripe payment is not "
+                f"complete: order_id={order_id}"
+            )
+            return jsonify(success=True)
 
         if changed:
             q_day = (updated_order.get("quota_day") or "").strip() or QUOTA.day_key()
@@ -2127,6 +2482,10 @@ def debug_order_missing_stl(order_id):
     items = order.get("items") or []
     missing = missing_stls_for_items(items)
     return jsonify({"ok": True, "order_id": order_id, "missing_job_ids": missing, "upload_dir": CFG.upload_dir})
+
+
+# Start the recovery scanner. render.yaml uses one Gunicorn worker.
+_start_slant_recovery_worker()
 
 
 if __name__ == "__main__":
