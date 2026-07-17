@@ -24,7 +24,7 @@ import requests
 import stripe
 from flask import Flask, request, jsonify, send_file, abort, make_response
 
-APP_VERSION = "KrezzServer/1.9"  # automatic Slant retry + recovery
+APP_VERSION = "KrezzServer/2.0.1-direct-upload"
 
 app = Flask(__name__)
 
@@ -779,17 +779,12 @@ class SlantError(RuntimeError):
 
 
 def slant_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """
-    Slant auth supports Bearer token; some setups also accept api-key.
-    We include both (api-key is harmless) and control Authorization with SLANT_SEND_BEARER.
-    """
+    """Build Slant API headers using the documented Bearer token."""
     h: Dict[str, str] = {"Accept": "application/json"}
 
     api_key = (CFG.slant_api_key or "").strip()
-    if api_key:
-        if CFG.slant_send_bearer:
-            h["Authorization"] = f"Bearer {api_key}"
-        h["api-key"] = api_key
+    if api_key and CFG.slant_send_bearer:
+        h["Authorization"] = f"Bearer {api_key}"
 
     if extra:
         h.update(extra)
@@ -950,15 +945,76 @@ def slant_get_filaments_cached(force: bool = False) -> List[Dict[str, Any]]:
 
 
 # ----------------------------
-# Slant files upload (URL)
+# Slant files upload (presigned direct upload)
 # ----------------------------
-def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
+def _slant_file_endpoint(suffix: str = "") -> str:
+    base = (CFG.slant_files_endpoint or f"{CFG.slant_base_url.rstrip('/')}/files").rstrip("/")
+    return f"{base}/{suffix.lstrip('/')}" if suffix else base
+
+
+def _slant_get_file_record(public_file_service_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort lookup used to recover from a confirmation timeout/500 when
+    Slant may actually have finished processing the file.
+    """
+    public_file_service_id = (public_file_service_id or "").strip()
+    if not public_file_service_id:
+        return None
+
+    endpoint = _slant_file_endpoint(public_file_service_id)
+    try:
+        r = HTTP.get(
+            endpoint,
+            headers=slant_headers({"Content-Type": "application/json"}),
+            timeout=slant_timeout(),
+        )
+    except Exception as exc:
+        print(
+            f"⚠️ Slant file verification request failed: "
+            f"publicFileServiceId={public_file_service_id} error={exc}"
+        )
+        return None
+
+    print(
+        "🧪 SLANT_HTTP",
+        json.dumps(
+            {
+                "where": "GET /files/{publicFileServiceId}",
+                "status": r.status_code,
+                "publicFileServiceId": public_file_service_id,
+                "body_snippet": (r.text or "")[:800] if r.status_code >= 400 else "",
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    if r.status_code >= 400:
+        return None
+
+    payload = _safe_json(r)
+    try:
+        found_id = parse_slant_file_public_id(payload)
+    except Exception:
+        return None
+
+    if found_id != public_file_service_id:
+        return None
+    return payload
+
+
+def slant_upload_stl(job_id: str, owner_id: str = "") -> str:
+    """
+    Upload an STL using Slant's documented presigned direct-upload flow:
+      1) POST /files/direct-upload
+      2) PUT raw STL bytes to the returned presigned S3 URL
+      3) POST /files/confirm-upload with the full filePlaceholder object
+
+    This replaces the failing URL-import POST /files flow.
+    """
     pid = (CFG.slant_platform_id or "").strip()
     if not pid:
         raise RuntimeError("SLANT_PLATFORM_ID is missing/blank at runtime.")
 
-    # Validate the local file instead of making this Render service call itself.
-    # The old self-HEAD request could time out while the same service was busy.
     local_path = stl_path_for(job_id)
     if not os.path.exists(local_path):
         raise RuntimeError(f"STL not found on server: {local_path}")
@@ -969,82 +1025,169 @@ def slant_create_file_by_url(job_id: str, stl_url: str) -> str:
             f"STL appears incomplete: job_id={job_id} size_bytes={size_bytes}"
         )
 
+    owner_value = (owner_id or job_id).strip()
+    request_payload = {
+        "name": f"{job_id}.stl",
+        "platformId": pid,
+        "ownerId": owner_value,
+    }
+
+    direct_endpoint = _slant_file_endpoint("direct-upload")
+    confirm_endpoint = _slant_file_endpoint("confirm-upload")
+
     print(
-        "🧪 STL LOCAL CHECK",
+        "➡️ Slant direct upload slot request",
         json.dumps(
             {
                 "job_id": job_id,
-                "path": local_path,
+                "ownerId": owner_value,
                 "size_bytes": size_bytes,
-                "public_url": stl_url,
+                "endpoint": direct_endpoint,
             },
             ensure_ascii=False,
-        ),
-    )
-
-    payload = {
-        CFG.slant_file_url_field: stl_url,
-        "name": job_id,
-        "platformId": pid,
-        "type": "stl",
-        "ownerId": job_id,
-    }
-
-    print(
-        "🧪 Slant create file request",
-        json.dumps(
-            {"endpoint": CFG.slant_files_endpoint, "payload": payload},
-            ensure_ascii=False,
-            default=str,
         ),
     )
 
     r = HTTP.post(
-        CFG.slant_files_endpoint,
+        direct_endpoint,
         headers=slant_headers({"Content-Type": "application/json"}),
-        json=payload,
+        json=request_payload,
         timeout=slant_timeout(),
-    )
-
-    print(
-        "🧪 SLANT_HTTP",
-        json.dumps(
-            {
-                "where": "POST /files",
-                "status": r.status_code,
-                "headers": {k: v for k, v in r.headers.items()},
-                "body_snippet": (r.text or "")[:1400],
-            },
-            ensure_ascii=False,
-            default=str,
-        ),
     )
 
     if r.status_code >= 400:
         raise SlantError(
             r.status_code,
             r.text,
-            "Slant POST /files",
+            "Slant POST /files/direct-upload",
             headers=dict(r.headers),
         )
 
-    resp = _safe_json(r)
-    file_id = parse_slant_file_public_id(resp)
+    direct_resp = _safe_json(r)
+    data_obj = direct_resp.get("data") if isinstance(direct_resp, dict) else None
+    if not isinstance(data_obj, dict):
+        raise RuntimeError(
+            f"Slant direct-upload response missing data object: {str(direct_resp)[:1200]}"
+        )
+
+    presigned_url = str(data_obj.get("presignedUrl") or "").strip()
+    placeholder = data_obj.get("filePlaceholder")
+    if not presigned_url or not isinstance(placeholder, dict):
+        raise RuntimeError(
+            "Slant direct-upload response missing presignedUrl or filePlaceholder"
+        )
+
+    placeholder_file_id = str(
+        placeholder.get("publicFileServiceId") or ""
+    ).strip()
+    if not placeholder_file_id:
+        raise RuntimeError(
+            f"Slant filePlaceholder missing publicFileServiceId: {str(placeholder)[:1200]}"
+        )
+
     print(
-        f"✅ Slant file created: job_id={job_id} "
-        f"publicFileServiceId={file_id}"
+        f"✅ Slant upload slot created: job_id={job_id} "
+        f"publicFileServiceId={placeholder_file_id}"
     )
-    return file_id
 
+    # Never send Slant auth headers to the presigned S3 URL.
+    with open(local_path, "rb") as stl_file:
+        put_resp = requests.put(
+            presigned_url,
+            data=stl_file,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=(15, max(CFG.slant_timeout_sec, 600)),
+        )
 
-def slant_upload_stl(job_id: str) -> str:
-    p = stl_path_for(job_id)
-    if not os.path.exists(p):
-        raise RuntimeError(f"STL not found on server: {p}")
+    print(
+        "🧪 SLANT_S3_HTTP",
+        json.dumps(
+            {
+                "where": "PUT presigned STL",
+                "status": put_resp.status_code,
+                "job_id": job_id,
+                "publicFileServiceId": placeholder_file_id,
+                "body_snippet": (put_resp.text or "")[:800],
+            },
+            ensure_ascii=False,
+        ),
+    )
 
-    route = "stl-full" if CFG.slant_stl_route == "full" else "stl-raw"
-    stl_url = f"{CFG.public_base_url}/{route}/{job_id}.stl"
-    return slant_create_file_by_url(job_id, stl_url)
+    if put_resp.status_code < 200 or put_resp.status_code >= 300:
+        raise SlantError(
+            put_resp.status_code,
+            put_resp.text,
+            "Slant presigned S3 PUT",
+            headers=dict(put_resp.headers),
+        )
+
+    confirm_payload = {"filePlaceholder": placeholder}
+
+    try:
+        confirm_resp = HTTP.post(
+            confirm_endpoint,
+            headers=slant_headers({"Content-Type": "application/json"}),
+            json=confirm_payload,
+            timeout=(10, max(CFG.slant_timeout_sec, 300)),
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        recovered = _slant_get_file_record(placeholder_file_id)
+        if recovered is not None:
+            print(
+                f"✅ Slant confirmation recovered after network error: "
+                f"job_id={job_id} publicFileServiceId={placeholder_file_id}"
+            )
+            return placeholder_file_id
+        raise exc
+
+    print(
+        "🧪 SLANT_HTTP",
+        json.dumps(
+            {
+                "where": "POST /files/confirm-upload",
+                "status": confirm_resp.status_code,
+                "job_id": job_id,
+                "publicFileServiceId": placeholder_file_id,
+                "body_snippet": (confirm_resp.text or "")[:1200]
+                if confirm_resp.status_code >= 400
+                else "",
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    if confirm_resp.status_code >= 400:
+        # Slant returned 500 when the same placeholder was confirmed twice.
+        # Verify the file record before declaring failure so a completed upload
+        # is not retried and duplicated.
+        recovered = _slant_get_file_record(placeholder_file_id)
+        if recovered is not None:
+            print(
+                f"✅ Slant confirmation already completed: "
+                f"job_id={job_id} publicFileServiceId={placeholder_file_id}"
+            )
+            return placeholder_file_id
+
+        raise SlantError(
+            confirm_resp.status_code,
+            confirm_resp.text,
+            "Slant POST /files/confirm-upload",
+            headers=dict(confirm_resp.headers),
+        )
+
+    confirm_json = _safe_json(confirm_resp)
+    confirmed_file_id = parse_slant_file_public_id(confirm_json)
+    if confirmed_file_id != placeholder_file_id:
+        raise RuntimeError(
+            "Slant confirmed a different publicFileServiceId: "
+            f"placeholder={placeholder_file_id} confirmed={confirmed_file_id}"
+        )
+
+    print(
+        f"✅ Slant direct upload confirmed: job_id={job_id} "
+        f"publicFileServiceId={confirmed_file_id}"
+    )
+    return confirmed_file_id
 
 
 # ----------------------------
@@ -1442,7 +1585,7 @@ def submit_paid_order_to_slant(order_id: str) -> None:
             raise RuntimeError("Item missing job_id")
 
         if not it.get("publicFileServiceId"):
-            it["publicFileServiceId"] = slant_upload_stl(job_id)
+            it["publicFileServiceId"] = slant_upload_stl(job_id, owner_id=order_id)
 
             def _persist_one_file(
                 order_obj: Dict[str, Any],
@@ -1702,7 +1845,7 @@ def _recover_pending_slant_orders() -> None:
     if not (
         CFG.slant_enabled
         and CFG.slant_auto_submit
-        and env_bool("SLANT_RECOVER_PENDING", True)
+        and env_bool("SLANT_RECOVER_PENDING", False)
     ):
         return
 
@@ -1782,6 +1925,8 @@ def health():
             "filaments_cache_ttl_sec": _FILAMENT_CACHE_TTL_SEC,
             "slant_file_url_field": CFG.slant_file_url_field,
             "slant_stl_route": CFG.slant_stl_route,
+            "slant_upload_method": "direct_presigned",
+            "build_marker": "presigned-direct-upload-2026-07-17",
         }
     )
 
@@ -2459,7 +2604,7 @@ def debug_slant_ping():
 @app.route("/debug/slant/upload/<job_id>", methods=["POST"])
 def debug_slant_upload(job_id):
     try:
-        pfsid = slant_upload_stl(job_id)
+        pfsid = slant_upload_stl(job_id, owner_id=f"debug:{job_id}")
         return jsonify({"ok": True, "job_id": job_id, "publicFileServiceId": pfsid})
     except Exception as e:
         tb = traceback.format_exc()
