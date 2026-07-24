@@ -1,77 +1,152 @@
-import subprocess
-from flask import Flask, jsonify, request, send_file
-import tempfile
-import uuid
-import os
+from __future__ import annotations
+
 import json
+import os
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
+
+from flask import Flask, after_this_request, jsonify, request, send_file
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024
 
-# ✅ Health check for Render
-@app.route("/")
+JOBS_DIR = Path(os.environ.get("JOBS_DIR", "/data/jobs"))
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+BLENDER_BIN = os.environ.get("BLENDER_BIN", "blender")
+APP_DIR = Path(__file__).resolve().parent
+GENERATE_SCRIPT = APP_DIR / "generate_stl.py"
+REPAIR_SCRIPT = APP_DIR / "repair_stl.py"
+
+
+def run_blender(script: Path, args: list[str], timeout: int = 240) -> subprocess.CompletedProcess[str]:
+    command = [
+        BLENDER_BIN,
+        "--background",
+        "--python",
+        str(script),
+        "--",
+        *args,
+    ]
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+@app.get("/")
 def health():
-    return "OK", 200
+    return jsonify(
+        ok=True,
+        service="krezzcut-blender",
+        repair_endpoint="/repair-stl",
+        jobs_dir=str(JOBS_DIR),
+    )
 
-@app.route("/blender-version")
-def blender_version():
-    try:
-        out = subprocess.check_output(["blender", "-v"], text=True).strip()
-        return jsonify({"blender_version": out})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
-@app.route("/generate-stl", methods=["POST"])
+# Keeps the existing JSON endpoint working for older app builds.
+@app.post("/generate-stl")
 def generate_stl():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="Expected a JSON object."), 400
+
+    job_id = str(payload.get("job_id") or payload.get("jobID") or uuid.uuid4())
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = job_dir / "input.json"
+    output_path = job_dir / f"{job_id}.stl"
+    input_path.write_text(json.dumps(payload), encoding="utf-8")
+
     try:
-        data = request.get_json()
-        print("🛬 Received JSON:", data)
-
-        vertices = data.get("vertices", [])
-        neckline = data.get("neckline", [])
-        overlay = data.get("overlay", "default")
-        job_id = data.get("job_id", uuid.uuid4().hex[:8])  # fallback UUID if not provided
-
-        if not vertices:
-            return jsonify({"error": "No vertices provided"}), 400
-
-        temp_id = uuid.uuid4().hex[:8]
-        input_path = f"/tmp/input_{temp_id}.json"
-        output_path = f"/tmp/output_{temp_id}.stl"
-
-        # Write full payload with overlay & job_id
-        with open(input_path, "w") as f:
-            json.dump({
-                "vertices": vertices,
-                "neckline": neckline,
-                "overlay": overlay,
-                "job_id": job_id
-            }, f)
-
-        print(f"📦 Calling Blender with input: {input_path}, output: {output_path}")
-
-        result = subprocess.run([
-            "blender", "--background", "--python", "generate_stl.py", "--",
-            input_path, output_path
-        ], capture_output=True, text=True, timeout=60)
-
-        print("✅ Blender STDOUT:\n", result.stdout)
-        print("⚠️ Blender STDERR:\n", result.stderr)
-
-        if result.returncode != 0:
-            return jsonify({
-                "error": "Blender failed",
-                "stderr": result.stderr,
-                "stdout": result.stdout
-            }), 500
-
-        if not os.path.exists(output_path):
-            return jsonify({"error": "STL not created", "stderr": result.stderr}), 500
-
-        return send_file(output_path, mimetype="application/octet-stream", as_attachment=True, download_name="mold.stl")
-
+        result = run_blender(
+            GENERATE_SCRIPT,
+            [str(input_path), str(output_path)],
+            timeout=240,
+        )
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Blender timed out"}), 504
-    except subprocess.CalledProcessError as e:
-        return jsonify({"error": f"Blender crashed", "details": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(error="Blender timed out while generating the mold."), 504
+
+    if result.returncode != 0 or not output_path.exists():
+        message = (result.stderr or result.stdout or "Blender generation failed.")[-6000:]
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(error=message), 500
+
+    @after_this_request
+    def cleanup(response):
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return response
+
+    return send_file(
+        output_path,
+        mimetype="application/sla",
+        as_attachment=True,
+        download_name=f"mold_{job_id}.stl",
+    )
+
+
+# New endpoint used by ViewController_ManifoldServer.swift.
+@app.post("/repair-stl")
+def repair_stl():
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return jsonify(error="Missing STL file field named 'file'."), 400
+
+    job_id = str(request.form.get("job_id") or uuid.uuid4())
+    params_raw = request.form.get("params") or "{}"
+
+    try:
+        params = json.loads(params_raw)
+        if not isinstance(params, dict):
+            raise ValueError("params must be a JSON object")
+    except (json.JSONDecodeError, ValueError) as exc:
+        return jsonify(error=f"Invalid params: {exc}"), 400
+
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = job_dir / "raw.stl"
+    output_path = job_dir / f"{job_id}.stl"
+    params_path = job_dir / "repair_params.json"
+
+    uploaded.save(input_path)
+    params_path.write_text(json.dumps(params), encoding="utf-8")
+
+    try:
+        result = run_blender(
+            REPAIR_SCRIPT,
+            [str(input_path), str(output_path), str(params_path)],
+            timeout=240,
+        )
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(error="Blender timed out while fusing the mold."), 504
+
+    if result.returncode != 0 or not output_path.exists():
+        message = (result.stderr or result.stdout or "Blender repair failed.")[-6000:]
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(error=message), 500
+
+    @after_this_request
+    def cleanup(response):
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return response
+
+    return send_file(
+        output_path,
+        mimetype="application/sla",
+        as_attachment=True,
+        download_name=f"mold_{job_id}.stl",
+    )
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
