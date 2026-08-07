@@ -7,34 +7,74 @@ import json
 
 app = Flask(__name__)
 
+# ✅ Health check for Render
+@app.route("/")
+def health():
+    return "OK", 200
 
-# ============================================================
-# CONFIG
-# ============================================================
+@app.route("/blender-version")
+def blender_version():
+    try:
+        out = subprocess.check_output(["blender", "-v"], text=True).strip()
+        return jsonify({"blender_version": out})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-BLENDER_TIMEOUT_SECONDS = 120
+@app.route("/generate-stl", methods=["POST"])
+def generate_stl():
+    try:
+        data = request.get_json()
+        print("🛬 Received JSON:", data)
 
-# This script is executed INSIDE Blender for the new
-# /boolean-holes endpoint.
-#
-# Arguments:
-#   1. input STL
-#   2. output STL
-#   3. holes JSON file
-#   4. radius in millimeters
-#
-BOOLEAN_HOLES_BLENDER_SCRIPT = r'''
-import bpy
-import bmesh
-import json
-import sys
-import os
+        vertices = data.get("vertices", [])
+        neckline = data.get("neckline", [])
+        overlay = data.get("overlay", "default")
+        job_id = data.get("job_id", uuid.uuid4().hex[:8])  # fallback UUID if not provided
 
+        if not vertices:
+            return jsonify({"error": "No vertices provided"}), 400
 
-# ============================================================
-# ARGUMENTS
-# ============================================================
+        temp_id = uuid.uuid4().hex[:8]
+        input_path = f"/tmp/input_{temp_id}.json"
+        output_path = f"/tmp/output_{temp_id}.stl"
 
+        # Write full payload with overlay & job_id
+        with open(input_path, "w") as f:
+            json.dump({
+                "vertices": vertices,
+                "neckline": neckline,
+                "overlay": overlay,
+                "job_id": job_id
+            }, f)
+
+        print(f"📦 Calling Blender with input: {input_path}, output: {output_path}")
+
+        result = subprocess.run([
+            "blender", "--background", "--python", "generate_stl.py", "--",
+            input_path, output_path
+        ], capture_output=True, text=True, timeout=60)
+
+        print("✅ Blender STDOUT:\n", result.stdout)
+        print("⚠️ Blender STDERR:\n", result.stderr)
+
+        if result.returncode != 0:
+            return jsonify({
+                "error": "Blender failed",
+                "stderr": result.stderr,
+                "stdout": result.stdout
+            }), 500
+
+        if not os.path.exists(output_path):
+            return jsonify({"error": "STL not created", "stderr": result.stderr}), 500
+
+        return send_file(output_path, mimetype="application/octet-stream", as_attachment=True, download_name="mold.stl")
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Blender timed out"}), 504
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": f"Blender crashed", "details": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 argv = sys.argv
 
 if "--" not in argv:
