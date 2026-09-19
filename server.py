@@ -25,7 +25,14 @@ import requests
 import stripe
 from flask import Flask, request, jsonify, send_file, abort, make_response
 
-APP_VERSION = "KrezzServer/2.0.4-admin-protection"
+try:
+    import psycopg
+except Exception:
+    # Partner reporting is optional. The fulfillment server must still boot if
+    # the PostgreSQL driver is unavailable for any reason.
+    psycopg = None
+
+APP_VERSION = "KrezzServer/2.1.0-partner-reporting"
 
 app = Flask(__name__)
 
@@ -118,6 +125,7 @@ class Config:
     public_base_url: str
     upload_dir: str
     order_data_path: str
+    database_url: str
 
     stripe_success_url_tmpl: str
     stripe_cancel_url_tmpl: str
@@ -177,6 +185,11 @@ class Config:
 
         order_data_path = env_str("ORDER_DATA_PATH", "/data/order_data.json")
         os.makedirs(os.path.dirname(order_data_path), exist_ok=True)
+
+        # Optional, reporting-only PostgreSQL database. Checkout, JSON order
+        # storage, and Slant fulfillment continue even when this is unset or
+        # unavailable.
+        database_url = env_str("DATABASE_URL")
 
         # ✅ NEW: Daily quota config (cap orders/day)
         daily_order_cap = safe_int(env_str("SLANT_DAILY_ORDER_CAP", "100"), 100)
@@ -241,6 +254,7 @@ class Config:
             public_base_url=public_base_url,
             upload_dir=upload_dir,
             order_data_path=order_data_path,
+            database_url=database_url,
             stripe_success_url_tmpl=success_tmpl,
             stripe_cancel_url_tmpl=cancel_tmpl,
             slant_enabled=slant_enabled,
@@ -276,6 +290,7 @@ class Config:
         print("   PUBLIC_BASE_URL:", cfg.public_base_url)
         print("   UPLOAD_DIR:", cfg.upload_dir)
         print("   ORDER_DATA_PATH:", cfg.order_data_path)
+        print("   PARTNER_DATABASE_CONFIGURED:", bool(cfg.database_url))
         print("   STRIPE_SUCCESS_URL:", cfg.stripe_success_url_tmpl)
         print("   STRIPE_CANCEL_URL:", cfg.stripe_cancel_url_tmpl)
         print("   SLANT_ENABLED:", cfg.slant_enabled)
@@ -326,6 +341,228 @@ def stl_path_for(job_id: str) -> str:
 
 def stl_exists(job_id: str) -> bool:
     return os.path.exists(stl_path_for(job_id))
+
+
+# ----------------------------
+# Partner reporting (PostgreSQL, best effort only)
+# ----------------------------
+class PartnerReportingStore:
+    """
+    Reporting-only PostgreSQL writer.
+
+    This class never owns fulfillment state. The JSON OrderStore below remains
+    the source of truth for checkout, uploads, Slant, shipping, and recovery.
+    """
+
+    def __init__(self, database_url: str, schema_path: str):
+        self.database_url = (database_url or "").strip()
+        self.schema_path = schema_path
+        self._schema_ready = False
+        self._schema_lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.database_url and psycopg is not None)
+
+    def _connect(self):
+        if not self.enabled:
+            raise RuntimeError("Partner PostgreSQL reporting is not configured")
+        return psycopg.connect(
+            self.database_url,
+            connect_timeout=3,
+            options="-c statement_timeout=5000",
+        )
+
+    def ensure_schema(self) -> bool:
+        if self._schema_ready:
+            return True
+        if not self.enabled:
+            return False
+
+        with self._schema_lock:
+            if self._schema_ready:
+                return True
+
+            with open(self.schema_path, "r", encoding="utf-8") as schema_file:
+                schema_sql = schema_file.read()
+
+            statements = [
+                statement.strip()
+                for statement in schema_sql.split(";")
+                if statement.strip()
+            ]
+
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    for statement in statements:
+                        cur.execute(statement)
+
+            self._schema_ready = True
+            print("✅ Partner PostgreSQL schema ready")
+            return True
+
+    def initialize_best_effort(self) -> None:
+        if not self.database_url:
+            print("🟡 Partner PostgreSQL reporting disabled: DATABASE_URL is not set")
+            return
+        if psycopg is None:
+            print("🟡 Partner PostgreSQL reporting disabled: psycopg is unavailable")
+            return
+
+        try:
+            self.ensure_schema()
+        except Exception as exc:
+            # A database problem must never prevent the fulfillment app from
+            # starting. A later paid order will try initialization again.
+            print(f"🟠 Partner PostgreSQL initialization skipped: {exc}")
+
+    def upsert_paid_order(
+        self,
+        *,
+        order_id: str,
+        stripe_session_id: str,
+        stripe_event_id: str,
+        salon_code: str,
+        stylist_code: str,
+        amount_subtotal_cents: int,
+        discount_cents: int,
+        tax_cents: int,
+        amount_total_cents: int,
+        currency: str,
+        payment_status: str,
+        livemode: bool,
+        paid_at: str,
+    ) -> None:
+        if not self.ensure_schema():
+            raise RuntimeError("Partner PostgreSQL reporting is unavailable")
+
+        order_id = (order_id or "").strip()
+        stripe_session_id = (stripe_session_id or "").strip()
+        stripe_event_id = (stripe_event_id or "").strip()
+        salon_code = (salon_code or "").strip()
+        stylist_code = (stylist_code or "").strip()
+
+        if not all(
+            (
+                order_id,
+                stripe_session_id,
+                stripe_event_id,
+                salon_code,
+                stylist_code,
+            )
+        ):
+            raise ValueError("Incomplete partner attribution data")
+
+        amount_subtotal_cents = max(0, int(amount_subtotal_cents or 0))
+        discount_cents = max(0, int(discount_cents or 0))
+        tax_cents = max(0, int(tax_cents or 0))
+        amount_total_cents = max(0, int(amount_total_cents or 0))
+        partner_revenue_cents = max(
+            0,
+            amount_subtotal_cents - discount_cents,
+        )
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        s.id,
+                        st.id,
+                        s.salon_share_cents,
+                        st.stylist_credit_cents
+                    FROM salons AS s
+                    JOIN stylists AS st
+                      ON st.salon_id = s.id
+                    WHERE s.salon_code = %s
+                      AND st.stylist_code = %s
+                      AND s.active = TRUE
+                      AND st.active = TRUE
+                    """,
+                    (salon_code, stylist_code),
+                )
+                partner = cur.fetchone()
+
+                if partner is None:
+                    raise LookupError(
+                        "No active salon/stylist record matches "
+                        f"{salon_code}/{stylist_code}"
+                    )
+
+                salon_db_id = int(partner[0])
+                stylist_db_id = int(partner[1])
+                salon_share_cents = int(partner[2] or 0)
+                stylist_credit_cents = int(partner[3] or 0)
+                krezzcut_share_cents = (
+                    partner_revenue_cents
+                    - salon_share_cents
+                    - stylist_credit_cents
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO partner_orders (
+                        order_id,
+                        stripe_checkout_session_id,
+                        stripe_event_id,
+                        salon_id,
+                        stylist_id,
+                        amount_subtotal_cents,
+                        discount_cents,
+                        tax_cents,
+                        amount_total_cents,
+                        partner_revenue_cents,
+                        stylist_credit_cents,
+                        salon_share_cents,
+                        krezzcut_share_cents,
+                        currency,
+                        payment_status,
+                        livemode,
+                        paid_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s
+                    )
+                    ON CONFLICT (order_id) DO UPDATE SET
+                        stripe_event_id = EXCLUDED.stripe_event_id,
+                        amount_subtotal_cents = EXCLUDED.amount_subtotal_cents,
+                        discount_cents = EXCLUDED.discount_cents,
+                        tax_cents = EXCLUDED.tax_cents,
+                        amount_total_cents = EXCLUDED.amount_total_cents,
+                        partner_revenue_cents = EXCLUDED.partner_revenue_cents,
+                        currency = EXCLUDED.currency,
+                        payment_status = EXCLUDED.payment_status,
+                        livemode = EXCLUDED.livemode,
+                        updated_at = NOW()
+                    """,
+                    (
+                        order_id,
+                        stripe_session_id,
+                        stripe_event_id,
+                        salon_db_id,
+                        stylist_db_id,
+                        amount_subtotal_cents,
+                        discount_cents,
+                        tax_cents,
+                        amount_total_cents,
+                        partner_revenue_cents,
+                        stylist_credit_cents,
+                        salon_share_cents,
+                        krezzcut_share_cents,
+                        (currency or "usd").strip().lower(),
+                        (payment_status or "unknown").strip(),
+                        bool(livemode),
+                        paid_at,
+                    ),
+                )
+
+        print(
+            f"✅ Partner reporting saved: order_id={order_id} "
+            f"salon={salon_code} stylist={stylist_code}"
+        )
 
 
 # ----------------------------
@@ -784,6 +1021,15 @@ QUOTA = DailyQuotaStore(
     reservation_ttl_sec=CFG.quota_reservation_ttl_sec,
     prune_days=CFG.quota_prune_days,
 )
+
+PARTNER_REPORTING = PartnerReportingStore(
+    database_url=CFG.database_url,
+    schema_path=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "schema.sql",
+    ),
+)
+PARTNER_REPORTING.initialize_best_effort()
 
 
 # ----------------------------
@@ -2718,6 +2964,66 @@ def stripe_webhook():
                 f"complete: order_id={order_id}"
             )
             return jsonify(success=True)
+
+        # Reporting-only partner attribution. Every exception is contained so
+        # PostgreSQL can never prevent quota handling or Slant fulfillment.
+        if salon_id and stylist_id:
+            try:
+                total_details = stripe_field(session, "total_details", {}) or {}
+                amount_total_cents = safe_int(
+                    stripe_field(session, "amount_total", 0),
+                    0,
+                )
+                amount_subtotal_cents = safe_int(
+                    stripe_field(
+                        session,
+                        "amount_subtotal",
+                        amount_total_cents,
+                    ),
+                    amount_total_cents,
+                )
+                discount_cents = safe_int(
+                    stripe_field(total_details, "amount_discount", 0),
+                    0,
+                )
+                tax_cents = safe_int(
+                    stripe_field(total_details, "amount_tax", 0),
+                    0,
+                )
+
+                paid_at = utc_iso()
+                event_created = stripe_field(stripe_event, "created", None)
+                if event_created is not None:
+                    try:
+                        paid_at = datetime.fromtimestamp(
+                            int(event_created),
+                            tz=timezone.utc,
+                        ).isoformat()
+                    except Exception:
+                        pass
+
+                PARTNER_REPORTING.upsert_paid_order(
+                    order_id=order_id,
+                    stripe_session_id=stripe_field(session, "id", "") or "",
+                    stripe_event_id=event_id or "",
+                    salon_code=salon_id,
+                    stylist_code=stylist_id,
+                    amount_subtotal_cents=amount_subtotal_cents,
+                    discount_cents=discount_cents,
+                    tax_cents=tax_cents,
+                    amount_total_cents=amount_total_cents,
+                    currency=stripe_field(session, "currency", "usd") or "usd",
+                    payment_status=payment_info.get("status") or "unknown",
+                    livemode=bool(
+                        stripe_field(session, "livemode", livemode)
+                    ),
+                    paid_at=paid_at,
+                )
+            except Exception as exc:
+                print(
+                    f"🟠 Partner reporting failed without blocking fulfillment: "
+                    f"order_id={order_id} error={exc}"
+                )
 
         if changed:
             q_day = (updated_order.get("quota_day") or "").strip() or QUOTA.day_key()
