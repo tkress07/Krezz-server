@@ -2437,6 +2437,23 @@ def create_checkout_session():
 
         order_id = (data.get("order_id") or "").strip() or str(uuid.uuid4())
 
+        salon_id = str(data.get("salon_id") or "").strip()
+        stylist_id = str(data.get("stylist_id") or "").strip()
+
+        if bool(salon_id) != bool(stylist_id):
+            return (
+                jsonify(
+                    {
+                        "error": "salon_id and stylist_id must be provided together",
+                    }
+                ),
+                400,
+            )
+
+        # Stripe metadata values must be strings and should stay compact.
+        if len(salon_id) > 200 or len(stylist_id) > 200:
+            return jsonify({"error": "Partner attribution value is too long"}), 400
+
         email = (shipping_info.get("email") or "").strip() or None
         if email:
             shipping_info["email"] = email
@@ -2497,6 +2514,8 @@ def create_checkout_session():
             {
                 "items": normalized_items,
                 "shipping": shipping_info,
+                "salon_id": salon_id,
+                "stylist_id": stylist_id,
                 "status": "created",
                 "created_at": utc_iso(),
                 "quota_day": quota_day,
@@ -2520,6 +2539,11 @@ def create_checkout_session():
 
         idem_key = f"checkout_{order_id}"
 
+        checkout_metadata = {"order_id": order_id}
+        if salon_id and stylist_id:
+            checkout_metadata["salon_id"] = salon_id
+            checkout_metadata["stylist_id"] = stylist_id
+
         session_kwargs = dict(
             payment_method_types=["card"],
             mode="payment",
@@ -2528,7 +2552,7 @@ def create_checkout_session():
             shipping_address_collection={"allowed_countries": ["US"]},
             success_url=build_success_url(order_id),
             cancel_url=build_cancel_url(order_id),
-            metadata={"order_id": order_id},
+            metadata=checkout_metadata,
             client_reference_id=order_id,
             idempotency_key=idem_key,
         )
@@ -2603,6 +2627,8 @@ def stripe_webhook():
 
         metadata = stripe_field(session, "metadata", {}) or {}
         order_id = (stripe_field(metadata, "order_id", "") or "").strip()
+        salon_id = (stripe_field(metadata, "salon_id", "") or "").strip()
+        stylist_id = (stripe_field(metadata, "stylist_id", "") or "").strip()
 
         if not order_id:
             print("❌ Missing order_id in Stripe metadata")
@@ -2614,6 +2640,12 @@ def stripe_webhook():
                 return order_obj, False
 
             order_obj["stripe_event_ids"] = (seen + [event_id])[-20:]
+
+            # Preserve the attribution carried by the paid Checkout Session.
+            # Existing stored values remain untouched for non-partner orders.
+            if salon_id and stylist_id:
+                order_obj["salon_id"] = salon_id
+                order_obj["stylist_id"] = stylist_id
 
             cd = stripe_field(session, "customer_details", {}) or {}
             email = (
@@ -2855,6 +2887,8 @@ def get_order_data(order_id):
     return jsonify(
         {
             "order_id": order_id,
+            "salon_id": data.get("salon_id", ""),
+            "stylist_id": data.get("stylist_id", ""),
             "status": data.get("status", "created"),
             "payment": data.get("payment", {}),
             "items": data.get("items", []),
