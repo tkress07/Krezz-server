@@ -1,4 +1,5 @@
-Flask 
-gunicorn 
-requests 
+Flask
+gunicorn
+requests
 stripe
+psycopg[binary]>=3.2,<4
