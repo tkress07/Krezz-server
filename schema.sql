@@ -1,11 +1,12 @@
--- Krezzcut partner reporting schema
--- Contains partner attribution and financial reporting data only.
+-- Krezzcut partner reporting and dashboard schema
+-- This migration is additive and idempotent. It never drops a table or row.
 -- Customer identity, shipping details, and STL data do not belong here.
 
 CREATE TABLE IF NOT EXISTS salons (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     salon_code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
+    location_label TEXT NOT NULL DEFAULT '',
     salon_share_cents INTEGER NOT NULL DEFAULT 0
         CHECK (salon_share_cents >= 0),
     active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -13,6 +14,9 @@ CREATE TABLE IF NOT EXISTS salons (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CHECK (salon_code ~ '^[a-z0-9][a-z0-9_-]*$')
 );
+
+ALTER TABLE salons
+    ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS stylists (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -65,25 +69,54 @@ CREATE TABLE IF NOT EXISTS partner_orders (
         ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS salon_users (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    salon_id BIGINT NOT NULL
+        REFERENCES salons(id) ON DELETE RESTRICT,
+    email TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    failed_login_count INTEGER NOT NULL DEFAULT 0
+        CHECK (failed_login_count >= 0),
+    locked_until TIMESTAMPTZ,
+    last_login_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS partner_orders_salon_paid_at_idx
     ON partner_orders (salon_id, paid_at DESC);
 
 CREATE INDEX IF NOT EXISTS partner_orders_stylist_paid_at_idx
     ON partner_orders (stylist_id, paid_at DESC);
 
--- Current pilot partner. These inserts are idempotent and will not overwrite
--- later changes made to names, active status, or reporting amounts.
+CREATE UNIQUE INDEX IF NOT EXISTS salon_users_email_lower_uidx
+    ON salon_users (LOWER(email));
+
+CREATE INDEX IF NOT EXISTS salon_users_salon_id_idx
+    ON salon_users (salon_id);
+
+-- Current pilot partner. These statements never overwrite existing records.
 INSERT INTO salons (
     salon_code,
     name,
+    location_label,
     salon_share_cents
 )
 VALUES (
     'supercuts_orange_ct',
-    'Supercuts - Orange, CT',
+    'Supercuts',
+    'Orange, CT',
     500
 )
 ON CONFLICT (salon_code) DO NOTHING;
+
+UPDATE salons
+SET
+    location_label = 'Orange, CT',
+    updated_at = NOW()
+WHERE salon_code = 'supercuts_orange_ct'
+  AND COALESCE(location_label, '') = '';
 
 INSERT INTO stylists (
     salon_id,
