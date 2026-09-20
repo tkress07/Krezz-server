@@ -11,6 +11,7 @@ import traceback
 import hmac
 import hashlib
 import shutil
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -21,9 +22,22 @@ except Exception:
 from typing import Any, Dict, List, Optional, Tuple
 
 import fcntl
+import click
 import requests
 import stripe
-from flask import Flask, request, jsonify, send_file, abort, make_response
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    send_file,
+    abort,
+    make_response,
+    render_template,
+    redirect,
+    url_for,
+    session,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
     import psycopg
@@ -32,7 +46,7 @@ except Exception:
     # the PostgreSQL driver is unavailable for any reason.
     psycopg = None
 
-APP_VERSION = "KrezzServer/2.1.0-partner-reporting"
+APP_VERSION = "KrezzServer/2.2.0-partner-dashboard"
 
 app = Flask(__name__)
 
@@ -126,6 +140,7 @@ class Config:
     upload_dir: str
     order_data_path: str
     database_url: str
+    partner_session_secret: str
 
     stripe_success_url_tmpl: str
     stripe_cancel_url_tmpl: str
@@ -190,6 +205,7 @@ class Config:
         # storage, and Slant fulfillment continue even when this is unset or
         # unavailable.
         database_url = env_str("DATABASE_URL")
+        partner_session_secret = env_str("PARTNER_SESSION_SECRET")
 
         # ✅ NEW: Daily quota config (cap orders/day)
         daily_order_cap = safe_int(env_str("SLANT_DAILY_ORDER_CAP", "100"), 100)
@@ -255,6 +271,7 @@ class Config:
             upload_dir=upload_dir,
             order_data_path=order_data_path,
             database_url=database_url,
+            partner_session_secret=partner_session_secret,
             stripe_success_url_tmpl=success_tmpl,
             stripe_cancel_url_tmpl=cancel_tmpl,
             slant_enabled=slant_enabled,
@@ -291,6 +308,7 @@ class Config:
         print("   UPLOAD_DIR:", cfg.upload_dir)
         print("   ORDER_DATA_PATH:", cfg.order_data_path)
         print("   PARTNER_DATABASE_CONFIGURED:", bool(cfg.database_url))
+        print("   PARTNER_DASHBOARD_CONFIGURED:", bool(cfg.partner_session_secret))
         print("   STRIPE_SUCCESS_URL:", cfg.stripe_success_url_tmpl)
         print("   STRIPE_CANCEL_URL:", cfg.stripe_cancel_url_tmpl)
         print("   SLANT_ENABLED:", cfg.slant_enabled)
@@ -322,6 +340,18 @@ class Config:
 
 CFG = Config.load()
 stripe.api_key = CFG.stripe_secret_key
+
+# The random fallback keeps Flask's session machinery safe if the dashboard
+# secret has not been configured, but dashboard routes remain disabled until
+# PARTNER_SESSION_SECRET is explicitly set.
+app.config.update(
+    SECRET_KEY=CFG.partner_session_secret or secrets.token_hex(32),
+    SESSION_COOKIE_NAME="krezz_partner_session",
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
 
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_VERSION})
@@ -2373,6 +2403,491 @@ def _build_monitor_status() -> Dict[str, Any]:
 
 
 # ----------------------------
+# Partner dashboard
+# ----------------------------
+PARTNER_LOGIN_MAX_FAILURES = 5
+PARTNER_LOGIN_LOCK_MINUTES = 15
+PARTNER_PAID_STATUSES = ("paid", "no_payment_required")
+_PARTNER_DUMMY_PASSWORD_HASH = generate_password_hash(
+    secrets.token_urlsafe(32)
+)
+
+
+def _partner_dashboard_ready() -> bool:
+    return bool(
+        (CFG.partner_session_secret or "").strip()
+        and PARTNER_REPORTING.enabled
+    )
+
+
+def _partner_connection():
+    if not _partner_dashboard_ready():
+        raise RuntimeError("Partner dashboard is not configured")
+    if not PARTNER_REPORTING.ensure_schema():
+        raise RuntimeError("Partner reporting database is unavailable")
+    return PARTNER_REPORTING._connect()
+
+
+def _partner_csrf_token() -> str:
+    token = str(session.get("partner_csrf_token") or "").strip()
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["partner_csrf_token"] = token
+    return token
+
+
+def _partner_valid_csrf() -> bool:
+    expected = str(session.get("partner_csrf_token") or "")
+    supplied = str(request.form.get("csrf_token") or "")
+    return bool(expected and supplied) and hmac.compare_digest(
+        expected,
+        supplied,
+    )
+
+
+def _partner_current_user() -> Optional[Dict[str, Any]]:
+    user_id = safe_int(session.get("partner_user_id"), 0)
+    if user_id <= 0:
+        return None
+
+    with _partner_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    u.id,
+                    u.salon_id,
+                    u.email,
+                    s.salon_code,
+                    s.name,
+                    s.location_label
+                FROM salon_users AS u
+                JOIN salons AS s
+                  ON s.id = u.salon_id
+                WHERE u.id = %s
+                  AND u.active = TRUE
+                  AND s.active = TRUE
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "user_id": int(row[0]),
+        "salon_id": int(row[1]),
+        "email": str(row[2]),
+        "salon_code": str(row[3]),
+        "salon_name": str(row[4]),
+        "location_label": str(row[5] or ""),
+    }
+
+
+def _money(cents: Any) -> str:
+    value = safe_int(cents, 0)
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value) / 100:,.2f}"
+
+
+app.jinja_env.filters["money"] = _money
+
+
+@app.after_request
+def _partner_security_headers(response):
+    if request.path == "/partner" or request.path.startswith("/partner/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=()"
+        )
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'"
+        )
+    return response
+
+
+@app.cli.command("set-partner-login")
+@click.option("--salon-code", required=True, help="Salon code from salons.salon_code")
+@click.option("--email", prompt=True, help="Partner login email")
+@click.password_option(confirmation_prompt=True)
+def set_partner_login_command(
+    salon_code: str,
+    email: str,
+    password: str,
+) -> None:
+    """Create or reset a salon dashboard login."""
+    salon_code = (salon_code or "").strip()
+    email = (email or "").strip().lower()
+
+    if not salon_code:
+        raise click.ClickException("Salon code is required")
+    if len(email) > 254 or "@" not in email:
+        raise click.ClickException("Enter a valid email address")
+    if len(password or "") < 12:
+        raise click.ClickException("Password must contain at least 12 characters")
+
+    if not PARTNER_REPORTING.enabled:
+        raise click.ClickException("DATABASE_URL is not configured")
+
+    try:
+        PARTNER_REPORTING.ensure_schema()
+        password_hash = generate_password_hash(password)
+
+        with PARTNER_REPORTING._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM salons
+                    WHERE salon_code = %s
+                      AND active = TRUE
+                    """,
+                    (salon_code,),
+                )
+                salon_row = cur.fetchone()
+                if salon_row is None:
+                    raise click.ClickException(
+                        f"No active salon found for code: {salon_code}"
+                    )
+
+                salon_id = int(salon_row[0])
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM salon_users
+                    WHERE LOWER(email) = LOWER(%s)
+                    """,
+                    (email,),
+                )
+                user_row = cur.fetchone()
+
+                if user_row is None:
+                    cur.execute(
+                        """
+                        INSERT INTO salon_users (
+                            salon_id,
+                            email,
+                            password_hash
+                        )
+                        VALUES (%s, %s, %s)
+                        """,
+                        (salon_id, email, password_hash),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE salon_users
+                        SET
+                            salon_id = %s,
+                            email = %s,
+                            password_hash = %s,
+                            active = TRUE,
+                            failed_login_count = 0,
+                            locked_until = NULL,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            salon_id,
+                            email,
+                            password_hash,
+                            int(user_row[0]),
+                        ),
+                    )
+    except click.ClickException:
+        raise
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Partner login ready for {salon_code}: {email}")
+
+
+@app.route("/partner/login", methods=["GET", "POST"])
+def partner_login():
+    if not _partner_dashboard_ready():
+        return (
+            render_template(
+                "partner.html",
+                mode="unavailable",
+                error=(
+                    "Partner dashboard setup is incomplete. "
+                    "Please contact Krezzcut."
+                ),
+            ),
+            503,
+        )
+
+    try:
+        current_user = _partner_current_user()
+    except Exception as exc:
+        print(f"🟠 Partner login database check failed: {exc}")
+        current_user = None
+
+    if request.method == "GET" and current_user is not None:
+        return redirect(url_for("partner_dashboard"))
+
+    error = ""
+    email = ""
+
+    if request.method == "POST":
+        if not _partner_valid_csrf():
+            return (
+                render_template(
+                    "partner.html",
+                    mode="login",
+                    error="Your session expired. Please try again.",
+                    email="",
+                    csrf_token=_partner_csrf_token(),
+                ),
+                400,
+            )
+
+        email = (request.form.get("email") or "").strip().lower()
+        password = request.form.get("password") or ""
+
+        if len(email) > 254 or len(password) > 1024:
+            error = "Email or password is incorrect."
+        else:
+            try:
+                with _partner_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT
+                                u.id,
+                                u.password_hash,
+                                u.active,
+                                s.active,
+                                (
+                                    u.locked_until IS NOT NULL
+                                    AND u.locked_until > NOW()
+                                ) AS is_locked
+                            FROM salon_users AS u
+                            JOIN salons AS s
+                              ON s.id = u.salon_id
+                            WHERE LOWER(u.email) = LOWER(%s)
+                            LIMIT 1
+                            """,
+                            (email,),
+                        )
+                        user_row = cur.fetchone()
+
+                        if user_row is None:
+                            check_password_hash(
+                                _PARTNER_DUMMY_PASSWORD_HASH,
+                                password,
+                            )
+                            error = "Email or password is incorrect."
+                        else:
+                            user_id = int(user_row[0])
+                            password_ok = check_password_hash(
+                                str(user_row[1]),
+                                password,
+                            )
+                            account_active = bool(user_row[2]) and bool(user_row[3])
+                            is_locked = bool(user_row[4])
+
+                            if not password_ok or not account_active or is_locked:
+                                if not password_ok and not is_locked:
+                                    cur.execute(
+                                        """
+                                        UPDATE salon_users
+                                        SET
+                                            failed_login_count = failed_login_count + 1,
+                                            locked_until = CASE
+                                                WHEN failed_login_count + 1 >= %s
+                                                THEN NOW() + (%s * INTERVAL '1 minute')
+                                                ELSE locked_until
+                                            END,
+                                            updated_at = NOW()
+                                        WHERE id = %s
+                                        """,
+                                        (
+                                            PARTNER_LOGIN_MAX_FAILURES,
+                                            PARTNER_LOGIN_LOCK_MINUTES,
+                                            user_id,
+                                        ),
+                                    )
+                                error = "Email or password is incorrect."
+                            else:
+                                cur.execute(
+                                    """
+                                    UPDATE salon_users
+                                    SET
+                                        failed_login_count = 0,
+                                        locked_until = NULL,
+                                        last_login_at = NOW(),
+                                        updated_at = NOW()
+                                    WHERE id = %s
+                                    """,
+                                    (user_id,),
+                                )
+
+                                session.clear()
+                                session["partner_user_id"] = user_id
+                                session["partner_csrf_token"] = (
+                                    secrets.token_urlsafe(32)
+                                )
+                                session.permanent = True
+                                return redirect(url_for("partner_dashboard"))
+            except Exception as exc:
+                print(f"🟠 Partner login failed safely: {exc}")
+                error = "The dashboard is temporarily unavailable."
+
+    return render_template(
+        "partner.html",
+        mode="login",
+        error=error,
+        email=email,
+        csrf_token=_partner_csrf_token(),
+    )
+
+
+@app.route("/partner/logout", methods=["POST"])
+def partner_logout():
+    if not _partner_valid_csrf():
+        abort(400)
+    session.clear()
+    return redirect(url_for("partner_login"))
+
+
+@app.route("/partner", methods=["GET"])
+def partner_dashboard():
+    if not _partner_dashboard_ready():
+        return redirect(url_for("partner_login"))
+
+    try:
+        current_user = _partner_current_user()
+        if current_user is None:
+            session.clear()
+            return redirect(url_for("partner_login"))
+
+        salon_id = int(current_user["salon_id"])
+        with _partner_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*)::BIGINT,
+                        COALESCE(SUM(amount_total_cents), 0)::BIGINT,
+                        COALESCE(SUM(stylist_credit_cents), 0)::BIGINT,
+                        COALESCE(SUM(salon_share_cents), 0)::BIGINT
+                    FROM partner_orders
+                    WHERE salon_id = %s
+                      AND livemode = TRUE
+                      AND payment_status IN ('paid', 'no_payment_required')
+                    """,
+                    (salon_id,),
+                )
+                totals_row = cur.fetchone() or (0, 0, 0, 0)
+
+                cur.execute(
+                    """
+                    SELECT
+                        st.display_name,
+                        st.stylist_code,
+                        COUNT(po.order_id)::BIGINT,
+                        COALESCE(SUM(po.amount_total_cents), 0)::BIGINT,
+                        COALESCE(SUM(po.stylist_credit_cents), 0)::BIGINT,
+                        COALESCE(SUM(po.salon_share_cents), 0)::BIGINT
+                    FROM stylists AS st
+                    LEFT JOIN partner_orders AS po
+                      ON po.stylist_id = st.id
+                     AND po.salon_id = st.salon_id
+                     AND po.livemode = TRUE
+                     AND po.payment_status IN ('paid', 'no_payment_required')
+                    WHERE st.salon_id = %s
+                    GROUP BY st.id, st.display_name, st.stylist_code
+                    ORDER BY
+                        COUNT(po.order_id) DESC,
+                        st.display_name ASC
+                    """,
+                    (salon_id,),
+                )
+                stylist_rows = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT
+                        po.order_id,
+                        po.paid_at,
+                        st.display_name,
+                        po.amount_total_cents,
+                        po.payment_status
+                    FROM partner_orders AS po
+                    JOIN stylists AS st
+                      ON st.id = po.stylist_id
+                     AND st.salon_id = po.salon_id
+                    WHERE po.salon_id = %s
+                      AND po.livemode = TRUE
+                      AND po.payment_status IN ('paid', 'no_payment_required')
+                    ORDER BY po.paid_at DESC
+                    LIMIT 50
+                    """,
+                    (salon_id,),
+                )
+                order_rows = cur.fetchall()
+
+        totals = {
+            "paid_sales": int(totals_row[0] or 0),
+            "customer_revenue_cents": int(totals_row[1] or 0),
+            "stylist_credits_cents": int(totals_row[2] or 0),
+            "salon_share_cents": int(totals_row[3] or 0),
+        }
+        stylists = [
+            {
+                "display_name": str(row[0]),
+                "stylist_code": str(row[1]),
+                "sales": int(row[2] or 0),
+                "customer_revenue_cents": int(row[3] or 0),
+                "stylist_credits_cents": int(row[4] or 0),
+                "salon_share_cents": int(row[5] or 0),
+            }
+            for row in stylist_rows
+        ]
+        orders = [
+            {
+                "order_id": str(row[0]),
+                "paid_at": row[1],
+                "stylist_name": str(row[2]),
+                "amount_total_cents": int(row[3] or 0),
+                "payment_status": str(row[4] or "unknown"),
+            }
+            for row in order_rows
+        ]
+
+        return render_template(
+            "partner.html",
+            mode="dashboard",
+            current_user=current_user,
+            totals=totals,
+            stylists=stylists,
+            orders=orders,
+            csrf_token=_partner_csrf_token(),
+        )
+    except Exception as exc:
+        print(f"🟠 Partner dashboard failed safely: {exc}")
+        return (
+            render_template(
+                "partner.html",
+                mode="unavailable",
+                error="The dashboard is temporarily unavailable.",
+            ),
+            503,
+        )
+
+
+# ----------------------------
 # Routes
 # ----------------------------
 @app.route("/")
@@ -2402,6 +2917,8 @@ def health():
             "build_marker": "presigned-direct-upload-public-monitor-admin-2026-07-17",
             "monitor_configured": bool((CFG.monitor_api_key or "").strip()),
             "admin_configured": bool((CFG.admin_api_key or "").strip()),
+            "partner_reporting_configured": PARTNER_REPORTING.enabled,
+            "partner_dashboard_configured": _partner_dashboard_ready(),
             "public_monitor_enabled": True,
             "monitor_stuck_minutes": CFG.monitor_stuck_minutes,
             "monitor_lookback_hours": CFG.monitor_lookback_hours,
