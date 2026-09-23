@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import io
 import uuid
 import json
 import time
@@ -12,6 +13,8 @@ import hmac
 import hashlib
 import shutil
 import secrets
+from functools import lru_cache
+from urllib.parse import urlencode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import fcntl
 import click
+import qrcode
 import requests
 import stripe
 from flask import (
@@ -46,7 +50,7 @@ except Exception:
     # the PostgreSQL driver is unavailable for any reason.
     psycopg = None
 
-APP_VERSION = "KrezzServer/2.3.0-multi-salon-dashboard"
+APP_VERSION = "KrezzServer/2.4.0-partner-qr-library"
 
 app = Flask(__name__)
 
@@ -2408,6 +2412,7 @@ def _build_monitor_status() -> Dict[str, Any]:
 PARTNER_LOGIN_MAX_FAILURES = 5
 PARTNER_LOGIN_LOCK_MINUTES = 15
 PARTNER_PAID_STATUSES = ("paid", "no_payment_required")
+PARTNER_LINK_BASE_URL = "https://krezzcut.com/p"
 _PARTNER_DUMMY_PASSWORD_HASH = generate_password_hash(
     secrets.token_urlsafe(32)
 )
@@ -2514,6 +2519,33 @@ def _money(cents: Any) -> str:
     return f"{sign}${abs(value) / 100:,.2f}"
 
 
+def _partner_link(salon_code: str, stylist_code: str) -> str:
+    query = urlencode(
+        {
+            "salon_id": salon_code,
+            "stylist_id": stylist_code,
+        }
+    )
+    return f"{PARTNER_LINK_BASE_URL}?{query}"
+
+
+@lru_cache(maxsize=2048)
+def _partner_qr_png_bytes(partner_link: str) -> bytes:
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=12,
+        border=4,
+    )
+    qr.add_data(partner_link)
+    qr.make(fit=True)
+
+    image = qr.make_image(fill_color="black", back_color="white")
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 app.jinja_env.filters["money"] = _money
 
 
@@ -2530,6 +2562,7 @@ def _partner_security_headers(response):
         )
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
+            "script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; "
             "form-action 'self'; "
@@ -2886,6 +2919,148 @@ def partner_logout():
     return redirect(url_for("partner_login"))
 
 
+@app.route("/partner/qr-library.js", methods=["GET"])
+def partner_qr_library_script():
+    response = make_response(
+        r"""
+(() => {
+  "use strict";
+
+  const copyText = async (value) => {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+
+    const input = document.createElement("textarea");
+    input.value = value;
+    input.setAttribute("readonly", "");
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    const copied = document.execCommand("copy");
+    input.remove();
+    if (!copied) {
+      throw new Error("Copy failed");
+    }
+  };
+
+  document.addEventListener("click", async (event) => {
+    const copyButton = event.target.closest("[data-copy-link]");
+    if (copyButton) {
+      const originalLabel = copyButton.textContent;
+      try {
+        await copyText(copyButton.dataset.copyLink || "");
+        copyButton.textContent = "Copied!";
+      } catch (_error) {
+        copyButton.textContent = "Select link to copy";
+        const field = copyButton
+          .closest(".qr-link-row")
+          ?.querySelector(".qr-link-field");
+        if (field) {
+          field.focus();
+          field.select();
+        }
+      }
+      window.setTimeout(() => {
+        copyButton.textContent = originalLabel;
+      }, 1800);
+      return;
+    }
+
+    const printButton = event.target.closest("[data-print-card]");
+    if (printButton) {
+      const source = document.getElementById(printButton.dataset.printCard || "");
+      const printArea = document.getElementById("qr-print-area");
+      if (!source || !printArea) {
+        return;
+      }
+
+      printArea.replaceChildren(source.cloneNode(true));
+      document.body.classList.add("qr-printing");
+      const preview = printArea.querySelector("img");
+      const openPrintDialog = () => window.setTimeout(() => window.print(), 80);
+      if (preview && !preview.complete) {
+        preview.addEventListener("load", openPrintDialog, { once: true });
+        preview.addEventListener("error", openPrintDialog, { once: true });
+      } else {
+        openPrintDialog();
+      }
+    }
+  });
+
+  window.addEventListener("afterprint", () => {
+    document.body.classList.remove("qr-printing");
+    document.getElementById("qr-print-area")?.replaceChildren();
+  });
+})();
+""".strip()
+    )
+    response.headers["Content-Type"] = "application/javascript; charset=utf-8"
+    return response
+
+
+@app.route(
+    "/partner/qr/<salon_code>/<stylist_code>.png",
+    methods=["GET"],
+)
+def partner_qr_png(salon_code: str, stylist_code: str):
+    if not _partner_dashboard_ready():
+        abort(503)
+
+    try:
+        current_user = _partner_current_user()
+        if current_user is None:
+            session.clear()
+            return redirect(url_for("partner_login"))
+
+        with _partner_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM salon_user_access AS access
+                    JOIN salons AS s
+                      ON s.id = access.salon_id
+                     AND s.active = TRUE
+                    JOIN stylists AS st
+                      ON st.salon_id = s.id
+                     AND st.active = TRUE
+                    WHERE access.user_id = %s
+                      AND access.active = TRUE
+                      AND s.salon_code = %s
+                      AND st.stylist_code = %s
+                    LIMIT 1
+                    """,
+                    (
+                        int(current_user["user_id"]),
+                        salon_code,
+                        stylist_code,
+                    ),
+                )
+                if cur.fetchone() is None:
+                    abort(404)
+
+        partner_link = _partner_link(salon_code, stylist_code)
+        png_bytes = _partner_qr_png_bytes(partner_link)
+        download = request.args.get("download") == "1"
+        filename = f"{salon_code}-{stylist_code}-krezzcut-qr.png"
+
+        return send_file(
+            io.BytesIO(png_bytes),
+            mimetype="image/png",
+            as_attachment=download,
+            download_name=filename,
+            max_age=0,
+        )
+    except Exception as exc:
+        if getattr(exc, "code", None) in (404, 503):
+            raise
+        print(f"🟠 Partner QR generation failed safely: {exc}")
+        abort(503)
+
+
 @app.route("/partner", methods=["GET"])
 def partner_dashboard():
     if not _partner_dashboard_ready():
@@ -2982,6 +3157,33 @@ def partner_dashboard():
                     (user_id,),
                 )
                 salon_rows = cur.fetchall()
+
+                cur.execute(
+                    """
+                    SELECT
+                        s.salon_code,
+                        s.name,
+                        s.location_label,
+                        st.stylist_code,
+                        st.display_name
+                    FROM salon_user_access AS access
+                    JOIN salons AS s
+                      ON s.id = access.salon_id
+                     AND s.active = TRUE
+                    JOIN stylists AS st
+                      ON st.salon_id = s.id
+                     AND st.active = TRUE
+                    WHERE access.user_id = %s
+                      AND access.active = TRUE
+                    ORDER BY
+                        s.name ASC,
+                        s.location_label ASC,
+                        st.display_name ASC,
+                        st.id ASC
+                    """,
+                    (user_id,),
+                )
+                qr_rows = cur.fetchall()
 
                 stylist_rows = []
                 if selected_salon_id is not None:
@@ -3081,6 +3283,34 @@ def partner_dashboard():
             }
             for row in stylist_rows
         ]
+        qr_stylists = []
+        for row in qr_rows:
+            salon_code = str(row[0])
+            stylist_code = str(row[3])
+            qr_stylists.append(
+                {
+                    "salon_code": salon_code,
+                    "salon_name": str(row[1]),
+                    "location_label": str(row[2] or ""),
+                    "stylist_code": stylist_code,
+                    "display_name": str(row[4]),
+                    "partner_link": _partner_link(
+                        salon_code,
+                        stylist_code,
+                    ),
+                    "qr_preview_url": url_for(
+                        "partner_qr_png",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                    ),
+                    "qr_download_url": url_for(
+                        "partner_qr_png",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                        download="1",
+                    ),
+                }
+            )
         orders = [
             {
                 "order_id": str(row[0]),
@@ -3102,6 +3332,7 @@ def partner_dashboard():
             salon_breakdown=salon_breakdown,
             selected_salon=selected_salon,
             stylists=stylists,
+            qr_stylists=qr_stylists,
             orders=orders,
             csrf_token=_partner_csrf_token(),
         )
