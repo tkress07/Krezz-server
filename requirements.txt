@@ -3,3 +3,4 @@ gunicorn
 requests
 stripe
 psycopg[binary]>=3.2,<4
+qrcode[pil]>=8,<9
