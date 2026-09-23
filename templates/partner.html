@@ -124,6 +124,41 @@
       color: var(--muted);
     }
 
+    .account {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-top: 4px;
+    }
+
+    .location-switcher {
+      margin-bottom: 26px;
+    }
+
+    .location-switcher h2 {
+      margin-bottom: 10px;
+    }
+
+    .location-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+    }
+
+    .location-pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      padding: 8px 13px;
+      text-decoration: none;
+    }
+
+    .location-pill:hover,
+    .location-pill.active {
+      border-color: var(--gold-deep);
+      background: rgba(224, 186, 108, 0.1);
+      color: var(--gold);
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -167,6 +202,24 @@
     .panel {
       margin-top: 16px;
       padding: 22px;
+    }
+
+    .panel-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .panel-heading h2,
+    .panel-heading p {
+      margin-bottom: 0;
+    }
+
+    .table-link {
+      font-weight: 700;
+      text-decoration: none;
     }
 
     .table-wrap {
@@ -308,6 +361,11 @@
         flex-direction: column;
       }
 
+      .panel-heading {
+        align-items: start;
+        flex-direction: column;
+      }
+
       .grid {
         grid-template-columns: 1fr;
       }
@@ -334,6 +392,7 @@
         <div>
           <div class="brand">Krezzcut</div>
           <span class="partner-label">Partner reporting</span>
+          <div class="account">{{ current_user.email }}</div>
         </div>
         <form class="logout-form" method="post" action="{{ url_for('partner_logout') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -343,71 +402,157 @@
 
       <section class="hero">
         <div>
-          <h1>{{ current_user.salon_name }}</h1>
-          <div class="location">{{ current_user.location_label or current_user.salon_code }}</div>
+          {% if selected_salon %}
+            <h1>{{ selected_salon.salon_name }}</h1>
+            <div class="location">
+              {{ selected_salon.location_label or selected_salon.salon_code }}
+            </div>
+          {% else %}
+            <h1>All locations</h1>
+            <div class="location">
+              {{ current_user.salon_count }} assigned salons
+            </div>
+          {% endif %}
         </div>
         <div class="muted">Live sales only · Refresh for new activity</div>
       </section>
 
-      <section class="grid" aria-label="Salon totals">
+      {% if current_user.salon_count > 1 %}
+        <nav class="location-switcher" aria-label="Choose a salon">
+          <h2>Locations</h2>
+          <div class="location-pills">
+            <a
+              class="location-pill{% if not selected_salon %} active{% endif %}"
+              href="{{ url_for('partner_dashboard') }}"
+            >All locations</a>
+            {% for salon in current_user.salons %}
+              <a
+                class="location-pill{% if selected_salon and selected_salon.salon_code == salon.salon_code %} active{% endif %}"
+                href="{{ url_for('partner_dashboard', salon=salon.salon_code) }}"
+              >{{ salon.salon_name }} · {{ salon.location_label or salon.salon_code }}</a>
+            {% endfor %}
+          </div>
+        </nav>
+      {% endif %}
+
+      <section class="grid" aria-label="Combined totals">
         <article class="metric">
-          <span class="metric-label">Total paid Krezzcut sales</span>
+          <span class="metric-label">Combined paid Krezzcut sales</span>
           <strong class="metric-value">{{ totals.paid_sales }}</strong>
         </article>
         <article class="metric">
-          <span class="metric-label">Total customer revenue</span>
+          <span class="metric-label">Combined customer revenue</span>
           <strong class="metric-value">{{ totals.customer_revenue_cents | money }}</strong>
         </article>
         <article class="metric">
-          <span class="metric-label">Total stylist credits</span>
+          <span class="metric-label">Combined stylist credits</span>
           <strong class="metric-value">{{ totals.stylist_credits_cents | money }}</strong>
         </article>
         <article class="metric">
-          <span class="metric-label">Total salon share</span>
+          <span class="metric-label">Combined salon share</span>
           <strong class="metric-value">{{ totals.salon_share_cents | money }}</strong>
         </article>
       </section>
 
       <section class="panel">
-        <h2>Sales by stylist</h2>
-        {% if stylists %}
+        <div class="panel-heading">
+          <h2>Sales by salon</h2>
+          <p class="muted">Select a salon to view its stylists</p>
+        </div>
+        {% if salon_breakdown %}
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Stylist</th>
+                  <th>Salon</th>
+                  <th>Location</th>
                   <th class="number">Sales</th>
                   <th class="number">Customer revenue</th>
-                  <th class="number">Stylist credit</th>
+                  <th class="number">Stylist credits</th>
                   <th class="number">Salon share</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
-                {% for stylist in stylists %}
+                {% for salon in salon_breakdown %}
                   <tr>
-                    <td>{{ stylist.display_name }}</td>
-                    <td class="number">{{ stylist.sales }}</td>
-                    <td class="number">{{ stylist.customer_revenue_cents | money }}</td>
-                    <td class="number">{{ stylist.stylist_credits_cents | money }}</td>
-                    <td class="number">{{ stylist.salon_share_cents | money }}</td>
+                    <td>{{ salon.salon_name }}</td>
+                    <td>{{ salon.location_label or salon.salon_code }}</td>
+                    <td class="number">{{ salon.paid_sales }}</td>
+                    <td class="number">{{ salon.customer_revenue_cents | money }}</td>
+                    <td class="number">{{ salon.stylist_credits_cents | money }}</td>
+                    <td class="number">{{ salon.salon_share_cents | money }}</td>
+                    <td>
+                      <a
+                        class="table-link"
+                        href="{{ url_for('partner_dashboard', salon=salon.salon_code) }}"
+                      >View</a>
+                    </td>
                   </tr>
                 {% endfor %}
               </tbody>
             </table>
           </div>
         {% else %}
-          <p class="empty">No stylists have been added yet.</p>
+          <p class="empty">No active salons are assigned to this login.</p>
         {% endif %}
       </section>
 
+      {% if selected_salon %}
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Stylist performance</h2>
+            <p class="muted">{{ selected_salon.salon_name }}</p>
+          </div>
+          {% if stylists %}
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Stylist</th>
+                    <th class="number">Sales</th>
+                    <th class="number">Customer revenue</th>
+                    <th class="number">Stylist credit</th>
+                    <th class="number">Salon share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for stylist in stylists %}
+                    <tr>
+                      <td>{{ stylist.display_name }}</td>
+                      <td class="number">{{ stylist.sales }}</td>
+                      <td class="number">{{ stylist.customer_revenue_cents | money }}</td>
+                      <td class="number">{{ stylist.stylist_credits_cents | money }}</td>
+                      <td class="number">{{ stylist.salon_share_cents | money }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="empty">No stylists have been added to this salon yet.</p>
+          {% endif %}
+        </section>
+      {% endif %}
+
       <section class="panel">
-        <h2>Recent orders</h2>
+        <div class="panel-heading">
+          <h2>Recent orders</h2>
+          <p class="muted">
+            {% if selected_salon %}
+              {{ selected_salon.salon_name }}
+            {% else %}
+              All assigned salons
+            {% endif %}
+          </p>
+        </div>
         {% if orders %}
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Date</th>
+                  <th>Salon</th>
                   <th>Stylist</th>
                   <th>Order</th>
                   <th class="number">Amount paid</th>
@@ -418,6 +563,12 @@
                 {% for order in orders %}
                   <tr>
                     <td>{{ order.paid_at.strftime('%b %d, %Y · %I:%M %p') }} UTC</td>
+                    <td>
+                      {{ order.salon_name }}
+                      {% if order.location_label %}
+                        · {{ order.location_label }}
+                      {% endif %}
+                    </td>
                     <td>{{ order.stylist_name }}</td>
                     <td>{{ order.order_id }}</td>
                     <td class="number">{{ order.amount_total_cents | money }}</td>
@@ -448,7 +599,7 @@
 
         {% if mode == "login" %}
           <h1>Welcome back</h1>
-          <p class="muted">Sign in to view your salon's sales and stylist credits.</p>
+          <p class="muted">Sign in to view your salons, sales, and stylist credits.</p>
 
           {% if error %}
             <p class="error" role="alert">{{ error }}</p>
