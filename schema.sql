@@ -96,6 +96,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS salon_users_email_lower_uidx
 CREATE INDEX IF NOT EXISTS salon_users_salon_id_idx
     ON salon_users (salon_id);
 
+CREATE TABLE IF NOT EXISTS salon_user_access (
+    user_id BIGINT NOT NULL
+        REFERENCES salon_users(id) ON DELETE CASCADE,
+    salon_id BIGINT NOT NULL
+        REFERENCES salons(id) ON DELETE RESTRICT,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, salon_id)
+);
+
+CREATE INDEX IF NOT EXISTS salon_user_access_salon_id_idx
+    ON salon_user_access (salon_id);
+
+-- Preserve every existing login's current salon access. DO NOTHING is
+-- intentional: rerunning the schema must never reactivate revoked access.
+INSERT INTO salon_user_access (
+    user_id,
+    salon_id
+)
+SELECT
+    id,
+    salon_id
+FROM salon_users
+ON CONFLICT (user_id, salon_id) DO NOTHING;
+
 -- Current pilot partner. These statements never overwrite existing records.
 INSERT INTO salons (
     salon_code,
