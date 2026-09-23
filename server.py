@@ -46,7 +46,7 @@ except Exception:
     # the PostgreSQL driver is unavailable for any reason.
     psycopg = None
 
-APP_VERSION = "KrezzServer/2.2.0-partner-dashboard"
+APP_VERSION = "KrezzServer/2.3.0-multi-salon-dashboard"
 
 app = Flask(__name__)
 
@@ -2456,32 +2456,55 @@ def _partner_current_user() -> Optional[Dict[str, Any]]:
                 """
                 SELECT
                     u.id,
-                    u.salon_id,
-                    u.email,
-                    s.salon_code,
-                    s.name,
-                    s.location_label
+                    u.email
                 FROM salon_users AS u
-                JOIN salons AS s
-                  ON s.id = u.salon_id
                 WHERE u.id = %s
                   AND u.active = TRUE
-                  AND s.active = TRUE
                 """,
                 (user_id,),
             )
-            row = cur.fetchone()
+            user_row = cur.fetchone()
 
-    if row is None:
+            if user_row is None:
+                return None
+
+            cur.execute(
+                """
+                SELECT
+                    s.id,
+                    s.salon_code,
+                    s.name,
+                    s.location_label
+                FROM salon_user_access AS access
+                JOIN salons AS s
+                  ON s.id = access.salon_id
+                WHERE access.user_id = %s
+                  AND access.active = TRUE
+                  AND s.active = TRUE
+                ORDER BY s.name ASC, s.location_label ASC, s.id ASC
+                """,
+                (user_id,),
+            )
+            salon_rows = cur.fetchall()
+
+    if not salon_rows:
         return None
 
+    salons = [
+        {
+            "salon_id": int(row[0]),
+            "salon_code": str(row[1]),
+            "salon_name": str(row[2]),
+            "location_label": str(row[3] or ""),
+        }
+        for row in salon_rows
+    ]
+
     return {
-        "user_id": int(row[0]),
-        "salon_id": int(row[1]),
-        "email": str(row[2]),
-        "salon_code": str(row[3]),
-        "salon_name": str(row[4]),
-        "location_label": str(row[5] or ""),
+        "user_id": int(user_row[0]),
+        "email": str(user_row[1]),
+        "salons": salons,
+        "salon_count": len(salons),
     }
 
 
@@ -2525,7 +2548,7 @@ def set_partner_login_command(
     email: str,
     password: str,
 ) -> None:
-    """Create or reset a salon dashboard login."""
+    """Create or reset a dashboard login and grant salon access."""
     salon_code = (salon_code or "").strip()
     email = (email or "").strip().lower()
 
@@ -2580,15 +2603,20 @@ def set_partner_login_command(
                             password_hash
                         )
                         VALUES (%s, %s, %s)
+                        RETURNING id
                         """,
                         (salon_id, email, password_hash),
                     )
+                    created_user_row = cur.fetchone()
+                    if created_user_row is None:
+                        raise RuntimeError("Partner login was not created")
+                    user_id = int(created_user_row[0])
                 else:
+                    user_id = int(user_row[0])
                     cur.execute(
                         """
                         UPDATE salon_users
                         SET
-                            salon_id = %s,
                             email = %s,
                             password_hash = %s,
                             active = TRUE,
@@ -2598,18 +2626,109 @@ def set_partner_login_command(
                         WHERE id = %s
                         """,
                         (
-                            salon_id,
                             email,
                             password_hash,
-                            int(user_row[0]),
+                            user_id,
                         ),
                     )
+
+                cur.execute(
+                    """
+                    INSERT INTO salon_user_access (
+                        user_id,
+                        salon_id,
+                        active
+                    )
+                    VALUES (%s, %s, TRUE)
+                    ON CONFLICT (user_id, salon_id) DO UPDATE
+                    SET
+                        active = TRUE,
+                        updated_at = NOW()
+                    """,
+                    (user_id, salon_id),
+                )
     except click.ClickException:
         raise
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Partner login ready for {salon_code}: {email}")
+    click.echo(f"Partner login and access ready for {salon_code}: {email}")
+
+
+@app.cli.command("grant-partner-salon")
+@click.option("--salon-code", required=True, help="Salon code from salons.salon_code")
+@click.option("--email", required=True, help="Existing partner login email")
+def grant_partner_salon_command(
+    salon_code: str,
+    email: str,
+) -> None:
+    """Grant an existing dashboard login access to another salon."""
+    salon_code = (salon_code or "").strip()
+    email = (email or "").strip().lower()
+
+    if not salon_code:
+        raise click.ClickException("Salon code is required")
+    if len(email) > 254 or "@" not in email:
+        raise click.ClickException("Enter a valid email address")
+    if not PARTNER_REPORTING.enabled:
+        raise click.ClickException("DATABASE_URL is not configured")
+
+    try:
+        PARTNER_REPORTING.ensure_schema()
+
+        with PARTNER_REPORTING._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM salon_users
+                    WHERE LOWER(email) = LOWER(%s)
+                      AND active = TRUE
+                    """,
+                    (email,),
+                )
+                user_row = cur.fetchone()
+                if user_row is None:
+                    raise click.ClickException(
+                        f"No active partner login found for: {email}"
+                    )
+
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM salons
+                    WHERE salon_code = %s
+                      AND active = TRUE
+                    """,
+                    (salon_code,),
+                )
+                salon_row = cur.fetchone()
+                if salon_row is None:
+                    raise click.ClickException(
+                        f"No active salon found for code: {salon_code}"
+                    )
+
+                cur.execute(
+                    """
+                    INSERT INTO salon_user_access (
+                        user_id,
+                        salon_id,
+                        active
+                    )
+                    VALUES (%s, %s, TRUE)
+                    ON CONFLICT (user_id, salon_id) DO UPDATE
+                    SET
+                        active = TRUE,
+                        updated_at = NOW()
+                    """,
+                    (int(user_row[0]), int(salon_row[0])),
+                )
+    except click.ClickException:
+        raise
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Partner access granted for {salon_code}: {email}")
 
 
 @app.route("/partner/login", methods=["GET", "POST"])
@@ -2667,14 +2786,20 @@ def partner_login():
                                 u.id,
                                 u.password_hash,
                                 u.active,
-                                s.active,
+                                EXISTS (
+                                    SELECT 1
+                                    FROM salon_user_access AS access
+                                    JOIN salons AS s
+                                      ON s.id = access.salon_id
+                                    WHERE access.user_id = u.id
+                                      AND access.active = TRUE
+                                      AND s.active = TRUE
+                                ) AS has_active_salon,
                                 (
                                     u.locked_until IS NOT NULL
                                     AND u.locked_until > NOW()
                                 ) AS is_locked
                             FROM salon_users AS u
-                            JOIN salons AS s
-                              ON s.id = u.salon_id
                             WHERE LOWER(u.email) = LOWER(%s)
                             LIMIT 1
                             """,
@@ -2772,49 +2897,125 @@ def partner_dashboard():
             session.clear()
             return redirect(url_for("partner_login"))
 
-        salon_id = int(current_user["salon_id"])
+        user_id = int(current_user["user_id"])
+        requested_salon_code = (request.args.get("salon") or "").strip()
+        selected_salon = None
+
+        if requested_salon_code:
+            selected_salon = next(
+                (
+                    salon
+                    for salon in current_user["salons"]
+                    if salon["salon_code"] == requested_salon_code
+                ),
+                None,
+            )
+            if selected_salon is None:
+                return (
+                    render_template(
+                        "partner.html",
+                        mode="unavailable",
+                        error="You do not have access to that salon.",
+                    ),
+                    403,
+                )
+        elif current_user["salon_count"] == 1:
+            selected_salon = current_user["salons"][0]
+
+        selected_salon_id = (
+            int(selected_salon["salon_id"])
+            if selected_salon is not None
+            else None
+        )
+
         with _partner_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     SELECT
                         COUNT(*)::BIGINT,
-                        COALESCE(SUM(amount_total_cents), 0)::BIGINT,
-                        COALESCE(SUM(stylist_credit_cents), 0)::BIGINT,
-                        COALESCE(SUM(salon_share_cents), 0)::BIGINT
-                    FROM partner_orders
-                    WHERE salon_id = %s
-                      AND livemode = TRUE
-                      AND payment_status IN ('paid', 'no_payment_required')
+                        COALESCE(SUM(po.amount_total_cents), 0)::BIGINT,
+                        COALESCE(SUM(po.stylist_credit_cents), 0)::BIGINT,
+                        COALESCE(SUM(po.salon_share_cents), 0)::BIGINT
+                    FROM partner_orders AS po
+                    JOIN salon_user_access AS access
+                      ON access.salon_id = po.salon_id
+                     AND access.user_id = %s
+                     AND access.active = TRUE
+                    JOIN salons AS s
+                      ON s.id = po.salon_id
+                     AND s.active = TRUE
+                    WHERE po.livemode = TRUE
+                      AND po.payment_status IN ('paid', 'no_payment_required')
                     """,
-                    (salon_id,),
+                    (user_id,),
                 )
                 totals_row = cur.fetchone() or (0, 0, 0, 0)
 
                 cur.execute(
                     """
                     SELECT
-                        st.display_name,
-                        st.stylist_code,
+                        s.id,
+                        s.salon_code,
+                        s.name,
+                        s.location_label,
                         COUNT(po.order_id)::BIGINT,
                         COALESCE(SUM(po.amount_total_cents), 0)::BIGINT,
                         COALESCE(SUM(po.stylist_credit_cents), 0)::BIGINT,
                         COALESCE(SUM(po.salon_share_cents), 0)::BIGINT
-                    FROM stylists AS st
+                    FROM salon_user_access AS access
+                    JOIN salons AS s
+                      ON s.id = access.salon_id
+                     AND s.active = TRUE
                     LEFT JOIN partner_orders AS po
-                      ON po.stylist_id = st.id
-                     AND po.salon_id = st.salon_id
+                      ON po.salon_id = s.id
                      AND po.livemode = TRUE
                      AND po.payment_status IN ('paid', 'no_payment_required')
-                    WHERE st.salon_id = %s
-                    GROUP BY st.id, st.display_name, st.stylist_code
+                    WHERE access.user_id = %s
+                      AND access.active = TRUE
+                    GROUP BY s.id, s.salon_code, s.name, s.location_label
                     ORDER BY
                         COUNT(po.order_id) DESC,
-                        st.display_name ASC
+                        s.name ASC,
+                        s.location_label ASC
                     """,
-                    (salon_id,),
+                    (user_id,),
                 )
-                stylist_rows = cur.fetchall()
+                salon_rows = cur.fetchall()
+
+                stylist_rows = []
+                if selected_salon_id is not None:
+                    cur.execute(
+                        """
+                        SELECT
+                            st.display_name,
+                            st.stylist_code,
+                            COUNT(po.order_id)::BIGINT,
+                            COALESCE(SUM(po.amount_total_cents), 0)::BIGINT,
+                            COALESCE(SUM(po.stylist_credit_cents), 0)::BIGINT,
+                            COALESCE(SUM(po.salon_share_cents), 0)::BIGINT
+                        FROM salon_user_access AS access
+                        JOIN salons AS s
+                          ON s.id = access.salon_id
+                         AND s.active = TRUE
+                        JOIN stylists AS st
+                          ON st.salon_id = s.id
+                        LEFT JOIN partner_orders AS po
+                          ON po.stylist_id = st.id
+                         AND po.salon_id = st.salon_id
+                         AND po.livemode = TRUE
+                         AND po.payment_status IN ('paid', 'no_payment_required')
+                        WHERE access.user_id = %s
+                          AND access.salon_id = %s
+                          AND access.active = TRUE
+                        GROUP BY st.id, st.display_name, st.stylist_code
+                        ORDER BY
+                            COUNT(po.order_id) DESC,
+                            st.display_name ASC
+                        """,
+                        (user_id, selected_salon_id),
+                    )
+                    stylist_rows = cur.fetchall()
 
                 cur.execute(
                     """
@@ -2822,19 +3023,31 @@ def partner_dashboard():
                         po.order_id,
                         po.paid_at,
                         st.display_name,
+                        s.name,
+                        s.location_label,
                         po.amount_total_cents,
                         po.payment_status
                     FROM partner_orders AS po
+                    JOIN salon_user_access AS access
+                      ON access.salon_id = po.salon_id
+                     AND access.user_id = %s
+                     AND access.active = TRUE
+                    JOIN salons AS s
+                      ON s.id = po.salon_id
+                     AND s.active = TRUE
                     JOIN stylists AS st
                       ON st.id = po.stylist_id
                      AND st.salon_id = po.salon_id
-                    WHERE po.salon_id = %s
-                      AND po.livemode = TRUE
+                    WHERE po.livemode = TRUE
                       AND po.payment_status IN ('paid', 'no_payment_required')
+                      AND (
+                          %s::BIGINT IS NULL
+                          OR po.salon_id = %s
+                      )
                     ORDER BY po.paid_at DESC
                     LIMIT 50
                     """,
-                    (salon_id,),
+                    (user_id, selected_salon_id, selected_salon_id),
                 )
                 order_rows = cur.fetchall()
 
@@ -2844,6 +3057,19 @@ def partner_dashboard():
             "stylist_credits_cents": int(totals_row[2] or 0),
             "salon_share_cents": int(totals_row[3] or 0),
         }
+        salon_breakdown = [
+            {
+                "salon_id": int(row[0]),
+                "salon_code": str(row[1]),
+                "salon_name": str(row[2]),
+                "location_label": str(row[3] or ""),
+                "paid_sales": int(row[4] or 0),
+                "customer_revenue_cents": int(row[5] or 0),
+                "stylist_credits_cents": int(row[6] or 0),
+                "salon_share_cents": int(row[7] or 0),
+            }
+            for row in salon_rows
+        ]
         stylists = [
             {
                 "display_name": str(row[0]),
@@ -2860,8 +3086,10 @@ def partner_dashboard():
                 "order_id": str(row[0]),
                 "paid_at": row[1],
                 "stylist_name": str(row[2]),
-                "amount_total_cents": int(row[3] or 0),
-                "payment_status": str(row[4] or "unknown"),
+                "salon_name": str(row[3]),
+                "location_label": str(row[4] or ""),
+                "amount_total_cents": int(row[5] or 0),
+                "payment_status": str(row[6] or "unknown"),
             }
             for row in order_rows
         ]
@@ -2871,6 +3099,8 @@ def partner_dashboard():
             mode="dashboard",
             current_user=current_user,
             totals=totals,
+            salon_breakdown=salon_breakdown,
+            selected_salon=selected_salon,
             stylists=stylists,
             orders=orders,
             csrf_token=_partner_csrf_token(),
