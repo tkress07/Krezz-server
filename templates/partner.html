@@ -204,6 +204,90 @@
       padding: 22px;
     }
 
+    .qr-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 18px;
+    }
+
+    .qr-card {
+      display: flex;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel-soft);
+      flex-direction: column;
+      padding: 20px;
+    }
+
+    .qr-stylist {
+      margin: 0;
+      color: var(--text);
+      font-size: 1.25rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .qr-salon {
+      min-height: 46px;
+      margin: 4px 0 16px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .qr-code-frame {
+      display: grid;
+      width: min(100%, 260px);
+      margin: 0 auto 18px;
+      border-radius: 14px;
+      background: #ffffff;
+      padding: 12px;
+      place-items: center;
+    }
+
+    .qr-code-frame img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .qr-link-row {
+      display: grid;
+      gap: 9px;
+      margin-top: auto;
+    }
+
+    .qr-link-field {
+      font-size: 0.76rem;
+    }
+
+    .qr-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 12px;
+    }
+
+    .qr-actions .button,
+    .qr-actions button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      border-radius: 11px;
+      flex: 1 1 125px;
+      font-size: 0.82rem;
+      padding: 9px 12px;
+      text-align: center;
+      text-decoration: none;
+    }
+
+    .qr-print-kicker,
+    .qr-print-link,
+    #qr-print-area {
+      display: none;
+    }
+
     .panel-heading {
       display: flex;
       align-items: baseline;
@@ -383,6 +467,76 @@
         padding: 18px;
       }
     }
+
+    @media print {
+      body.qr-printing {
+        background: #ffffff;
+        color: #111111;
+      }
+
+      body.qr-printing > *:not(#qr-print-area) {
+        display: none !important;
+      }
+
+      body.qr-printing #qr-print-area {
+        display: grid !important;
+        min-height: 100vh;
+        background: #ffffff;
+        place-items: center;
+      }
+
+      body.qr-printing #qr-print-area .qr-card {
+        width: 4in;
+        min-height: 6in;
+        border: 2px solid #111111;
+        border-radius: 0.2in;
+        background: #ffffff;
+        color: #111111;
+        justify-content: center;
+        padding: 0.35in;
+        text-align: center;
+      }
+
+      body.qr-printing #qr-print-area .qr-print-kicker {
+        display: block;
+        margin-bottom: 0.12in;
+        font-size: 11pt;
+        font-weight: 900;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      body.qr-printing #qr-print-area .qr-stylist {
+        color: #111111;
+        font-size: 24pt;
+      }
+
+      body.qr-printing #qr-print-area .qr-salon {
+        min-height: 0;
+        margin: 0.06in 0 0.2in;
+        color: #333333;
+        font-size: 12pt;
+      }
+
+      body.qr-printing #qr-print-area .qr-code-frame {
+        width: 2.75in;
+        margin-bottom: 0.2in;
+        padding: 0;
+      }
+
+      body.qr-printing #qr-print-area .qr-link-row,
+      body.qr-printing #qr-print-area .qr-actions {
+        display: none;
+      }
+
+      body.qr-printing #qr-print-area .qr-print-link {
+        display: block;
+        color: #333333;
+        font-size: 8.5pt;
+        line-height: 1.3;
+        overflow-wrap: anywhere;
+      }
+    }
   </style>
 </head>
 <body>
@@ -535,6 +689,68 @@
         </section>
       {% endif %}
 
+      <section class="panel" id="qr-library">
+        <div class="panel-heading">
+          <h2>QR / Partner Links Library</h2>
+          <p class="muted">{{ qr_stylists | length }} active stylists across your assigned salons</p>
+        </div>
+        {% if qr_stylists %}
+          <div class="qr-grid">
+            {% for stylist in qr_stylists %}
+              <article class="qr-card" id="qr-card-{{ loop.index }}">
+                <div class="qr-print-kicker">Krezzcut</div>
+                <h3 class="qr-stylist">{{ stylist.display_name }}</h3>
+                <p class="qr-salon">
+                  {{ stylist.salon_name }}
+                  {% if stylist.location_label %}
+                    · {{ stylist.location_label }}
+                  {% endif %}
+                </p>
+                <div class="qr-code-frame">
+                  <img
+                    src="{{ stylist.qr_preview_url }}"
+                    alt="Krezzcut partner QR code for {{ stylist.display_name }} at {{ stylist.salon_name }}"
+                    loading="lazy"
+                    width="348"
+                    height="348"
+                  >
+                </div>
+                <div class="qr-link-row">
+                  <label for="partner-link-{{ loop.index }}">Permanent partner link</label>
+                  <input
+                    class="qr-link-field"
+                    id="partner-link-{{ loop.index }}"
+                    type="text"
+                    value="{{ stylist.partner_link }}"
+                    readonly
+                  >
+                  <button
+                    class="button-secondary"
+                    type="button"
+                    data-copy-link="{{ stylist.partner_link }}"
+                  >Copy Link</button>
+                </div>
+                <div class="qr-actions">
+                  <a
+                    class="button"
+                    href="{{ stylist.qr_download_url }}"
+                    download
+                  >Download QR PNG</a>
+                  <button
+                    class="button-secondary"
+                    type="button"
+                    data-print-card="qr-card-{{ loop.index }}"
+                  >Print QR Card</button>
+                </div>
+                <div class="qr-print-link">{{ stylist.partner_link }}</div>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="empty">No active stylists are available for your assigned salons.</p>
+        {% endif %}
+      </section>
+
       <section class="panel">
         <div class="panel-heading">
           <h2>Recent orders</h2>
@@ -639,6 +855,10 @@
         <p class="privacy-note">Partner reporting contains no customer contact, address, shipping, or mold data.</p>
       </section>
     </main>
+  {% endif %}
+  <div id="qr-print-area" aria-hidden="true"></div>
+  {% if mode == "dashboard" %}
+    <script src="{{ url_for('partner_qr_library_script') }}" defer></script>
   {% endif %}
 </body>
 </html>
