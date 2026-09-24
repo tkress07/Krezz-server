@@ -29,6 +29,7 @@ import click
 import qrcode
 import requests
 import stripe
+from PIL import Image, ImageDraw, ImageFont
 from flask import (
     Flask,
     request,
@@ -2413,6 +2414,9 @@ PARTNER_LOGIN_MAX_FAILURES = 5
 PARTNER_LOGIN_LOCK_MINUTES = 15
 PARTNER_PAID_STATUSES = ("paid", "no_payment_required")
 PARTNER_LINK_BASE_URL = "https://krezzcut.com/p"
+PARTNER_CARD_WIDTH_PX = 1500
+PARTNER_CARD_HEIGHT_PX = 2100
+PARTNER_CARD_DPI = 300
 _PARTNER_DUMMY_PASSWORD_HASH = generate_password_hash(
     secrets.token_urlsafe(32)
 )
@@ -2543,6 +2547,161 @@ def _partner_qr_png_bytes(partner_link: str) -> bytes:
     image = qr.make_image(fill_color="black", back_color="white")
     output = io.BytesIO()
     image.save(output, format="PNG")
+    return output.getvalue()
+
+
+@lru_cache(maxsize=128)
+def _partner_card_font(size: int, bold: bool = False):
+    filename = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    candidates = (
+        filename,
+        f"/usr/share/fonts/truetype/dejavu/{filename}",
+        f"/usr/local/share/fonts/{filename}",
+        (
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+            if bold
+            else "/System/Library/Fonts/Supplemental/Arial.ttf"
+        ),
+    )
+
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except (OSError, ValueError):
+            continue
+
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _partner_fitted_font(
+    draw,
+    text: str,
+    *,
+    maximum_width: int,
+    starting_size: int,
+    minimum_size: int,
+    bold: bool,
+):
+    for size in range(starting_size, minimum_size - 1, -2):
+        font = _partner_card_font(size, bold)
+        bounds = draw.textbbox((0, 0), text, font=font)
+        if bounds[2] - bounds[0] <= maximum_width:
+            return font
+    return _partner_card_font(minimum_size, bold)
+
+
+def _partner_draw_centered_text(
+    draw,
+    text: str,
+    *,
+    y: int,
+    font,
+    fill: str,
+) -> None:
+    bounds = draw.textbbox((0, 0), text, font=font)
+    text_width = bounds[2] - bounds[0]
+    x = (PARTNER_CARD_WIDTH_PX - text_width) / 2 - bounds[0]
+    draw.text((x, y - bounds[1]), text, font=font, fill=fill)
+
+
+@lru_cache(maxsize=2048)
+def _partner_qr_card_png_bytes(
+    partner_link: str,
+    stylist_name: str,
+    salon_name: str,
+) -> bytes:
+    card = Image.new(
+        "RGB",
+        (PARTNER_CARD_WIDTH_PX, PARTNER_CARD_HEIGHT_PX),
+        "white",
+    )
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle(
+        (55, 55, PARTNER_CARD_WIDTH_PX - 55, PARTNER_CARD_HEIGHT_PX - 55),
+        radius=42,
+        outline="#E0BA6C",
+        width=8,
+    )
+
+    safe_text_width = PARTNER_CARD_WIDTH_PX - 300
+    stylist_font = _partner_fitted_font(
+        draw,
+        stylist_name,
+        maximum_width=safe_text_width,
+        starting_size=108,
+        minimum_size=58,
+        bold=True,
+    )
+    salon_font = _partner_fitted_font(
+        draw,
+        salon_name,
+        maximum_width=safe_text_width,
+        starting_size=66,
+        minimum_size=42,
+        bold=False,
+    )
+    instruction = "Scan to start your Krezzcut mold"
+    instruction_font = _partner_fitted_font(
+        draw,
+        instruction,
+        maximum_width=safe_text_width,
+        starting_size=58,
+        minimum_size=42,
+        bold=True,
+    )
+
+    _partner_draw_centered_text(
+        draw,
+        stylist_name,
+        y=145,
+        font=stylist_font,
+        fill="#111111",
+    )
+    _partner_draw_centered_text(
+        draw,
+        salon_name,
+        y=300,
+        font=salon_font,
+        fill="#333333",
+    )
+
+    qr_image = Image.open(
+        io.BytesIO(_partner_qr_png_bytes(partner_link))
+    ).convert("RGB")
+    maximum_qr_width = 1200
+    integer_scale = max(1, maximum_qr_width // qr_image.width)
+    if integer_scale > 1:
+        qr_image = qr_image.resize(
+            (
+                qr_image.width * integer_scale,
+                qr_image.height * integer_scale,
+            ),
+            resample=Image.Resampling.NEAREST,
+        )
+
+    qr_x = (PARTNER_CARD_WIDTH_PX - qr_image.width) // 2
+    qr_y = 500
+    card.paste(qr_image, (qr_x, qr_y))
+
+    instruction_y = qr_y + qr_image.height + 95
+    _partner_draw_centered_text(
+        draw,
+        instruction,
+        y=instruction_y,
+        font=instruction_font,
+        fill="#111111",
+    )
+
+    output = io.BytesIO()
+    card.save(
+        output,
+        format="PNG",
+        dpi=(PARTNER_CARD_DPI, PARTNER_CARD_DPI),
+        optimize=True,
+    )
     return output.getvalue()
 
 
@@ -3019,7 +3178,9 @@ def partner_qr_png(salon_code: str, stylist_code: str):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT 1
+                    SELECT
+                        s.name,
+                        st.display_name
                     FROM salon_user_access AS access
                     JOIN salons AS s
                       ON s.id = access.salon_id
@@ -3039,13 +3200,24 @@ def partner_qr_png(salon_code: str, stylist_code: str):
                         stylist_code,
                     ),
                 )
-                if cur.fetchone() is None:
+                stylist_row = cur.fetchone()
+                if stylist_row is None:
                     abort(404)
 
         partner_link = _partner_link(salon_code, stylist_code)
-        png_bytes = _partner_qr_png_bytes(partner_link)
         download = request.args.get("download") == "1"
-        filename = f"{salon_code}-{stylist_code}-krezzcut-qr.png"
+        if download:
+            png_bytes = _partner_qr_card_png_bytes(
+                partner_link,
+                str(stylist_row[1]),
+                str(stylist_row[0]),
+            )
+            filename = (
+                f"{salon_code}-{stylist_code}-krezzcut-card-5x7.png"
+            )
+        else:
+            png_bytes = _partner_qr_png_bytes(partner_link)
+            filename = f"{salon_code}-{stylist_code}-krezzcut-qr.png"
 
         return send_file(
             io.BytesIO(png_bytes),
