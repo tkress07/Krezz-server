@@ -283,6 +283,7 @@
     }
 
     .qr-print-kicker,
+    .qr-print-instruction,
     .qr-print-link,
     #qr-print-area {
       display: none;
@@ -468,6 +469,11 @@
       }
     }
 
+    @page {
+      size: 5in 7in;
+      margin: 0.25in;
+    }
+
     @media print {
       body.qr-printing {
         background: #ffffff;
@@ -480,61 +486,69 @@
 
       body.qr-printing #qr-print-area {
         display: grid !important;
-        min-height: 100vh;
+        width: 4.5in;
+        height: 6.5in;
+        min-height: 0;
         background: #ffffff;
         place-items: center;
       }
 
       body.qr-printing #qr-print-area .qr-card {
-        width: 4in;
-        min-height: 6in;
+        width: 4.5in;
+        height: 6.5in;
+        min-height: 0;
         border: 2px solid #111111;
         border-radius: 0.2in;
         background: #ffffff;
         color: #111111;
-        justify-content: center;
-        padding: 0.35in;
+        justify-content: flex-start;
+        overflow: hidden;
+        padding: 0.4in;
         text-align: center;
       }
 
       body.qr-printing #qr-print-area .qr-print-kicker {
-        display: block;
-        margin-bottom: 0.12in;
-        font-size: 11pt;
-        font-weight: 900;
-        letter-spacing: 0.14em;
-        text-transform: uppercase;
+        display: none;
       }
 
       body.qr-printing #qr-print-area .qr-stylist {
         color: #111111;
-        font-size: 24pt;
+        font-size: 26pt;
+        line-height: 1.1;
       }
 
       body.qr-printing #qr-print-area .qr-salon {
         min-height: 0;
-        margin: 0.06in 0 0.2in;
+        margin: 0.08in 0 0;
         color: #333333;
-        font-size: 12pt;
+        font-size: 14pt;
+        font-weight: 650;
+        line-height: 1.2;
       }
 
-      body.qr-printing #qr-print-area .qr-code-frame {
-        width: 2.75in;
-        margin-bottom: 0.2in;
-        padding: 0;
-      }
-
-      body.qr-printing #qr-print-area .qr-link-row,
-      body.qr-printing #qr-print-area .qr-actions {
+      body.qr-printing #qr-print-area .qr-location {
         display: none;
       }
 
-      body.qr-printing #qr-print-area .qr-print-link {
+      body.qr-printing #qr-print-area .qr-code-frame {
+        width: 3.35in;
+        margin: 0.42in auto 0.25in;
+        padding: 0;
+      }
+
+      body.qr-printing #qr-print-area .qr-print-instruction {
         display: block;
-        color: #333333;
-        font-size: 8.5pt;
-        line-height: 1.3;
-        overflow-wrap: anywhere;
+        margin: 0;
+        color: #111111;
+        font-size: 15pt;
+        font-weight: 750;
+        line-height: 1.25;
+      }
+
+      body.qr-printing #qr-print-area .qr-link-row,
+      body.qr-printing #qr-print-area .qr-actions,
+      body.qr-printing #qr-print-area .qr-print-link {
+        display: none;
       }
     }
   </style>
@@ -703,7 +717,7 @@
                 <p class="qr-salon">
                   {{ stylist.salon_name }}
                   {% if stylist.location_label %}
-                    · {{ stylist.location_label }}
+                    <span class="qr-location">· {{ stylist.location_label }}</span>
                   {% endif %}
                 </p>
                 <div class="qr-code-frame">
@@ -715,6 +729,7 @@
                     height="348"
                   >
                 </div>
+                <p class="qr-print-instruction">Scan to start your Krezzcut mold</p>
                 <div class="qr-link-row">
                   <label for="partner-link-{{ loop.index }}">Permanent partner link</label>
                   <input
