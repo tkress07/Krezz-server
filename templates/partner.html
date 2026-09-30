@@ -750,12 +750,34 @@
                     class="button"
                     href="{{ stylist.qr_download_url }}"
                     download
-                  >Download QR PNG</a>
+                  >Download 5 × 7</a>
                   <button
                     class="button-secondary"
                     type="button"
                     data-print-card="qr-card-{{ loop.index }}"
-                  >Print QR Card</button>
+                  >Print 5 × 7</button>
+                  <a
+                    class="button"
+                    href="{{ stylist.business_front_download_url }}"
+                    download
+                  >Download Business Card Front</a>
+                  <a
+                    class="button"
+                    href="{{ stylist.business_back_download_url }}"
+                    download
+                  >Download Business Card Back</a>
+                  <a
+                    class="button button-secondary"
+                    href="{{ stylist.business_front_print_url }}"
+                    target="_blank"
+                    rel="noopener"
+                  >Print Business Card Front</a>
+                  <a
+                    class="button button-secondary"
+                    href="{{ stylist.business_back_print_url }}"
+                    target="_blank"
+                    rel="noopener"
+                  >Print Business Card Back</a>
                 </div>
                 <div class="qr-print-link">{{ stylist.partner_link }}</div>
               </article>
