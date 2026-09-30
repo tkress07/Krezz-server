@@ -2417,6 +2417,8 @@ PARTNER_LINK_BASE_URL = "https://krezzcut.com/p"
 PARTNER_CARD_WIDTH_PX = 1500
 PARTNER_CARD_HEIGHT_PX = 2100
 PARTNER_CARD_DPI = 300
+PARTNER_BUSINESS_CARD_WIDTH_PX = 1050
+PARTNER_BUSINESS_CARD_HEIGHT_PX = 600
 _PARTNER_DUMMY_PASSWORD_HASH = generate_password_hash(
     secrets.token_urlsafe(32)
 )
@@ -2694,6 +2696,247 @@ def _partner_qr_card_png_bytes(
         font=instruction_font,
         fill="#111111",
     )
+
+    output = io.BytesIO()
+    card.save(
+        output,
+        format="PNG",
+        dpi=(PARTNER_CARD_DPI, PARTNER_CARD_DPI),
+        optimize=True,
+    )
+    return output.getvalue()
+
+
+def _partner_draw_centered_in_region(
+    draw,
+    text: str,
+    *,
+    left: int,
+    right: int,
+    y: int,
+    font,
+    fill: str,
+) -> None:
+    bounds = draw.textbbox((0, 0), text, font=font)
+    text_width = bounds[2] - bounds[0]
+    region_center = (left + right) / 2
+    x = region_center - (text_width / 2) - bounds[0]
+    draw.text((x, y - bounds[1]), text, font=font, fill=fill)
+
+
+def _partner_wrapped_lines(
+    draw,
+    text: str,
+    *,
+    font,
+    maximum_width: int,
+) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    lines: List[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        bounds = draw.textbbox((0, 0), candidate, font=font)
+        if bounds[2] - bounds[0] <= maximum_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _partner_qr_image_within(
+    partner_link: str,
+    maximum_width: int,
+):
+    probe = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=1,
+        border=4,
+    )
+    probe.add_data(partner_link)
+    probe.make(fit=True)
+    module_width = len(probe.get_matrix())
+    box_size = max(1, maximum_width // module_width)
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=box_size,
+        border=4,
+    )
+    qr.add_data(partner_link)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return Image.open(io.BytesIO(output.getvalue())).convert("RGB")
+
+
+@lru_cache(maxsize=2048)
+def _partner_business_card_front_png_bytes(
+    partner_link: str,
+    stylist_name: str,
+    salon_name: str,
+) -> bytes:
+    card = Image.new(
+        "RGB",
+        (
+            PARTNER_BUSINESS_CARD_WIDTH_PX,
+            PARTNER_BUSINESS_CARD_HEIGHT_PX,
+        ),
+        "white",
+    )
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle(
+        (
+            24,
+            24,
+            PARTNER_BUSINESS_CARD_WIDTH_PX - 24,
+            PARTNER_BUSINESS_CARD_HEIGHT_PX - 24,
+        ),
+        radius=30,
+        outline="#E0BA6C",
+        width=6,
+    )
+
+    text_left = 58
+    text_right = 500
+    text_width = text_right - text_left
+    stylist_font = _partner_fitted_font(
+        draw,
+        stylist_name,
+        maximum_width=text_width,
+        starting_size=68,
+        minimum_size=34,
+        bold=True,
+    )
+    salon_font = _partner_fitted_font(
+        draw,
+        salon_name,
+        maximum_width=text_width,
+        starting_size=42,
+        minimum_size=28,
+        bold=False,
+    )
+
+    _partner_draw_centered_in_region(
+        draw,
+        stylist_name,
+        left=text_left,
+        right=text_right,
+        y=178,
+        font=stylist_font,
+        fill="#111111",
+    )
+    _partner_draw_centered_in_region(
+        draw,
+        salon_name,
+        left=text_left,
+        right=text_right,
+        y=322,
+        font=salon_font,
+        fill="#333333",
+    )
+
+    qr_image = _partner_qr_image_within(partner_link, 480)
+    qr_x = 530 + ((480 - qr_image.width) // 2)
+    qr_y = (PARTNER_BUSINESS_CARD_HEIGHT_PX - qr_image.height) // 2
+    card.paste(qr_image, (qr_x, qr_y))
+
+    output = io.BytesIO()
+    card.save(
+        output,
+        format="PNG",
+        dpi=(PARTNER_CARD_DPI, PARTNER_CARD_DPI),
+        optimize=True,
+    )
+    return output.getvalue()
+
+
+@lru_cache(maxsize=1)
+def _partner_business_card_back_png_bytes() -> bytes:
+    card = Image.new(
+        "RGB",
+        (
+            PARTNER_BUSINESS_CARD_WIDTH_PX,
+            PARTNER_BUSINESS_CARD_HEIGHT_PX,
+        ),
+        "white",
+    )
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle(
+        (
+            24,
+            24,
+            PARTNER_BUSINESS_CARD_WIDTH_PX - 24,
+            PARTNER_BUSINESS_CARD_HEIGHT_PX - 24,
+        ),
+        radius=30,
+        outline="#E0BA6C",
+        width=6,
+    )
+
+    heading_font = _partner_card_font(58, True)
+    step_font = _partner_card_font(34, False)
+    note_font = _partner_card_font(27, True)
+
+    _partner_draw_centered_in_region(
+        draw,
+        "How to Order",
+        left=55,
+        right=PARTNER_BUSINESS_CARD_WIDTH_PX - 55,
+        y=48,
+        font=heading_font,
+        fill="#111111",
+    )
+
+    steps = (
+        "1. Scan your stylist’s QR",
+        "2. Open Krezzcut",
+        "3. Create and order your custom mold",
+    )
+    for index, step in enumerate(steps):
+        draw.text(
+            (95, 145 + (index * 64)),
+            step,
+            font=step_font,
+            fill="#222222",
+        )
+
+    draw.line(
+        (95, 350, PARTNER_BUSINESS_CARD_WIDTH_PX - 95, 350),
+        fill="#E0BA6C",
+        width=4,
+    )
+
+    note = (
+        "Need to download Krezzcut? Install the app, then scan your "
+        "stylist’s QR again before ordering so they receive credit."
+    )
+    note_lines = _partner_wrapped_lines(
+        draw,
+        note,
+        font=note_font,
+        maximum_width=PARTNER_BUSINESS_CARD_WIDTH_PX - 190,
+    )
+    note_y = 380
+    for line in note_lines:
+        _partner_draw_centered_in_region(
+            draw,
+            line,
+            left=80,
+            right=PARTNER_BUSINESS_CARD_WIDTH_PX - 80,
+            y=note_y,
+            font=note_font,
+            fill="#333333",
+        )
+        note_y += 38
 
     output = io.BytesIO()
     card.save(
@@ -3153,6 +3396,24 @@ def partner_qr_library_script():
     document.body.classList.remove("qr-printing");
     document.getElementById("qr-print-area")?.replaceChildren();
   });
+
+  const autoPrintImage = document.querySelector("[data-auto-print-image]");
+  if (autoPrintImage) {
+    let printStarted = false;
+    const openAutoPrintDialog = () => {
+      if (printStarted) {
+        return;
+      }
+      printStarted = true;
+      window.setTimeout(() => window.print(), 120);
+    };
+    if (autoPrintImage.complete) {
+      openAutoPrintDialog();
+    } else {
+      autoPrintImage.addEventListener("load", openAutoPrintDialog, { once: true });
+      autoPrintImage.addEventListener("error", openAutoPrintDialog, { once: true });
+    }
+  }
 })();
 """.strip()
     )
@@ -3205,8 +3466,24 @@ def partner_qr_png(salon_code: str, stylist_code: str):
                     abort(404)
 
         partner_link = _partner_link(salon_code, stylist_code)
+        asset = (request.args.get("asset") or "").strip().lower()
+        if asset not in ("", "business-front", "business-back"):
+            abort(404)
+
         download = request.args.get("download") == "1"
-        if download:
+        if asset == "business-front":
+            png_bytes = _partner_business_card_front_png_bytes(
+                partner_link,
+                str(stylist_row[1]),
+                str(stylist_row[0]),
+            )
+            filename = (
+                f"{salon_code}-{stylist_code}-business-card-front.png"
+            )
+        elif asset == "business-back":
+            png_bytes = _partner_business_card_back_png_bytes()
+            filename = "krezzcut-business-card-back.png"
+        elif download:
             png_bytes = _partner_qr_card_png_bytes(
                 partner_link,
                 str(stylist_row[1]),
@@ -3230,6 +3507,116 @@ def partner_qr_png(salon_code: str, stylist_code: str):
         if getattr(exc, "code", None) in (404, 503):
             raise
         print(f"🟠 Partner QR generation failed safely: {exc}")
+        abort(503)
+
+
+@app.route(
+    "/partner/qr/<salon_code>/<stylist_code>/print/<card_side>",
+    methods=["GET"],
+)
+def partner_business_card_print(
+    salon_code: str,
+    stylist_code: str,
+    card_side: str,
+):
+    if not _partner_dashboard_ready():
+        abort(503)
+
+    asset_by_side = {
+        "front": "business-front",
+        "back": "business-back",
+    }
+    asset = asset_by_side.get((card_side or "").strip().lower())
+    if asset is None:
+        abort(404)
+
+    try:
+        current_user = _partner_current_user()
+        if current_user is None:
+            session.clear()
+            return redirect(url_for("partner_login"))
+
+        with _partner_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM salon_user_access AS access
+                    JOIN salons AS s
+                      ON s.id = access.salon_id
+                     AND s.active = TRUE
+                    JOIN stylists AS st
+                      ON st.salon_id = s.id
+                     AND st.active = TRUE
+                    WHERE access.user_id = %s
+                      AND access.active = TRUE
+                      AND s.salon_code = %s
+                      AND st.stylist_code = %s
+                    LIMIT 1
+                    """,
+                    (
+                        int(current_user["user_id"]),
+                        salon_code,
+                        stylist_code,
+                    ),
+                )
+                if cur.fetchone() is None:
+                    abort(404)
+
+        image_url = html.escape(
+            url_for(
+                "partner_qr_png",
+                salon_code=salon_code,
+                stylist_code=stylist_code,
+                asset=asset,
+            ),
+            quote=True,
+        )
+        script_url = html.escape(
+            url_for("partner_qr_library_script"),
+            quote=True,
+        )
+        title = "Business Card Front" if card_side == "front" else "Business Card Back"
+        title_html = html.escape(title)
+
+        response = make_response(
+            f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title_html} · Krezzcut</title>
+  <style>
+    @page {{ size: 3.5in 2in; margin: 0; }}
+    * {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; width: 3.5in; height: 2in; background: white; }}
+    img {{ display: block; width: 3.5in; height: 2in; object-fit: contain; }}
+    .hint {{
+      position: fixed;
+      top: calc(2in + 16px);
+      left: 0;
+      width: 3.5in;
+      margin: 0;
+      color: #555;
+      font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      text-align: center;
+    }}
+    @media print {{ .hint {{ display: none; }} }}
+  </style>
+</head>
+<body>
+  <img src="{image_url}" alt="{title_html}" data-auto-print-image>
+  <p class="hint">Press Command-P if the print dialog does not open.</p>
+  <script src="{script_url}" defer></script>
+</body>
+</html>"""
+        )
+        response.headers["Content-Type"] = "text/html; charset=utf-8"
+        return response
+    except Exception as exc:
+        if getattr(exc, "code", None) in (404, 503):
+            raise
+        print(f"🟠 Partner business-card print failed safely: {exc}")
         abort(503)
 
 
@@ -3480,6 +3867,32 @@ def partner_dashboard():
                         salon_code=salon_code,
                         stylist_code=stylist_code,
                         download="1",
+                    ),
+                    "business_front_download_url": url_for(
+                        "partner_qr_png",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                        asset="business-front",
+                        download="1",
+                    ),
+                    "business_back_download_url": url_for(
+                        "partner_qr_png",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                        asset="business-back",
+                        download="1",
+                    ),
+                    "business_front_print_url": url_for(
+                        "partner_business_card_print",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                        card_side="front",
+                    ),
+                    "business_back_print_url": url_for(
+                        "partner_business_card_print",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                        card_side="back",
                     ),
                 }
             )
