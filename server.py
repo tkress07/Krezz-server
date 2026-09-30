@@ -2808,6 +2808,14 @@ def _partner_business_card_front_png_bytes(
     text_left = 58
     text_right = 500
     text_width = text_right - text_left
+    app_name_font = _partner_fitted_font(
+        draw,
+        "KREZZCUT",
+        maximum_width=text_width,
+        starting_size=40,
+        minimum_size=32,
+        bold=True,
+    )
     stylist_font = _partner_fitted_font(
         draw,
         stylist_name,
@@ -2823,6 +2831,24 @@ def _partner_business_card_front_png_bytes(
         starting_size=42,
         minimum_size=28,
         bold=False,
+    )
+    download_font = _partner_fitted_font(
+        draw,
+        "Download on iPhone",
+        maximum_width=text_width,
+        starting_size=32,
+        minimum_size=26,
+        bold=True,
+    )
+
+    _partner_draw_centered_in_region(
+        draw,
+        "KREZZCUT",
+        left=text_left,
+        right=text_right,
+        y=68,
+        font=app_name_font,
+        fill="#9F7934",
     )
 
     _partner_draw_centered_in_region(
@@ -2842,6 +2868,15 @@ def _partner_business_card_front_png_bytes(
         y=322,
         font=salon_font,
         fill="#333333",
+    )
+    _partner_draw_centered_in_region(
+        draw,
+        "Download on iPhone",
+        left=text_left,
+        right=text_right,
+        y=455,
+        font=download_font,
+        fill="#111111",
     )
 
     qr_image = _partner_qr_image_within(partner_link, 480)
