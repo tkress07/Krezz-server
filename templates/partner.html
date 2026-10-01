@@ -418,6 +418,47 @@
       padding: 12px 14px;
     }
 
+    .notice {
+      margin: 0 0 22px;
+      border: 1px solid rgba(152, 221, 182, 0.35);
+      border-radius: 12px;
+      background: rgba(152, 221, 182, 0.09);
+      color: var(--success);
+      padding: 12px 14px;
+    }
+
+    .notice.error-notice {
+      border-color: rgba(255, 181, 173, 0.3);
+      background: rgba(255, 181, 173, 0.08);
+      color: var(--danger);
+    }
+
+    .payout-form {
+      margin: 0;
+    }
+
+    .payout-form button {
+      min-width: 132px;
+      padding: 8px 12px;
+      white-space: nowrap;
+    }
+
+    .order-details summary {
+      color: var(--gold);
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .payout-order-list {
+      display: grid;
+      gap: 4px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 0.76rem;
+      white-space: normal;
+      word-break: break-all;
+    }
+
     .privacy-note {
       margin: 22px 0 0;
       color: var(--muted);
@@ -585,6 +626,13 @@
         <div class="muted">Live sales only · Refresh for new activity</div>
       </section>
 
+      {% if partner_notice %}
+        <p
+          class="notice{% if partner_notice.kind == 'error' %} error-notice{% endif %}"
+          role="status"
+        >{{ partner_notice.message }}</p>
+      {% endif %}
+
       {% if current_user.salon_count > 1 %}
         <nav class="location-switcher" aria-label="Choose a salon">
           <h2>Locations</h2>
@@ -622,6 +670,37 @@
         </article>
       </section>
 
+      <section class="panel" aria-labelledby="payout-summary-heading">
+        <div class="panel-heading">
+          <h2 id="payout-summary-heading">Stylist payout tracking</h2>
+          <p class="muted">Manual payments · Lifetime totals</p>
+        </div>
+        <div class="grid" aria-label="Stylist payout totals">
+          <article class="metric">
+            <span class="metric-label">Total earned</span>
+            <strong class="metric-value">{{ totals.stylist_credits_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Total already paid</span>
+            <strong class="metric-value">{{ totals.stylist_paid_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Current amount owed</span>
+            <strong class="metric-value">{{ totals.stylist_owed_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Last payout date</span>
+            <strong class="metric-value">
+              {% if totals.last_stylist_payout_at %}
+                {{ totals.last_stylist_payout_at.strftime('%b %d, %Y') }}
+              {% else %}
+                —
+              {% endif %}
+            </strong>
+          </article>
+        </div>
+      </section>
+
       <section class="panel">
         <div class="panel-heading">
           <h2>Sales by salon</h2>
@@ -637,6 +716,8 @@
                   <th class="number">Sales</th>
                   <th class="number">Customer revenue</th>
                   <th class="number">Stylist credits</th>
+                  <th class="number">Stylist paid</th>
+                  <th class="number">Stylist owed</th>
                   <th class="number">Salon share</th>
                   <th></th>
                 </tr>
@@ -649,6 +730,8 @@
                     <td class="number">{{ salon.paid_sales }}</td>
                     <td class="number">{{ salon.customer_revenue_cents | money }}</td>
                     <td class="number">{{ salon.stylist_credits_cents | money }}</td>
+                    <td class="number">{{ salon.stylist_paid_cents | money }}</td>
+                    <td class="number">{{ salon.stylist_owed_cents | money }}</td>
                     <td class="number">{{ salon.salon_share_cents | money }}</td>
                     <td>
                       <a
@@ -667,10 +750,12 @@
       </section>
 
       {% if selected_salon %}
-        <section class="panel">
+        <section class="panel" id="stylist-payouts">
           <div class="panel-heading">
-            <h2>Stylist performance</h2>
-            <p class="muted">{{ selected_salon.salon_name }}</p>
+            <h2>Stylist performance and payouts</h2>
+            <p class="muted">
+              {{ selected_salon.salon_name }} · Lifetime totals
+            </p>
           </div>
           {% if stylists %}
             <div class="table-wrap">
@@ -680,8 +765,14 @@
                     <th>Stylist</th>
                     <th class="number">Sales</th>
                     <th class="number">Customer revenue</th>
-                    <th class="number">Stylist credit</th>
+                    <th class="number">Total earned</th>
+                    <th class="number">Total paid</th>
+                    <th class="number">Amount owed</th>
+                    <th>Last payout</th>
                     <th class="number">Salon share</th>
+                    {% if current_user.can_manage_payouts %}
+                      <th></th>
+                    {% endif %}
                   </tr>
                 </thead>
                 <tbody>
@@ -691,7 +782,39 @@
                       <td class="number">{{ stylist.sales }}</td>
                       <td class="number">{{ stylist.customer_revenue_cents | money }}</td>
                       <td class="number">{{ stylist.stylist_credits_cents | money }}</td>
+                      <td class="number">{{ stylist.stylist_paid_cents | money }}</td>
+                      <td class="number">{{ stylist.stylist_owed_cents | money }}</td>
+                      <td>
+                        {% if stylist.last_payout_at %}
+                          {{ stylist.last_payout_at.strftime('%b %d, %Y') }}
+                        {% else %}
+                          —
+                        {% endif %}
+                      </td>
                       <td class="number">{{ stylist.salon_share_cents | money }}</td>
+                      {% if current_user.can_manage_payouts %}
+                        <td>
+                          {% if stylist.stylist_owed_cents > 0 %}
+                            <form
+                              class="payout-form"
+                              method="post"
+                              action="{{ stylist.mark_paid_url }}"
+                              onsubmit="return window.confirm('Mark all currently unpaid stylist credits as paid?');"
+                            >
+                              <input
+                                type="hidden"
+                                name="csrf_token"
+                                value="{{ csrf_token }}"
+                              >
+                              <button type="submit">
+                                Mark Paid {{ stylist.stylist_owed_cents | money }}
+                              </button>
+                            </form>
+                          {% else %}
+                            <span class="status">Paid</span>
+                          {% endif %}
+                        </td>
+                      {% endif %}
                     </tr>
                   {% endfor %}
                 </tbody>
@@ -702,6 +825,64 @@
           {% endif %}
         </section>
       {% endif %}
+
+      <section class="panel" id="payout-history">
+        <div class="panel-heading">
+          <h2>Payout history</h2>
+          <p class="muted">
+            {% if selected_salon %}
+              {{ selected_salon.salon_name }}
+            {% else %}
+              All assigned salons
+            {% endif %}
+          </p>
+        </div>
+        {% if payout_history %}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Salon</th>
+                  <th>Stylist</th>
+                  <th class="number">Amount paid</th>
+                  <th>Included sales</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for payout in payout_history %}
+                  <tr>
+                    <td>{{ payout.paid_at.strftime('%b %d, %Y · %I:%M %p') }} UTC</td>
+                    <td>
+                      {{ payout.salon_name }}
+                      {% if payout.location_label %}
+                        · {{ payout.location_label }}
+                      {% endif %}
+                    </td>
+                    <td>{{ payout.stylist_name }}</td>
+                    <td class="number">{{ payout.amount_cents | money }}</td>
+                    <td>
+                      <details class="order-details">
+                        <summary>
+                          {{ payout.sales_count }}
+                          sale{% if payout.sales_count != 1 %}s{% endif %}
+                        </summary>
+                        <div class="payout-order-list">
+                          {% for order_id in payout.order_ids %}
+                            <span>{{ order_id }}</span>
+                          {% endfor %}
+                        </div>
+                      </details>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No stylist payouts have been recorded yet.</p>
+        {% endif %}
+      </section>
 
       <section class="panel" id="qr-library">
         <div class="panel-heading">
