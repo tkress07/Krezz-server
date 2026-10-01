@@ -51,7 +51,7 @@ except Exception:
     # the PostgreSQL driver is unavailable for any reason.
     psycopg = None
 
-APP_VERSION = "KrezzServer/2.4.0-partner-qr-library"
+APP_VERSION = "KrezzServer/2.5.0-manual-stylist-payouts"
 
 app = Flask(__name__)
 
@@ -2467,7 +2467,8 @@ def _partner_current_user() -> Optional[Dict[str, Any]]:
                 """
                 SELECT
                     u.id,
-                    u.email
+                    u.email,
+                    u.can_manage_payouts
                 FROM salon_users AS u
                 WHERE u.id = %s
                   AND u.active = TRUE
@@ -2514,6 +2515,7 @@ def _partner_current_user() -> Optional[Dict[str, Any]]:
     return {
         "user_id": int(user_row[0]),
         "email": str(user_row[1]),
+        "can_manage_payouts": bool(user_row[2]),
         "salons": salons,
         "salon_count": len(salons),
     }
@@ -3655,6 +3657,197 @@ def partner_business_card_print(
         abort(503)
 
 
+@app.route(
+    "/partner/payouts/stylist/<salon_code>/<stylist_code>/mark-paid",
+    methods=["POST"],
+)
+def partner_mark_stylist_paid(
+    salon_code: str,
+    stylist_code: str,
+):
+    if not _partner_dashboard_ready():
+        abort(503)
+
+    current_user = _partner_current_user()
+    if current_user is None:
+        session.clear()
+        return redirect(url_for("partner_login"))
+    if not bool(current_user.get("can_manage_payouts")):
+        abort(403)
+    if not _partner_valid_csrf():
+        abort(400)
+
+    user_id = int(current_user["user_id"])
+    redirect_url = url_for(
+        "partner_dashboard",
+        salon=salon_code,
+    ) + "#stylist-payouts"
+
+    try:
+        with _partner_connection() as conn:
+            with conn.cursor() as cur:
+                # Locking the stylist serializes simultaneous Mark Paid clicks
+                # for the same payee. The item uniqueness constraint provides
+                # a second database-level defense against double payment.
+                cur.execute(
+                    """
+                    SELECT
+                        s.id,
+                        s.name,
+                        st.id,
+                        st.display_name
+                    FROM salon_user_access AS access
+                    JOIN salons AS s
+                      ON s.id = access.salon_id
+                     AND s.active = TRUE
+                    JOIN stylists AS st
+                      ON st.salon_id = s.id
+                    WHERE access.user_id = %s
+                      AND access.active = TRUE
+                      AND s.salon_code = %s
+                      AND st.stylist_code = %s
+                    LIMIT 1
+                    FOR UPDATE OF st
+                    """,
+                    (user_id, salon_code, stylist_code),
+                )
+                payee_row = cur.fetchone()
+                if payee_row is None:
+                    abort(404)
+
+                salon_id = int(payee_row[0])
+                stylist_id = int(payee_row[2])
+                stylist_name = str(payee_row[3])
+
+                cur.execute(
+                    """
+                    SELECT
+                        po.order_id,
+                        po.stylist_credit_cents,
+                        po.currency
+                    FROM partner_orders AS po
+                    WHERE po.salon_id = %s
+                      AND po.stylist_id = %s
+                      AND po.livemode = TRUE
+                      AND po.payment_status IN (
+                          'paid',
+                          'no_payment_required'
+                      )
+                      AND po.stylist_credit_cents > 0
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM partner_payout_items AS item
+                          WHERE item.order_id = po.order_id
+                            AND item.payout_type = 'stylist_credit'
+                      )
+                    ORDER BY po.paid_at ASC, po.order_id ASC
+                    FOR UPDATE OF po
+                    """,
+                    (salon_id, stylist_id),
+                )
+                unpaid_rows = cur.fetchall()
+
+                if not unpaid_rows:
+                    session["partner_notice"] = {
+                        "kind": "success",
+                        "message": (
+                            f"{stylist_name} has no unpaid stylist credits."
+                        ),
+                    }
+                    return redirect(redirect_url)
+
+                currencies = {
+                    str(row[2] or "usd").strip().lower()
+                    for row in unpaid_rows
+                }
+                if len(currencies) != 1:
+                    raise RuntimeError(
+                        "Cannot combine multiple currencies in one payout"
+                    )
+
+                currency = next(iter(currencies))
+                payout_amount_cents = sum(
+                    int(row[1] or 0)
+                    for row in unpaid_rows
+                )
+                if payout_amount_cents <= 0:
+                    raise RuntimeError("Payout amount must be positive")
+
+                cur.execute(
+                    """
+                    INSERT INTO partner_payouts (
+                        payout_type,
+                        salon_id,
+                        stylist_id,
+                        amount_cents,
+                        currency,
+                        paid_at,
+                        created_by_user_id
+                    )
+                    VALUES (
+                        'stylist_credit',
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        NOW(),
+                        %s
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        salon_id,
+                        stylist_id,
+                        payout_amount_cents,
+                        currency,
+                        user_id,
+                    ),
+                )
+                payout_id = int(cur.fetchone()[0])
+
+                cur.executemany(
+                    """
+                    INSERT INTO partner_payout_items (
+                        payout_id,
+                        payout_type,
+                        order_id,
+                        amount_cents
+                    )
+                    VALUES (%s, 'stylist_credit', %s, %s)
+                    """,
+                    [
+                        (
+                            payout_id,
+                            str(row[0]),
+                            int(row[1]),
+                        )
+                        for row in unpaid_rows
+                    ],
+                )
+
+        session["partner_notice"] = {
+            "kind": "success",
+            "message": (
+                f"Marked {_money(payout_amount_cents)} paid to "
+                f"{stylist_name} for {len(unpaid_rows)} "
+                f"sale{'s' if len(unpaid_rows) != 1 else ''}."
+            ),
+        }
+        return redirect(redirect_url)
+    except Exception as exc:
+        if getattr(exc, "code", None) in (400, 403, 404, 503):
+            raise
+        print(f"🟠 Manual stylist payout failed safely: {exc}")
+        session["partner_notice"] = {
+            "kind": "error",
+            "message": (
+                "The payout was not recorded. No sales were changed. "
+                "Please try again."
+            ),
+        }
+        return redirect(redirect_url)
+
+
 @app.route("/partner", methods=["GET"])
 def partner_dashboard():
     if not _partner_dashboard_ready():
@@ -3724,6 +3917,25 @@ def partner_dashboard():
                 cur.execute(
                     """
                     SELECT
+                        COALESCE(SUM(pp.amount_cents), 0)::BIGINT,
+                        MAX(pp.paid_at)
+                    FROM partner_payouts AS pp
+                    JOIN salon_user_access AS access
+                      ON access.salon_id = pp.salon_id
+                     AND access.user_id = %s
+                     AND access.active = TRUE
+                    JOIN salons AS s
+                      ON s.id = pp.salon_id
+                     AND s.active = TRUE
+                    WHERE pp.payout_type = 'stylist_credit'
+                    """,
+                    (user_id,),
+                )
+                payout_totals_row = cur.fetchone() or (0, None)
+
+                cur.execute(
+                    """
+                    SELECT
                         s.id,
                         s.salon_code,
                         s.name,
@@ -3731,7 +3943,9 @@ def partner_dashboard():
                         COUNT(po.order_id)::BIGINT,
                         COALESCE(SUM(po.amount_total_cents), 0)::BIGINT,
                         COALESCE(SUM(po.stylist_credit_cents), 0)::BIGINT,
-                        COALESCE(SUM(po.salon_share_cents), 0)::BIGINT
+                        COALESCE(SUM(po.salon_share_cents), 0)::BIGINT,
+                        COALESCE(pt.stylist_paid_cents, 0)::BIGINT,
+                        pt.last_stylist_payout_at
                     FROM salon_user_access AS access
                     JOIN salons AS s
                       ON s.id = access.salon_id
@@ -3740,9 +3954,25 @@ def partner_dashboard():
                       ON po.salon_id = s.id
                      AND po.livemode = TRUE
                      AND po.payment_status IN ('paid', 'no_payment_required')
+                    LEFT JOIN (
+                        SELECT
+                            salon_id,
+                            SUM(amount_cents)::BIGINT AS stylist_paid_cents,
+                            MAX(paid_at) AS last_stylist_payout_at
+                        FROM partner_payouts
+                        WHERE payout_type = 'stylist_credit'
+                        GROUP BY salon_id
+                    ) AS pt
+                      ON pt.salon_id = s.id
                     WHERE access.user_id = %s
                       AND access.active = TRUE
-                    GROUP BY s.id, s.salon_code, s.name, s.location_label
+                    GROUP BY
+                        s.id,
+                        s.salon_code,
+                        s.name,
+                        s.location_label,
+                        pt.stylist_paid_cents,
+                        pt.last_stylist_payout_at
                     ORDER BY
                         COUNT(po.order_id) DESC,
                         s.name ASC,
@@ -3783,33 +4013,85 @@ def partner_dashboard():
                 if selected_salon_id is not None:
                     cur.execute(
                         """
+                        WITH order_totals AS (
+                            SELECT
+                                po.stylist_id,
+                                COUNT(po.order_id)::BIGINT AS sales,
+                                COALESCE(
+                                    SUM(po.amount_total_cents),
+                                    0
+                                )::BIGINT AS customer_revenue_cents,
+                                COALESCE(
+                                    SUM(po.stylist_credit_cents),
+                                    0
+                                )::BIGINT AS earned_cents,
+                                COALESCE(
+                                    SUM(po.salon_share_cents),
+                                    0
+                                )::BIGINT AS salon_share_cents
+                            FROM partner_orders AS po
+                            WHERE po.salon_id = %s
+                              AND po.livemode = TRUE
+                              AND po.payment_status IN (
+                                  'paid',
+                                  'no_payment_required'
+                              )
+                            GROUP BY po.stylist_id
+                        ),
+                        payout_totals AS (
+                            SELECT
+                                pp.stylist_id,
+                                COALESCE(
+                                    SUM(pp.amount_cents),
+                                    0
+                                )::BIGINT AS paid_cents,
+                                MAX(pp.paid_at) AS last_payout_at
+                            FROM partner_payouts AS pp
+                            WHERE pp.salon_id = %s
+                              AND pp.payout_type = 'stylist_credit'
+                            GROUP BY pp.stylist_id
+                        )
                         SELECT
+                            st.id,
                             st.display_name,
                             st.stylist_code,
-                            COUNT(po.order_id)::BIGINT,
-                            COALESCE(SUM(po.amount_total_cents), 0)::BIGINT,
-                            COALESCE(SUM(po.stylist_credit_cents), 0)::BIGINT,
-                            COALESCE(SUM(po.salon_share_cents), 0)::BIGINT
+                            COALESCE(ot.sales, 0)::BIGINT,
+                            COALESCE(
+                                ot.customer_revenue_cents,
+                                0
+                            )::BIGINT,
+                            COALESCE(ot.earned_cents, 0)::BIGINT,
+                            COALESCE(ot.salon_share_cents, 0)::BIGINT,
+                            COALESCE(pt.paid_cents, 0)::BIGINT,
+                            GREATEST(
+                                COALESCE(ot.earned_cents, 0)
+                                - COALESCE(pt.paid_cents, 0),
+                                0
+                            )::BIGINT AS owed_cents,
+                            pt.last_payout_at
                         FROM salon_user_access AS access
                         JOIN salons AS s
                           ON s.id = access.salon_id
                          AND s.active = TRUE
                         JOIN stylists AS st
                           ON st.salon_id = s.id
-                        LEFT JOIN partner_orders AS po
-                          ON po.stylist_id = st.id
-                         AND po.salon_id = st.salon_id
-                         AND po.livemode = TRUE
-                         AND po.payment_status IN ('paid', 'no_payment_required')
+                        LEFT JOIN order_totals AS ot
+                          ON ot.stylist_id = st.id
+                        LEFT JOIN payout_totals AS pt
+                          ON pt.stylist_id = st.id
                         WHERE access.user_id = %s
                           AND access.salon_id = %s
                           AND access.active = TRUE
-                        GROUP BY st.id, st.display_name, st.stylist_code
                         ORDER BY
-                            COUNT(po.order_id) DESC,
+                            COALESCE(ot.sales, 0) DESC,
                             st.display_name ASC
                         """,
-                        (user_id, selected_salon_id),
+                        (
+                            selected_salon_id,
+                            selected_salon_id,
+                            user_id,
+                            selected_salon_id,
+                        ),
                     )
                     stylist_rows = cur.fetchall()
 
@@ -3847,10 +4129,67 @@ def partner_dashboard():
                 )
                 order_rows = cur.fetchall()
 
+                cur.execute(
+                    """
+                    SELECT
+                        pp.id,
+                        pp.paid_at,
+                        s.name,
+                        s.location_label,
+                        st.display_name,
+                        pp.amount_cents,
+                        pp.currency,
+                        COUNT(item.order_id)::BIGINT,
+                        ARRAY_AGG(
+                            item.order_id
+                            ORDER BY item.order_id
+                        )
+                    FROM partner_payouts AS pp
+                    JOIN salon_user_access AS access
+                      ON access.salon_id = pp.salon_id
+                     AND access.user_id = %s
+                     AND access.active = TRUE
+                    JOIN salons AS s
+                      ON s.id = pp.salon_id
+                     AND s.active = TRUE
+                    JOIN stylists AS st
+                      ON st.id = pp.stylist_id
+                     AND st.salon_id = pp.salon_id
+                    JOIN partner_payout_items AS item
+                      ON item.payout_id = pp.id
+                     AND item.payout_type = pp.payout_type
+                    WHERE pp.payout_type = 'stylist_credit'
+                      AND (
+                          %s::BIGINT IS NULL
+                          OR pp.salon_id = %s
+                      )
+                    GROUP BY
+                        pp.id,
+                        pp.paid_at,
+                        s.name,
+                        s.location_label,
+                        st.display_name,
+                        pp.amount_cents,
+                        pp.currency
+                    ORDER BY pp.paid_at DESC, pp.id DESC
+                    LIMIT 100
+                    """,
+                    (user_id, selected_salon_id, selected_salon_id),
+                )
+                payout_history_rows = cur.fetchall()
+
+        total_stylist_earned_cents = int(totals_row[2] or 0)
+        total_stylist_paid_cents = int(payout_totals_row[0] or 0)
         totals = {
             "paid_sales": int(totals_row[0] or 0),
             "customer_revenue_cents": int(totals_row[1] or 0),
-            "stylist_credits_cents": int(totals_row[2] or 0),
+            "stylist_credits_cents": total_stylist_earned_cents,
+            "stylist_paid_cents": total_stylist_paid_cents,
+            "stylist_owed_cents": max(
+                0,
+                total_stylist_earned_cents - total_stylist_paid_cents,
+            ),
+            "last_stylist_payout_at": payout_totals_row[1],
             "salon_share_cents": int(totals_row[3] or 0),
         }
         salon_breakdown = [
@@ -3863,17 +4202,32 @@ def partner_dashboard():
                 "customer_revenue_cents": int(row[5] or 0),
                 "stylist_credits_cents": int(row[6] or 0),
                 "salon_share_cents": int(row[7] or 0),
+                "stylist_paid_cents": int(row[8] or 0),
+                "stylist_owed_cents": max(
+                    0,
+                    int(row[6] or 0) - int(row[8] or 0),
+                ),
+                "last_stylist_payout_at": row[9],
             }
             for row in salon_rows
         ]
         stylists = [
             {
-                "display_name": str(row[0]),
-                "stylist_code": str(row[1]),
-                "sales": int(row[2] or 0),
-                "customer_revenue_cents": int(row[3] or 0),
-                "stylist_credits_cents": int(row[4] or 0),
-                "salon_share_cents": int(row[5] or 0),
+                "stylist_id": int(row[0]),
+                "display_name": str(row[1]),
+                "stylist_code": str(row[2]),
+                "sales": int(row[3] or 0),
+                "customer_revenue_cents": int(row[4] or 0),
+                "stylist_credits_cents": int(row[5] or 0),
+                "salon_share_cents": int(row[6] or 0),
+                "stylist_paid_cents": int(row[7] or 0),
+                "stylist_owed_cents": int(row[8] or 0),
+                "last_payout_at": row[9],
+                "mark_paid_url": url_for(
+                    "partner_mark_stylist_paid",
+                    salon_code=str(selected_salon["salon_code"]),
+                    stylist_code=str(row[2]),
+                ),
             }
             for row in stylist_rows
         ]
@@ -3943,6 +4297,21 @@ def partner_dashboard():
             }
             for row in order_rows
         ]
+        payout_history = [
+            {
+                "payout_id": int(row[0]),
+                "paid_at": row[1],
+                "salon_name": str(row[2]),
+                "location_label": str(row[3] or ""),
+                "stylist_name": str(row[4]),
+                "amount_cents": int(row[5] or 0),
+                "currency": str(row[6] or "usd").upper(),
+                "sales_count": int(row[7] or 0),
+                "order_ids": [str(order_id) for order_id in (row[8] or [])],
+            }
+            for row in payout_history_rows
+        ]
+        partner_notice = session.pop("partner_notice", None)
 
         return render_template(
             "partner.html",
@@ -3954,6 +4323,8 @@ def partner_dashboard():
             stylists=stylists,
             qr_stylists=qr_stylists,
             orders=orders,
+            payout_history=payout_history,
+            partner_notice=partner_notice,
             csrf_token=_partner_csrf_token(),
         )
     except Exception as exc:
