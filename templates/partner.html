@@ -959,6 +959,1064 @@
                     target="_blank"
                     rel="noopener"
                   >Print Business Card Back</a>
+                  <a
+                    class="button button-secondary"
+                    href="{{ stylist.avery_front_print_url }}"
+                    target="_blank"
+                    rel="noopener"
+                  >Print Avery 8471 Front Sheet</a>
+                  <a
+                    class="button button-secondary"
+                    href="{{ stylist.avery_back_print_url }}"
+                    target="_blank"
+                    rel="noopener"
+                  >Print Avery 8471 Back Sheet</a>
+                </div>
+                <div class="qr-print-link">{{ stylist.partner_link }}</div>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="empty">No active stylists are available for your assigned salons.</p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Recent orders</h2>
+          <p class="muted">
+            {% if selected_salon %}
+              {{ selected_salon.salon_name }}
+            {% else %}
+              All assigned salons
+            {% endif %}
+          </p>
+        </div>
+        {% if orders %}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Salon</th>
+                  <th>Stylist</th>
+                  <th>Order</th>
+                  <th class="number">Amount paid</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for order in orders %}
+                  <tr>
+                    <td>{{ order.paid_at.strftime('%b %d, %Y · %I:%M %p') }} UTC</td>
+                    <td>
+                      {{ order.salon_name }}
+                      {% if order.location_label %}
+                        · {{ order.location_label }}
+                      {% endif %}
+                    </td>
+                    <td>{{ order.stylist_name }}</td>
+                    <td>{{ order.order_id }}</td>
+                    <td class="number">{{ order.amount_total_cents | money }}</td>
+                    <td>
+                      <span class="status">
+                        {% if order.payment_status == "no_payment_required" %}
+                          No payment required
+                        {% else %}
+                          {{ order.payment_status.replace('_', ' ') }}
+                        {% endif %}
+                      </span>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No paid partner orders yet.</p>
+        {% endif %}
+      </section>
+    </main>
+  {% else %}
+    <main class="shell auth-page">
+      <section class="auth-card">
+        <div class="brand">Krezzcut</div>
+        <span class="partner-label">Partner reporting</span>
+
+        {% if mode == "login" %}
+          <h1>Welcome back</h1>
+          <p class="muted">Sign in to view your salons, sales, and stylist credits.</p>
+
+          {% if error %}
+            <p class="error" role="alert">{{ error }}</p>
+          {% endif %}
+
+          <form method="post" action="{{ url_for('partner_login') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="field">
+              <label for="email">Email</label>
+              <input
+                id="email"
+                name="email"
+                type="email"
+                value="{{ email }}"
+                autocomplete="email"
+                maxlength="254"
+                required
+              >
+            </div>
+            <div class="field">
+              <label for="password">Password</label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autocomplete="current-password"
+                required
+              >
+            </div>
+            <button type="submit">Sign in</button>
+          </form>
+        {% else %}
+          <h1>Temporarily unavailable</h1>
+          <p class="error" role="alert">{{ error }}</p>
+        {% endif %}
+
+        <p class="privacy-note">Partner reporting contains no customer contact, address, shipping, or mold data.</p>
+      </section>
+    </main>
+  {% endif %}
+  <div id="qr-print-area" aria-hidden="true"></div>
+  {% if mode == "dashboard" %}
+    <script src="{{ url_for('partner_qr_library_script') }}" defer></script>
+  {% endif %}
+</body>
+</html>
+
+    a {
+      color: var(--gold);
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    .shell {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 56px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 34px;
+    }
+
+    .brand {
+      color: var(--gold);
+      font-size: 1.05rem;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    .partner-label {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .button,
+    button {
+      appearance: none;
+      border: 1px solid var(--gold-deep);
+      border-radius: 999px;
+      background: var(--gold);
+      color: #171107;
+      cursor: pointer;
+      font-weight: 750;
+      padding: 11px 18px;
+    }
+
+    .button-secondary {
+      background: transparent;
+      color: var(--gold);
+    }
+
+    .hero {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 26px;
+    }
+
+    h1,
+    h2,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      margin-bottom: 4px;
+      font-size: clamp(2rem, 5vw, 3.65rem);
+      line-height: 1.05;
+      letter-spacing: -0.045em;
+    }
+
+    h2 {
+      margin-bottom: 16px;
+      font-size: 1.08rem;
+      letter-spacing: -0.01em;
+    }
+
+    .location,
+    .muted {
+      color: var(--muted);
+    }
+
+    .account {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-top: 4px;
+    }
+
+    .location-switcher {
+      margin-bottom: 26px;
+    }
+
+    .location-switcher h2 {
+      margin-bottom: 10px;
+    }
+
+    .location-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+    }
+
+    .location-pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      padding: 8px 13px;
+      text-decoration: none;
+    }
+
+    .location-pill:hover,
+    .location-pill.active {
+      border-color: var(--gold-deep);
+      background: rgba(224, 186, 108, 0.1);
+      color: var(--gold);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+
+    .metric,
+    .panel,
+    .auth-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(19, 19, 19, 0.94);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+    }
+
+    .metric {
+      min-height: 142px;
+      padding: 22px;
+    }
+
+    .metric-label {
+      display: block;
+      min-height: 42px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .metric-value {
+      display: block;
+      margin-top: 12px;
+      color: var(--gold);
+      font-size: clamp(1.65rem, 3vw, 2.25rem);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .panel {
+      margin-top: 16px;
+      padding: 22px;
+    }
+
+    .qr-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 18px;
+    }
+
+    .qr-card {
+      display: flex;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel-soft);
+      flex-direction: column;
+      padding: 20px;
+    }
+
+    .qr-stylist {
+      margin: 0;
+      color: var(--text);
+      font-size: 1.25rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .qr-salon {
+      min-height: 46px;
+      margin: 4px 0 16px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .qr-code-frame {
+      display: grid;
+      width: min(100%, 260px);
+      margin: 0 auto 18px;
+      border-radius: 14px;
+      background: #ffffff;
+      padding: 12px;
+      place-items: center;
+    }
+
+    .qr-code-frame img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .qr-link-row {
+      display: grid;
+      gap: 9px;
+      margin-top: auto;
+    }
+
+    .qr-link-field {
+      font-size: 0.76rem;
+    }
+
+    .qr-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 12px;
+    }
+
+    .qr-actions .button,
+    .qr-actions button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      border-radius: 11px;
+      flex: 1 1 125px;
+      font-size: 0.82rem;
+      padding: 9px 12px;
+      text-align: center;
+      text-decoration: none;
+    }
+
+    .qr-print-kicker,
+    .qr-print-instruction,
+    .qr-print-link,
+    #qr-print-area {
+      display: none;
+    }
+
+    .panel-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .panel-heading h2,
+    .panel-heading p {
+      margin-bottom: 0;
+    }
+
+    .table-link {
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      white-space: nowrap;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 14px 12px;
+      text-align: left;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 0.74rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .number {
+      text-align: right;
+    }
+
+    .status {
+      display: inline-block;
+      border: 1px solid rgba(152, 221, 182, 0.35);
+      border-radius: 999px;
+      background: rgba(152, 221, 182, 0.09);
+      color: var(--success);
+      font-size: 0.76rem;
+      font-weight: 750;
+      padding: 4px 9px;
+      text-transform: capitalize;
+    }
+
+    .empty {
+      margin: 0;
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      color: var(--muted);
+      padding: 28px;
+      text-align: center;
+    }
+
+    .auth-page {
+      display: grid;
+      min-height: calc(100vh - 84px);
+      place-items: center;
+    }
+
+    .auth-card {
+      width: min(100%, 430px);
+      padding: 32px;
+    }
+
+    .auth-card h1 {
+      margin: 28px 0 8px;
+      font-size: 2rem;
+    }
+
+    .field {
+      display: grid;
+      gap: 7px;
+      margin-top: 18px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 650;
+    }
+
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      outline: none;
+      background: var(--panel-soft);
+      color: var(--text);
+      padding: 13px 14px;
+    }
+
+    input:focus {
+      border-color: var(--gold);
+      box-shadow: 0 0 0 3px rgba(224, 186, 108, 0.12);
+    }
+
+    .auth-card button {
+      width: 100%;
+      margin-top: 22px;
+    }
+
+    .error {
+      border: 1px solid rgba(255, 181, 173, 0.3);
+      border-radius: 12px;
+      background: rgba(255, 181, 173, 0.08);
+      color: var(--danger);
+      margin: 20px 0 0;
+      padding: 12px 14px;
+    }
+
+    .notice {
+      margin: 0 0 22px;
+      border: 1px solid rgba(152, 221, 182, 0.35);
+      border-radius: 12px;
+      background: rgba(152, 221, 182, 0.09);
+      color: var(--success);
+      padding: 12px 14px;
+    }
+
+    .notice.error-notice {
+      border-color: rgba(255, 181, 173, 0.3);
+      background: rgba(255, 181, 173, 0.08);
+      color: var(--danger);
+    }
+
+    .payout-form {
+      margin: 0;
+    }
+
+    .payout-form button {
+      min-width: 132px;
+      padding: 8px 12px;
+      white-space: nowrap;
+    }
+
+    .order-details summary {
+      color: var(--gold);
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .payout-order-list {
+      display: grid;
+      gap: 4px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 0.76rem;
+      white-space: normal;
+      word-break: break-all;
+    }
+
+    .privacy-note {
+      margin: 22px 0 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+      text-align: center;
+    }
+
+    .logout-form {
+      margin: 0;
+    }
+
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 560px) {
+      .shell {
+        width: min(100% - 22px, 1180px);
+        padding-top: 18px;
+      }
+
+      .hero {
+        align-items: start;
+        flex-direction: column;
+      }
+
+      .panel-heading {
+        align-items: start;
+        flex-direction: column;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .metric {
+        min-height: 0;
+      }
+
+      .metric-label {
+        min-height: 0;
+      }
+
+      .panel,
+      .auth-card {
+        padding: 18px;
+      }
+    }
+
+    @page {
+      size: 5in 7in;
+      margin: 0.25in;
+    }
+
+    @media print {
+      body.qr-printing {
+        background: #ffffff;
+        color: #111111;
+      }
+
+      body.qr-printing > *:not(#qr-print-area) {
+        display: none !important;
+      }
+
+      body.qr-printing #qr-print-area {
+        display: grid !important;
+        width: 4.5in;
+        height: 6.5in;
+        min-height: 0;
+        background: #ffffff;
+        place-items: center;
+      }
+
+      body.qr-printing #qr-print-area .qr-card {
+        width: 4.5in;
+        height: 6.5in;
+        min-height: 0;
+        border: 2px solid #111111;
+        border-radius: 0.2in;
+        background: #ffffff;
+        color: #111111;
+        justify-content: flex-start;
+        overflow: hidden;
+        padding: 0.4in;
+        text-align: center;
+      }
+
+      body.qr-printing #qr-print-area .qr-print-kicker {
+        display: none;
+      }
+
+      body.qr-printing #qr-print-area .qr-stylist {
+        color: #111111;
+        font-size: 26pt;
+        line-height: 1.1;
+      }
+
+      body.qr-printing #qr-print-area .qr-salon {
+        min-height: 0;
+        margin: 0.08in 0 0;
+        color: #333333;
+        font-size: 14pt;
+        font-weight: 650;
+        line-height: 1.2;
+      }
+
+      body.qr-printing #qr-print-area .qr-location {
+        display: none;
+      }
+
+      body.qr-printing #qr-print-area .qr-code-frame {
+        width: 3.35in;
+        margin: 0.42in auto 0.25in;
+        padding: 0;
+      }
+
+      body.qr-printing #qr-print-area .qr-print-instruction {
+        display: block;
+        margin: 0;
+        color: #111111;
+        font-size: 15pt;
+        font-weight: 750;
+        line-height: 1.25;
+      }
+
+      body.qr-printing #qr-print-area .qr-link-row,
+      body.qr-printing #qr-print-area .qr-actions,
+      body.qr-printing #qr-print-area .qr-print-link {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  {% if mode == "dashboard" %}
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <div class="brand">Krezzcut</div>
+          <span class="partner-label">Partner reporting</span>
+          <div class="account">{{ current_user.email }}</div>
+        </div>
+        <form class="logout-form" method="post" action="{{ url_for('partner_logout') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="button-secondary" type="submit">Sign out</button>
+        </form>
+      </header>
+
+      <section class="hero">
+        <div>
+          {% if selected_salon %}
+            <h1>{{ selected_salon.salon_name }}</h1>
+            <div class="location">
+              {{ selected_salon.location_label or selected_salon.salon_code }}
+            </div>
+          {% else %}
+            <h1>All locations</h1>
+            <div class="location">
+              {{ current_user.salon_count }} assigned salons
+            </div>
+          {% endif %}
+        </div>
+        <div class="muted">Live sales only · Refresh for new activity</div>
+      </section>
+
+      {% if partner_notice %}
+        <p
+          class="notice{% if partner_notice.kind == 'error' %} error-notice{% endif %}"
+          role="status"
+        >{{ partner_notice.message }}</p>
+      {% endif %}
+
+      {% if current_user.salon_count > 1 %}
+        <nav class="location-switcher" aria-label="Choose a salon">
+          <h2>Locations</h2>
+          <div class="location-pills">
+            <a
+              class="location-pill{% if not selected_salon %} active{% endif %}"
+              href="{{ url_for('partner_dashboard') }}"
+            >All locations</a>
+            {% for salon in current_user.salons %}
+              <a
+                class="location-pill{% if selected_salon and selected_salon.salon_code == salon.salon_code %} active{% endif %}"
+                href="{{ url_for('partner_dashboard', salon=salon.salon_code) }}"
+              >{{ salon.salon_name }} · {{ salon.location_label or salon.salon_code }}</a>
+            {% endfor %}
+          </div>
+        </nav>
+      {% endif %}
+
+      <section class="grid" aria-label="Combined totals">
+        <article class="metric">
+          <span class="metric-label">Combined paid Krezzcut sales</span>
+          <strong class="metric-value">{{ totals.paid_sales }}</strong>
+        </article>
+        <article class="metric">
+          <span class="metric-label">Combined customer revenue</span>
+          <strong class="metric-value">{{ totals.customer_revenue_cents | money }}</strong>
+        </article>
+        <article class="metric">
+          <span class="metric-label">Combined stylist credits</span>
+          <strong class="metric-value">{{ totals.stylist_credits_cents | money }}</strong>
+        </article>
+        <article class="metric">
+          <span class="metric-label">Combined salon share</span>
+          <strong class="metric-value">{{ totals.salon_share_cents | money }}</strong>
+        </article>
+      </section>
+
+      <section class="panel" aria-labelledby="payout-summary-heading">
+        <div class="panel-heading">
+          <h2 id="payout-summary-heading">Stylist payout tracking</h2>
+          <p class="muted">Manual payments · Lifetime totals</p>
+        </div>
+        <div class="grid" aria-label="Stylist payout totals">
+          <article class="metric">
+            <span class="metric-label">Total earned</span>
+            <strong class="metric-value">{{ totals.stylist_credits_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Total already paid</span>
+            <strong class="metric-value">{{ totals.stylist_paid_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Current amount owed</span>
+            <strong class="metric-value">{{ totals.stylist_owed_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Last payout date</span>
+            <strong class="metric-value">
+              {% if totals.last_stylist_payout_at %}
+                {{ totals.last_stylist_payout_at.strftime('%b %d, %Y') }}
+              {% else %}
+                —
+              {% endif %}
+            </strong>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Sales by salon</h2>
+          <p class="muted">Select a salon to view its stylists</p>
+        </div>
+        {% if salon_breakdown %}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Salon</th>
+                  <th>Location</th>
+                  <th class="number">Sales</th>
+                  <th class="number">Customer revenue</th>
+                  <th class="number">Stylist credits</th>
+                  <th class="number">Stylist paid</th>
+                  <th class="number">Stylist owed</th>
+                  <th class="number">Salon share</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for salon in salon_breakdown %}
+                  <tr>
+                    <td>{{ salon.salon_name }}</td>
+                    <td>{{ salon.location_label or salon.salon_code }}</td>
+                    <td class="number">{{ salon.paid_sales }}</td>
+                    <td class="number">{{ salon.customer_revenue_cents | money }}</td>
+                    <td class="number">{{ salon.stylist_credits_cents | money }}</td>
+                    <td class="number">{{ salon.stylist_paid_cents | money }}</td>
+                    <td class="number">{{ salon.stylist_owed_cents | money }}</td>
+                    <td class="number">{{ salon.salon_share_cents | money }}</td>
+                    <td>
+                      <a
+                        class="table-link"
+                        href="{{ url_for('partner_dashboard', salon=salon.salon_code) }}"
+                      >View</a>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No active salons are assigned to this login.</p>
+        {% endif %}
+      </section>
+
+      {% if selected_salon %}
+        <section class="panel" id="stylist-payouts">
+          <div class="panel-heading">
+            <h2>Stylist performance and payouts</h2>
+            <p class="muted">
+              {{ selected_salon.salon_name }} · Lifetime totals
+            </p>
+          </div>
+          {% if stylists %}
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Stylist</th>
+                    <th class="number">Sales</th>
+                    <th class="number">Customer revenue</th>
+                    <th class="number">Total earned</th>
+                    <th class="number">Total paid</th>
+                    <th class="number">Amount owed</th>
+                    <th>Last payout</th>
+                    <th class="number">Salon share</th>
+                    {% if current_user.can_manage_payouts %}
+                      <th></th>
+                    {% endif %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for stylist in stylists %}
+                    <tr>
+                      <td>{{ stylist.display_name }}</td>
+                      <td class="number">{{ stylist.sales }}</td>
+                      <td class="number">{{ stylist.customer_revenue_cents | money }}</td>
+                      <td class="number">{{ stylist.stylist_credits_cents | money }}</td>
+                      <td class="number">{{ stylist.stylist_paid_cents | money }}</td>
+                      <td class="number">{{ stylist.stylist_owed_cents | money }}</td>
+                      <td>
+                        {% if stylist.last_payout_at %}
+                          {{ stylist.last_payout_at.strftime('%b %d, %Y') }}
+                        {% else %}
+                          —
+                        {% endif %}
+                      </td>
+                      <td class="number">{{ stylist.salon_share_cents | money }}</td>
+                      {% if current_user.can_manage_payouts %}
+                        <td>
+                          {% if stylist.stylist_owed_cents > 0 %}
+                            <form
+                              class="payout-form"
+                              method="post"
+                              action="{{ stylist.mark_paid_url }}"
+                              onsubmit="return window.confirm('Mark all currently unpaid stylist credits as paid?');"
+                            >
+                              <input
+                                type="hidden"
+                                name="csrf_token"
+                                value="{{ csrf_token }}"
+                              >
+                              <button type="submit">
+                                Mark Paid {{ stylist.stylist_owed_cents | money }}
+                              </button>
+                            </form>
+                          {% else %}
+                            <span class="status">Paid</span>
+                          {% endif %}
+                        </td>
+                      {% endif %}
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="empty">No stylists have been added to this salon yet.</p>
+          {% endif %}
+        </section>
+      {% endif %}
+
+      <section class="panel" id="payout-history">
+        <div class="panel-heading">
+          <h2>Payout history</h2>
+          <p class="muted">
+            {% if selected_salon %}
+              {{ selected_salon.salon_name }}
+            {% else %}
+              All assigned salons
+            {% endif %}
+          </p>
+        </div>
+        {% if payout_history %}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Salon</th>
+                  <th>Stylist</th>
+                  <th class="number">Amount paid</th>
+                  <th>Included sales</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for payout in payout_history %}
+                  <tr>
+                    <td>{{ payout.paid_at.strftime('%b %d, %Y · %I:%M %p') }} UTC</td>
+                    <td>
+                      {{ payout.salon_name }}
+                      {% if payout.location_label %}
+                        · {{ payout.location_label }}
+                      {% endif %}
+                    </td>
+                    <td>{{ payout.stylist_name }}</td>
+                    <td class="number">{{ payout.amount_cents | money }}</td>
+                    <td>
+                      <details class="order-details">
+                        <summary>
+                          {{ payout.sales_count }}
+                          sale{% if payout.sales_count != 1 %}s{% endif %}
+                        </summary>
+                        <div class="payout-order-list">
+                          {% for order_id in payout.order_ids %}
+                            <span>{{ order_id }}</span>
+                          {% endfor %}
+                        </div>
+                      </details>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No stylist payouts have been recorded yet.</p>
+        {% endif %}
+      </section>
+
+      <section class="panel" id="qr-library">
+        <div class="panel-heading">
+          <h2>QR / Partner Links Library</h2>
+          <p class="muted">{{ qr_stylists | length }} active stylists across your assigned salons</p>
+        </div>
+        {% if qr_stylists %}
+          <div class="qr-grid">
+            {% for stylist in qr_stylists %}
+              <article class="qr-card" id="qr-card-{{ loop.index }}">
+                <div class="qr-print-kicker">Krezzcut</div>
+                <h3 class="qr-stylist">{{ stylist.display_name }}</h3>
+                <p class="qr-salon">
+                  {{ stylist.salon_name }}
+                  {% if stylist.location_label %}
+                    <span class="qr-location">· {{ stylist.location_label }}</span>
+                  {% endif %}
+                </p>
+                <div class="qr-code-frame">
+                  <img
+                    src="{{ stylist.qr_preview_url }}"
+                    alt="Krezzcut partner QR code for {{ stylist.display_name }} at {{ stylist.salon_name }}"
+                    loading="lazy"
+                    width="348"
+                    height="348"
+                  >
+                </div>
+                <p class="qr-print-instruction">Scan to start your Krezzcut mold</p>
+                <div class="qr-link-row">
+                  <label for="partner-link-{{ loop.index }}">Permanent partner link</label>
+                  <input
+                    class="qr-link-field"
+                    id="partner-link-{{ loop.index }}"
+                    type="text"
+                    value="{{ stylist.partner_link }}"
+                    readonly
+                  >
+                  <button
+                    class="button-secondary"
+                    type="button"
+                    data-copy-link="{{ stylist.partner_link }}"
+                  >Copy Link</button>
+                </div>
+                <div class="qr-actions">
+                  <a
+                    class="button"
+                    href="{{ stylist.qr_download_url }}"
+                    download
+                  >Download 5 × 7</a>
+                  <button
+                    class="button-secondary"
+                    type="button"
+                    data-print-card="qr-card-{{ loop.index }}"
+                  >Print 5 × 7</button>
+                  <a
+                    class="button"
+                    href="{{ stylist.business_front_download_url }}"
+                    download
+                  >Download Business Card Front</a>
+                  <a
+                    class="button"
+                    href="{{ stylist.business_back_download_url }}"
+                    download
+                  >Download Business Card Back</a>
+                  <a
+                    class="button button-secondary"
+                    href="{{ stylist.business_front_print_url }}"
+                    target="_blank"
+                    rel="noopener"
+                  >Print Business Card Front</a>
+                  <a
+                    class="button button-secondary"
+                    href="{{ stylist.business_back_print_url }}"
+                    target="_blank"
+                    rel="noopener"
+                  >Print Business Card Back</a>
                 </div>
                 <div class="qr-print-link">{{ stylist.partner_link }}</div>
               </article>
