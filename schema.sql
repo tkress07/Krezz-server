@@ -84,6 +84,64 @@ CREATE TABLE IF NOT EXISTS salon_users (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE salon_users
+    ADD COLUMN IF NOT EXISTS can_manage_payouts BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Manual payout ledger. The salon_share type is reserved for a later UI and
+-- this release only creates stylist_credit payouts.
+CREATE TABLE IF NOT EXISTS partner_payouts (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payout_type TEXT NOT NULL
+        CHECK (payout_type IN ('stylist_credit', 'salon_share')),
+    salon_id BIGINT NOT NULL
+        REFERENCES salons(id) ON DELETE RESTRICT,
+    stylist_id BIGINT,
+    amount_cents INTEGER NOT NULL
+        CHECK (amount_cents > 0),
+    currency TEXT NOT NULL DEFAULT 'usd'
+        CHECK (currency ~ '^[a-z]{3}$'),
+    paid_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by_user_id BIGINT NOT NULL
+        REFERENCES salon_users(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (id, payout_type),
+    CONSTRAINT partner_payouts_stylist_belongs_to_salon
+        FOREIGN KEY (stylist_id, salon_id)
+        REFERENCES stylists(id, salon_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT partner_payouts_payee_matches_type
+        CHECK (
+            (
+                payout_type = 'stylist_credit'
+                AND stylist_id IS NOT NULL
+            )
+            OR
+            (
+                payout_type = 'salon_share'
+                AND stylist_id IS NULL
+            )
+        )
+);
+
+-- Each row records the exact sale component included in a payout. The unique
+-- order/type constraint prevents the same earning from being paid twice.
+CREATE TABLE IF NOT EXISTS partner_payout_items (
+    payout_id BIGINT NOT NULL,
+    payout_type TEXT NOT NULL
+        CHECK (payout_type IN ('stylist_credit', 'salon_share')),
+    order_id TEXT NOT NULL
+        REFERENCES partner_orders(order_id) ON DELETE RESTRICT,
+    amount_cents INTEGER NOT NULL
+        CHECK (amount_cents > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (payout_id, order_id),
+    UNIQUE (order_id, payout_type),
+    CONSTRAINT partner_payout_items_matches_payout_type
+        FOREIGN KEY (payout_id, payout_type)
+        REFERENCES partner_payouts(id, payout_type)
+        ON DELETE RESTRICT
+);
+
 CREATE INDEX IF NOT EXISTS partner_orders_salon_paid_at_idx
     ON partner_orders (salon_id, paid_at DESC);
 
@@ -95,6 +153,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS salon_users_email_lower_uidx
 
 CREATE INDEX IF NOT EXISTS salon_users_salon_id_idx
     ON salon_users (salon_id);
+
+CREATE INDEX IF NOT EXISTS partner_payouts_stylist_paid_at_idx
+    ON partner_payouts (stylist_id, paid_at DESC)
+    WHERE payout_type = 'stylist_credit';
+
+CREATE INDEX IF NOT EXISTS partner_payouts_salon_paid_at_idx
+    ON partner_payouts (salon_id, paid_at DESC);
+
+CREATE INDEX IF NOT EXISTS partner_payout_items_payout_id_idx
+    ON partner_payout_items (payout_id);
 
 CREATE TABLE IF NOT EXISTS salon_user_access (
     user_id BIGINT NOT NULL
