@@ -51,7 +51,7 @@ except Exception:
     # the PostgreSQL driver is unavailable for any reason.
     psycopg = None
 
-APP_VERSION = "KrezzServer/2.5.0-manual-stylist-payouts"
+APP_VERSION = "KrezzServer/2.5.1-avery-8471-sheets"
 
 app = Flask(__name__)
 
@@ -3434,8 +3434,10 @@ def partner_qr_library_script():
     document.getElementById("qr-print-area")?.replaceChildren();
   });
 
-  const autoPrintImage = document.querySelector("[data-auto-print-image]");
-  if (autoPrintImage) {
+  const autoPrintImages = Array.from(
+    document.querySelectorAll("[data-auto-print-image]")
+  );
+  if (autoPrintImages.length > 0) {
     let printStarted = false;
     const openAutoPrintDialog = () => {
       if (printStarted) {
@@ -3444,11 +3446,23 @@ def partner_qr_library_script():
       printStarted = true;
       window.setTimeout(() => window.print(), 120);
     };
-    if (autoPrintImage.complete) {
+
+    let waitingFor = autoPrintImages.filter((image) => !image.complete).length;
+    if (waitingFor === 0) {
       openAutoPrintDialog();
     } else {
-      autoPrintImage.addEventListener("load", openAutoPrintDialog, { once: true });
-      autoPrintImage.addEventListener("error", openAutoPrintDialog, { once: true });
+      const imageFinished = () => {
+        waitingFor -= 1;
+        if (waitingFor === 0) {
+          openAutoPrintDialog();
+        }
+      };
+      autoPrintImages.forEach((image) => {
+        if (!image.complete) {
+          image.addEventListener("load", imageFinished, { once: true });
+          image.addEventListener("error", imageFinished, { once: true });
+        }
+      });
     }
   }
 })();
@@ -3654,6 +3668,188 @@ def partner_business_card_print(
         if getattr(exc, "code", None) in (404, 503):
             raise
         print(f"🟠 Partner business-card print failed safely: {exc}")
+        abort(503)
+
+
+@app.route(
+    "/partner/qr/<salon_code>/<stylist_code>/print/avery-8471/<card_side>",
+    methods=["GET"],
+)
+def partner_avery_8471_print(
+    salon_code: str,
+    stylist_code: str,
+    card_side: str,
+):
+    if not _partner_dashboard_ready():
+        abort(503)
+
+    asset_by_side = {
+        "front": "business-front",
+        "back": "business-back",
+    }
+    normalized_side = (card_side or "").strip().lower()
+    asset = asset_by_side.get(normalized_side)
+    if asset is None:
+        abort(404)
+
+    try:
+        current_user = _partner_current_user()
+        if current_user is None:
+            session.clear()
+            return redirect(url_for("partner_login"))
+
+        with _partner_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM salon_user_access AS access
+                    JOIN salons AS s
+                      ON s.id = access.salon_id
+                     AND s.active = TRUE
+                    JOIN stylists AS st
+                      ON st.salon_id = s.id
+                     AND st.active = TRUE
+                    WHERE access.user_id = %s
+                      AND access.active = TRUE
+                      AND s.salon_code = %s
+                      AND st.stylist_code = %s
+                    LIMIT 1
+                    """,
+                    (
+                        int(current_user["user_id"]),
+                        salon_code,
+                        stylist_code,
+                    ),
+                )
+                if cur.fetchone() is None:
+                    abort(404)
+
+        image_url = html.escape(
+            url_for(
+                "partner_qr_png",
+                salon_code=salon_code,
+                stylist_code=stylist_code,
+                asset=asset,
+            ),
+            quote=True,
+        )
+        script_url = html.escape(
+            url_for("partner_qr_library_script"),
+            quote=True,
+        )
+        side_title = "Front" if normalized_side == "front" else "Back"
+        title_html = html.escape(f"Avery 8471 {side_title} Sheet")
+        card_alt = html.escape(
+            f"Krezzcut business card {normalized_side}",
+            quote=True,
+        )
+        cards_html = "\n".join(
+            (
+                '<div class="avery-card">'
+                f'<img src="{image_url}" alt="{card_alt}" '
+                'data-auto-print-image>'
+                "</div>"
+            )
+            for _ in range(10)
+        )
+
+        response = make_response(
+            f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title_html} · Krezzcut</title>
+  <style>
+    @page {{ size: Letter portrait; margin: 0; }}
+    * {{ box-sizing: border-box; }}
+    html, body {{
+      width: 8.5in;
+      height: 11in;
+      margin: 0;
+      padding: 0;
+      background: white;
+    }}
+    body {{
+      color: #111;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }}
+    .avery-sheet {{
+      display: grid;
+      width: 8.5in;
+      height: 11in;
+      margin: 0;
+      padding: 0.5in 0.75in;
+      grid-template-columns: repeat(2, 3.5in);
+      grid-template-rows: repeat(5, 2in);
+      column-gap: 0;
+      row-gap: 0;
+      overflow: hidden;
+      page-break-after: avoid;
+      page-break-inside: avoid;
+    }}
+    .avery-card {{
+      width: 3.5in;
+      height: 2in;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }}
+    .avery-card img {{
+      display: block;
+      width: 3.5in;
+      height: 2in;
+      margin: 0;
+      object-fit: fill;
+    }}
+    .hint {{
+      position: fixed;
+      z-index: 10;
+      top: 12px;
+      left: 50%;
+      width: max-content;
+      max-width: calc(100vw - 24px);
+      margin: 0;
+      border-radius: 999px;
+      background: #111;
+      color: white;
+      padding: 9px 14px;
+      font-size: 14px;
+      text-align: center;
+      transform: translateX(-50%);
+    }}
+    @media screen {{
+      body {{ background: #d7d7d7; }}
+      .avery-sheet {{
+        margin: 52px auto 20px;
+        background: white;
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+      }}
+    }}
+    @media print {{
+      .hint {{ display: none; }}
+      .avery-sheet {{ margin: 0; }}
+    }}
+  </style>
+</head>
+<body>
+  <p class="hint">Print on US Letter at Actual Size / 100%. Do not use Fit to Page.</p>
+  <main class="avery-sheet" aria-label="{title_html}">
+    {cards_html}
+  </main>
+  <script src="{script_url}" defer></script>
+</body>
+</html>"""
+        )
+        response.headers["Content-Type"] = "text/html; charset=utf-8"
+        return response
+    except Exception as exc:
+        if getattr(exc, "code", None) in (404, 503):
+            raise
+        print(f"🟠 Avery 8471 sheet generation failed safely: {exc}")
         abort(503)
 
 
@@ -4279,6 +4475,18 @@ def partner_dashboard():
                     ),
                     "business_back_print_url": url_for(
                         "partner_business_card_print",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                        card_side="back",
+                    ),
+                    "avery_front_print_url": url_for(
+                        "partner_avery_8471_print",
+                        salon_code=salon_code,
+                        stylist_code=stylist_code,
+                        card_side="front",
+                    ),
+                    "avery_back_print_url": url_for(
+                        "partner_avery_8471_print",
                         salon_code=salon_code,
                         stylist_code=stylist_code,
                         card_side="back",
