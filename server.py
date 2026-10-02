@@ -30,6 +30,14 @@ import qrcode
 import requests
 import stripe
 from PIL import Image, ImageDraw, ImageFont
+from reportlab.graphics import renderPDF
+from reportlab.graphics.barcode import qr as reportlab_qr
+from reportlab.graphics.shapes import Drawing
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfgen import canvas as reportlab_canvas
 from flask import (
     Flask,
     request,
@@ -51,7 +59,7 @@ except Exception:
     # the PostgreSQL driver is unavailable for any reason.
     psycopg = None
 
-APP_VERSION = "KrezzServer/2.5.1-avery-8471-pdf"
+APP_VERSION = "KrezzServer/2.5.2-memory-safe-avery"
 
 app = Flask(__name__)
 
@@ -2417,12 +2425,11 @@ PARTNER_LINK_BASE_URL = "https://krezzcut.com/p"
 PARTNER_CARD_WIDTH_PX = 1500
 PARTNER_CARD_HEIGHT_PX = 2100
 PARTNER_CARD_DPI = 300
-PARTNER_BUSINESS_CARD_WIDTH_PX = 1050
-PARTNER_BUSINESS_CARD_HEIGHT_PX = 600
-PARTNER_AVERY_8471_WIDTH_PX = 2550
-PARTNER_AVERY_8471_HEIGHT_PX = 3300
-PARTNER_AVERY_8471_LEFT_PX = 225
-PARTNER_AVERY_8471_TOP_PX = 150
+PARTNER_AVERY_CARD_WIDTH_PT = 3.5 * inch
+PARTNER_AVERY_CARD_HEIGHT_PT = 2.0 * inch
+PARTNER_AVERY_LEFT_MARGIN_PT = 0.75 * inch
+PARTNER_AVERY_TOP_MARGIN_PT = 0.5 * inch
+_PARTNER_AVERY_PDF_LOCK = threading.BoundedSemaphore(1)
 _PARTNER_DUMMY_PASSWORD_HASH = generate_password_hash(
     secrets.token_urlsafe(32)
 )
@@ -2553,9 +2560,12 @@ def _partner_qr_png_bytes(partner_link: str) -> bytes:
     qr.make(fit=True)
 
     image = qr.make_image(fill_color="black", back_color="white")
-    output = io.BytesIO()
-    image.save(output, format="PNG")
-    return output.getvalue()
+    try:
+        with io.BytesIO() as output:
+            image.save(output, format="PNG")
+            return output.getvalue()
+    finally:
+        image.close()
 
 
 @lru_cache(maxsize=128)
@@ -2626,423 +2636,408 @@ def _partner_qr_card_png_bytes(
         (PARTNER_CARD_WIDTH_PX, PARTNER_CARD_HEIGHT_PX),
         "white",
     )
-    draw = ImageDraw.Draw(card)
-    draw.rounded_rectangle(
-        (55, 55, PARTNER_CARD_WIDTH_PX - 55, PARTNER_CARD_HEIGHT_PX - 55),
-        radius=42,
-        outline="#E0BA6C",
-        width=8,
-    )
-
-    safe_text_width = PARTNER_CARD_WIDTH_PX - 300
-    stylist_font = _partner_fitted_font(
-        draw,
-        stylist_name,
-        maximum_width=safe_text_width,
-        starting_size=108,
-        minimum_size=58,
-        bold=True,
-    )
-    salon_font = _partner_fitted_font(
-        draw,
-        salon_name,
-        maximum_width=safe_text_width,
-        starting_size=66,
-        minimum_size=42,
-        bold=False,
-    )
-    instruction = "Scan to start your Krezzcut mold"
-    instruction_font = _partner_fitted_font(
-        draw,
-        instruction,
-        maximum_width=safe_text_width,
-        starting_size=58,
-        minimum_size=42,
-        bold=True,
-    )
-
-    _partner_draw_centered_text(
-        draw,
-        stylist_name,
-        y=145,
-        font=stylist_font,
-        fill="#111111",
-    )
-    _partner_draw_centered_text(
-        draw,
-        salon_name,
-        y=300,
-        font=salon_font,
-        fill="#333333",
-    )
-
-    qr_image = Image.open(
-        io.BytesIO(_partner_qr_png_bytes(partner_link))
-    ).convert("RGB")
-    maximum_qr_width = 1200
-    integer_scale = max(1, maximum_qr_width // qr_image.width)
-    if integer_scale > 1:
-        qr_image = qr_image.resize(
-            (
-                qr_image.width * integer_scale,
-                qr_image.height * integer_scale,
-            ),
-            resample=Image.Resampling.NEAREST,
+    qr_image = None
+    try:
+        draw = ImageDraw.Draw(card)
+        draw.rounded_rectangle(
+            (55, 55, PARTNER_CARD_WIDTH_PX - 55, PARTNER_CARD_HEIGHT_PX - 55),
+            radius=42,
+            outline="#E0BA6C",
+            width=8,
         )
 
-    qr_x = (PARTNER_CARD_WIDTH_PX - qr_image.width) // 2
-    qr_y = 500
-    card.paste(qr_image, (qr_x, qr_y))
+        safe_text_width = PARTNER_CARD_WIDTH_PX - 300
+        stylist_font = _partner_fitted_font(
+            draw,
+            stylist_name,
+            maximum_width=safe_text_width,
+            starting_size=108,
+            minimum_size=58,
+            bold=True,
+        )
+        salon_font = _partner_fitted_font(
+            draw,
+            salon_name,
+            maximum_width=safe_text_width,
+            starting_size=66,
+            minimum_size=42,
+            bold=False,
+        )
+        instruction = "Scan to start your Krezzcut mold"
+        instruction_font = _partner_fitted_font(
+            draw,
+            instruction,
+            maximum_width=safe_text_width,
+            starting_size=58,
+            minimum_size=42,
+            bold=True,
+        )
 
-    instruction_y = qr_y + qr_image.height + 95
-    _partner_draw_centered_text(
-        draw,
-        instruction,
-        y=instruction_y,
-        font=instruction_font,
-        fill="#111111",
-    )
+        _partner_draw_centered_text(
+            draw,
+            stylist_name,
+            y=145,
+            font=stylist_font,
+            fill="#111111",
+        )
+        _partner_draw_centered_text(
+            draw,
+            salon_name,
+            y=300,
+            font=salon_font,
+            fill="#333333",
+        )
 
-    output = io.BytesIO()
-    card.save(
-        output,
-        format="PNG",
-        dpi=(PARTNER_CARD_DPI, PARTNER_CARD_DPI),
-        optimize=True,
-    )
-    return output.getvalue()
+        with io.BytesIO(_partner_qr_png_bytes(partner_link)) as qr_source:
+            with Image.open(qr_source) as opened_qr:
+                qr_image = opened_qr.convert("RGB")
+
+        maximum_qr_width = 1200
+        integer_scale = max(1, maximum_qr_width // qr_image.width)
+        if integer_scale > 1:
+            resized_qr = qr_image.resize(
+                (
+                    qr_image.width * integer_scale,
+                    qr_image.height * integer_scale,
+                ),
+                resample=Image.Resampling.NEAREST,
+            )
+            qr_image.close()
+            qr_image = resized_qr
+
+        qr_x = (PARTNER_CARD_WIDTH_PX - qr_image.width) // 2
+        qr_y = 500
+        card.paste(qr_image, (qr_x, qr_y))
+
+        instruction_y = qr_y + qr_image.height + 95
+        _partner_draw_centered_text(
+            draw,
+            instruction,
+            y=instruction_y,
+            font=instruction_font,
+            fill="#111111",
+        )
+
+        with io.BytesIO() as output:
+            card.save(
+                output,
+                format="PNG",
+                dpi=(PARTNER_CARD_DPI, PARTNER_CARD_DPI),
+                optimize=True,
+            )
+            return output.getvalue()
+    finally:
+        if qr_image is not None:
+            qr_image.close()
+        card.close()
 
 
-def _partner_draw_centered_in_region(
-    draw,
+def _partner_pdf_fitted_font_size(
     text: str,
     *,
-    left: int,
-    right: int,
-    y: int,
-    font,
-    fill: str,
+    font_name: str,
+    maximum_width: float,
+    starting_size: float,
+    minimum_size: float,
+) -> float:
+    size = float(starting_size)
+    while size > minimum_size:
+        if pdfmetrics.stringWidth(text, font_name, size) <= maximum_width:
+            return size
+        size -= 0.5
+    return float(minimum_size)
+
+
+def _partner_pdf_draw_centered(
+    pdf,
+    text: str,
+    *,
+    left: float,
+    right: float,
+    y: float,
+    font_name: str,
+    font_size: float,
+    color,
 ) -> None:
-    bounds = draw.textbbox((0, 0), text, font=font)
-    text_width = bounds[2] - bounds[0]
-    region_center = (left + right) / 2
-    x = region_center - (text_width / 2) - bounds[0]
-    draw.text((x, y - bounds[1]), text, font=font, fill=fill)
+    pdf.setFillColor(color)
+    pdf.setFont(font_name, font_size)
+    pdf.drawCentredString((left + right) / 2.0, y, text)
 
 
-def _partner_wrapped_lines(
-    draw,
-    text: str,
-    *,
-    font,
-    maximum_width: int,
-) -> List[str]:
-    words = text.split()
-    if not words:
-        return []
-
-    lines: List[str] = []
-    current = words[0]
-    for word in words[1:]:
-        candidate = f"{current} {word}"
-        bounds = draw.textbbox((0, 0), candidate, font=font)
-        if bounds[2] - bounds[0] <= maximum_width:
-            current = candidate
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
-
-
-def _partner_qr_image_within(
+def _partner_pdf_draw_qr(
+    pdf,
     partner_link: str,
-    maximum_width: int,
-):
-    probe = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=1,
-        border=4,
+    *,
+    x: float,
+    y: float,
+    size: float,
+) -> None:
+    qr_widget = reportlab_qr.QrCodeWidget(
+        partner_link,
+        barLevel="M",
+        barBorder=4,
+        barWidth=size,
+        barHeight=size,
+        barFillColor=colors.black,
     )
-    probe.add_data(partner_link)
-    probe.make(fit=True)
-    module_width = len(probe.get_matrix())
-    box_size = max(1, maximum_width // module_width)
-
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=box_size,
-        border=4,
-    )
-    qr.add_data(partner_link)
-    qr.make(fit=True)
-    image = qr.make_image(fill_color="black", back_color="white")
-    output = io.BytesIO()
-    image.save(output, format="PNG")
-    return Image.open(io.BytesIO(output.getvalue())).convert("RGB")
+    drawing = Drawing(size, size)
+    drawing.add(qr_widget)
+    renderPDF.draw(drawing, pdf, x, y)
 
 
-@lru_cache(maxsize=2048)
-def _partner_business_card_front_png_bytes(
+def _partner_pdf_draw_front_card(
+    pdf,
     partner_link: str,
     stylist_name: str,
     salon_name: str,
-) -> bytes:
-    card = Image.new(
-        "RGB",
-        (
-            PARTNER_BUSINESS_CARD_WIDTH_PX,
-            PARTNER_BUSINESS_CARD_HEIGHT_PX,
-        ),
-        "white",
-    )
-    draw = ImageDraw.Draw(card)
-    draw.rounded_rectangle(
-        (
-            24,
-            24,
-            PARTNER_BUSINESS_CARD_WIDTH_PX - 24,
-            PARTNER_BUSINESS_CARD_HEIGHT_PX - 24,
-        ),
-        radius=30,
-        outline="#E0BA6C",
-        width=6,
+) -> None:
+    card_width = PARTNER_AVERY_CARD_WIDTH_PT
+    card_height = PARTNER_AVERY_CARD_HEIGHT_PT
+    inset = 6.0
+
+    pdf.setFillColor(colors.white)
+    pdf.rect(0, 0, card_width, card_height, stroke=0, fill=1)
+    pdf.setStrokeColor(colors.HexColor("#E0BA6C"))
+    pdf.setLineWidth(1.5)
+    pdf.roundRect(
+        inset,
+        inset,
+        card_width - (2 * inset),
+        card_height - (2 * inset),
+        7.0,
+        stroke=1,
+        fill=0,
     )
 
-    text_left = 58
-    text_right = 500
+    text_left = 14.0
+    text_right = 120.0
     text_width = text_right - text_left
-    app_name_font = _partner_fitted_font(
-        draw,
+    app_font_size = _partner_pdf_fitted_font_size(
         "KREZZCUT",
+        font_name="Helvetica-Bold",
         maximum_width=text_width,
-        starting_size=40,
-        minimum_size=32,
-        bold=True,
+        starting_size=9.6,
+        minimum_size=7.7,
     )
-    stylist_font = _partner_fitted_font(
-        draw,
+    stylist_font_size = _partner_pdf_fitted_font_size(
         stylist_name,
+        font_name="Helvetica-Bold",
         maximum_width=text_width,
-        starting_size=68,
-        minimum_size=34,
-        bold=True,
+        starting_size=16.3,
+        minimum_size=8.2,
     )
-    salon_font = _partner_fitted_font(
-        draw,
+    salon_font_size = _partner_pdf_fitted_font_size(
         salon_name,
+        font_name="Helvetica",
         maximum_width=text_width,
-        starting_size=42,
-        minimum_size=28,
-        bold=False,
+        starting_size=10.1,
+        minimum_size=6.7,
     )
-    download_font = _partner_fitted_font(
-        draw,
+    download_font_size = _partner_pdf_fitted_font_size(
         "Download on iPhone",
+        font_name="Helvetica-Bold",
         maximum_width=text_width,
-        starting_size=32,
-        minimum_size=26,
-        bold=True,
+        starting_size=7.7,
+        minimum_size=6.2,
     )
 
-    _partner_draw_centered_in_region(
-        draw,
+    _partner_pdf_draw_centered(
+        pdf,
         "KREZZCUT",
         left=text_left,
         right=text_right,
-        y=68,
-        font=app_name_font,
-        fill="#9F7934",
+        y=118.0,
+        font_name="Helvetica-Bold",
+        font_size=app_font_size,
+        color=colors.HexColor("#9F7934"),
     )
-
-    _partner_draw_centered_in_region(
-        draw,
+    _partner_pdf_draw_centered(
+        pdf,
         stylist_name,
         left=text_left,
         right=text_right,
-        y=178,
-        font=stylist_font,
-        fill="#111111",
+        y=86.0,
+        font_name="Helvetica-Bold",
+        font_size=stylist_font_size,
+        color=colors.HexColor("#111111"),
     )
-    _partner_draw_centered_in_region(
-        draw,
+    _partner_pdf_draw_centered(
+        pdf,
         salon_name,
         left=text_left,
         right=text_right,
-        y=322,
-        font=salon_font,
-        fill="#333333",
+        y=57.0,
+        font_name="Helvetica",
+        font_size=salon_font_size,
+        color=colors.HexColor("#333333"),
     )
-    _partner_draw_centered_in_region(
-        draw,
+    _partner_pdf_draw_centered(
+        pdf,
         "Download on iPhone",
         left=text_left,
         right=text_right,
-        y=455,
-        font=download_font,
-        fill="#111111",
+        y=27.0,
+        font_name="Helvetica-Bold",
+        font_size=download_font_size,
+        color=colors.HexColor("#111111"),
     )
 
-    qr_image = _partner_qr_image_within(partner_link, 480)
-    qr_x = 530 + ((480 - qr_image.width) // 2)
-    qr_y = (PARTNER_BUSINESS_CARD_HEIGHT_PX - qr_image.height) // 2
-    card.paste(qr_image, (qr_x, qr_y))
-
-    output = io.BytesIO()
-    card.save(
-        output,
-        format="PNG",
-        dpi=(PARTNER_CARD_DPI, PARTNER_CARD_DPI),
-        optimize=True,
-    )
-    return output.getvalue()
-
-
-@lru_cache(maxsize=1)
-def _partner_business_card_back_png_bytes() -> bytes:
-    card = Image.new(
-        "RGB",
-        (
-            PARTNER_BUSINESS_CARD_WIDTH_PX,
-            PARTNER_BUSINESS_CARD_HEIGHT_PX,
-        ),
-        "white",
-    )
-    draw = ImageDraw.Draw(card)
-    draw.rounded_rectangle(
-        (
-            24,
-            24,
-            PARTNER_BUSINESS_CARD_WIDTH_PX - 24,
-            PARTNER_BUSINESS_CARD_HEIGHT_PX - 24,
-        ),
-        radius=30,
-        outline="#E0BA6C",
-        width=6,
+    qr_size = 115.2
+    _partner_pdf_draw_qr(
+        pdf,
+        partner_link,
+        x=card_width - qr_size - 9.6,
+        y=(card_height - qr_size) / 2.0,
+        size=qr_size,
     )
 
-    heading_font = _partner_card_font(58, True)
-    step_font = _partner_card_font(34, False)
-    note_font = _partner_card_font(27, True)
 
-    _partner_draw_centered_in_region(
-        draw,
+def _partner_pdf_draw_back_card(pdf) -> None:
+    card_width = PARTNER_AVERY_CARD_WIDTH_PT
+    card_height = PARTNER_AVERY_CARD_HEIGHT_PT
+    inset = 6.0
+
+    pdf.setFillColor(colors.white)
+    pdf.rect(0, 0, card_width, card_height, stroke=0, fill=1)
+    pdf.setStrokeColor(colors.HexColor("#E0BA6C"))
+    pdf.setLineWidth(1.5)
+    pdf.roundRect(
+        inset,
+        inset,
+        card_width - (2 * inset),
+        card_height - (2 * inset),
+        7.0,
+        stroke=1,
+        fill=0,
+    )
+
+    _partner_pdf_draw_centered(
+        pdf,
         "How to Order",
-        left=55,
-        right=PARTNER_BUSINESS_CARD_WIDTH_PX - 55,
-        y=48,
-        font=heading_font,
-        fill="#111111",
+        left=13.0,
+        right=card_width - 13.0,
+        y=121.0,
+        font_name="Helvetica-Bold",
+        font_size=14.0,
+        color=colors.HexColor("#111111"),
     )
 
+    pdf.setFillColor(colors.HexColor("#222222"))
+    pdf.setFont("Helvetica", 8.2)
     steps = (
-        "1. Scan your stylist’s QR",
+        "1. Scan your stylist's QR",
         "2. Open Krezzcut",
         "3. Create and order your custom mold",
     )
     for index, step in enumerate(steps):
-        draw.text(
-            (95, 145 + (index * 64)),
-            step,
-            font=step_font,
-            fill="#222222",
-        )
+        pdf.drawString(23.0, 99.0 - (index * 15.4), step)
 
-    draw.line(
-        (95, 350, PARTNER_BUSINESS_CARD_WIDTH_PX - 95, 350),
-        fill="#E0BA6C",
-        width=4,
-    )
+    pdf.setStrokeColor(colors.HexColor("#E0BA6C"))
+    pdf.setLineWidth(1.0)
+    pdf.line(23.0, 60.0, card_width - 23.0, 60.0)
 
-    note = (
-        "Need to download Krezzcut? Install the app, then scan your "
-        "stylist’s QR again before ordering so they receive credit."
+    note_lines = (
+        "Need to download Krezzcut? Install the app, then scan your",
+        "stylist's QR again before ordering so they receive credit.",
     )
-    note_lines = _partner_wrapped_lines(
-        draw,
-        note,
-        font=note_font,
-        maximum_width=PARTNER_BUSINESS_CARD_WIDTH_PX - 190,
-    )
-    note_y = 380
-    for line in note_lines:
-        _partner_draw_centered_in_region(
-            draw,
+    for index, line in enumerate(note_lines):
+        _partner_pdf_draw_centered(
+            pdf,
             line,
-            left=80,
-            right=PARTNER_BUSINESS_CARD_WIDTH_PX - 80,
-            y=note_y,
-            font=note_font,
-            fill="#333333",
+            left=18.0,
+            right=card_width - 18.0,
+            y=43.0 - (index * 9.0),
+            font_name="Helvetica-Bold",
+            font_size=6.5,
+            color=colors.HexColor("#333333"),
         )
-        note_y += 38
 
-    output = io.BytesIO()
-    card.save(
-        output,
-        format="PNG",
-        dpi=(PARTNER_CARD_DPI, PARTNER_CARD_DPI),
-        optimize=True,
+
+def _partner_pdf_draw_avery_sheet(
+    pdf,
+    *,
+    form_name: str,
+) -> None:
+    page_width, page_height = letter
+    first_y = (
+        page_height
+        - PARTNER_AVERY_TOP_MARGIN_PT
+        - PARTNER_AVERY_CARD_HEIGHT_PT
     )
-    return output.getvalue()
+    for row_index in range(5):
+        y = first_y - (row_index * PARTNER_AVERY_CARD_HEIGHT_PT)
+        for column_index in range(2):
+            x = (
+                PARTNER_AVERY_LEFT_MARGIN_PT
+                + (column_index * PARTNER_AVERY_CARD_WIDTH_PT)
+            )
+            pdf.saveState()
+            pdf.translate(x, y)
+            pdf.doForm(form_name)
+            pdf.restoreState()
 
 
-@lru_cache(maxsize=2048)
-def _partner_avery_8471_pdf_bytes(
+def _partner_avery_8471_pdf_buffer(
     partner_link: str,
     stylist_name: str,
     salon_name: str,
-) -> bytes:
-    front_card = Image.open(
-        io.BytesIO(
-            _partner_business_card_front_png_bytes(
-                partner_link,
-                stylist_name,
-                salon_name,
-            )
-        )
-    ).convert("RGB")
-    back_card = Image.open(
-        io.BytesIO(_partner_business_card_back_png_bytes())
-    ).convert("RGB")
-
-    front_sheet = Image.new(
-        "RGB",
-        (PARTNER_AVERY_8471_WIDTH_PX, PARTNER_AVERY_8471_HEIGHT_PX),
-        "white",
-    )
-    back_sheet = Image.new(
-        "RGB",
-        (PARTNER_AVERY_8471_WIDTH_PX, PARTNER_AVERY_8471_HEIGHT_PX),
-        "white",
-    )
-
-    for row_index in range(5):
-        for column_index in range(2):
-            position = (
-                PARTNER_AVERY_8471_LEFT_PX
-                + (column_index * PARTNER_BUSINESS_CARD_WIDTH_PX),
-                PARTNER_AVERY_8471_TOP_PX
-                + (row_index * PARTNER_BUSINESS_CARD_HEIGHT_PX),
-            )
-            front_sheet.paste(front_card, position)
-            back_sheet.paste(back_card, position)
-
+) -> io.BytesIO:
     output = io.BytesIO()
-    front_sheet.save(
-        output,
-        format="PDF",
-        save_all=True,
-        append_images=[back_sheet],
-        resolution=float(PARTNER_CARD_DPI),
-        quality=100,
-        subsampling=0,
-        title=f"Krezzcut Avery 8471 - {stylist_name}",
-        author="Krezzcut",
-    )
-    return output.getvalue()
+    pdf = None
+    try:
+        pdf = reportlab_canvas.Canvas(
+            output,
+            pagesize=letter,
+            pageCompression=1,
+        )
+        pdf.setTitle(f"Krezzcut Avery 8471 - {stylist_name}")
+        pdf.setAuthor("Krezzcut")
+
+        front_form_name = "krezzcut_avery_front"
+        pdf.beginForm(
+            front_form_name,
+            0,
+            0,
+            PARTNER_AVERY_CARD_WIDTH_PT,
+            PARTNER_AVERY_CARD_HEIGHT_PT,
+        )
+        _partner_pdf_draw_front_card(
+            pdf,
+            partner_link,
+            stylist_name,
+            salon_name,
+        )
+        pdf.endForm()
+        _partner_pdf_draw_avery_sheet(
+            pdf,
+            form_name=front_form_name,
+        )
+        pdf.showPage()
+
+        back_form_name = "krezzcut_avery_back"
+        pdf.beginForm(
+            back_form_name,
+            0,
+            0,
+            PARTNER_AVERY_CARD_WIDTH_PT,
+            PARTNER_AVERY_CARD_HEIGHT_PT,
+        )
+        _partner_pdf_draw_back_card(pdf)
+        pdf.endForm()
+        _partner_pdf_draw_avery_sheet(
+            pdf,
+            form_name=back_form_name,
+        )
+        pdf.showPage()
+
+        pdf.save()
+        output.seek(0)
+        return output
+    except Exception:
+        output.close()
+        raise
+    finally:
+        pdf = None
 
 
 app.jinja_env.filters["money"] = _money
@@ -3494,23 +3489,6 @@ def partner_qr_library_script():
     document.getElementById("qr-print-area")?.replaceChildren();
   });
 
-  const autoPrintImage = document.querySelector("[data-auto-print-image]");
-  if (autoPrintImage) {
-    let printStarted = false;
-    const openAutoPrintDialog = () => {
-      if (printStarted) {
-        return;
-      }
-      printStarted = true;
-      window.setTimeout(() => window.print(), 120);
-    };
-    if (autoPrintImage.complete) {
-      openAutoPrintDialog();
-    } else {
-      autoPrintImage.addEventListener("load", openAutoPrintDialog, { once: true });
-      autoPrintImage.addEventListener("error", openAutoPrintDialog, { once: true });
-    }
-  }
 })();
 """.strip()
     )
@@ -3563,24 +3541,11 @@ def partner_qr_png(salon_code: str, stylist_code: str):
                     abort(404)
 
         partner_link = _partner_link(salon_code, stylist_code)
-        asset = (request.args.get("asset") or "").strip().lower()
-        if asset not in ("", "business-front", "business-back"):
+        if (request.args.get("asset") or "").strip():
             abort(404)
 
         download = request.args.get("download") == "1"
-        if asset == "business-front":
-            png_bytes = _partner_business_card_front_png_bytes(
-                partner_link,
-                str(stylist_row[1]),
-                str(stylist_row[0]),
-            )
-            filename = (
-                f"{salon_code}-{stylist_code}-business-card-front.png"
-            )
-        elif asset == "business-back":
-            png_bytes = _partner_business_card_back_png_bytes()
-            filename = "krezzcut-business-card-back.png"
-        elif download:
+        if download:
             png_bytes = _partner_qr_card_png_bytes(
                 partner_link,
                 str(stylist_row[1]),
@@ -3608,116 +3573,6 @@ def partner_qr_png(salon_code: str, stylist_code: str):
 
 
 @app.route(
-    "/partner/qr/<salon_code>/<stylist_code>/print/<card_side>",
-    methods=["GET"],
-)
-def partner_business_card_print(
-    salon_code: str,
-    stylist_code: str,
-    card_side: str,
-):
-    if not _partner_dashboard_ready():
-        abort(503)
-
-    asset_by_side = {
-        "front": "business-front",
-        "back": "business-back",
-    }
-    asset = asset_by_side.get((card_side or "").strip().lower())
-    if asset is None:
-        abort(404)
-
-    try:
-        current_user = _partner_current_user()
-        if current_user is None:
-            session.clear()
-            return redirect(url_for("partner_login"))
-
-        with _partner_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM salon_user_access AS access
-                    JOIN salons AS s
-                      ON s.id = access.salon_id
-                     AND s.active = TRUE
-                    JOIN stylists AS st
-                      ON st.salon_id = s.id
-                     AND st.active = TRUE
-                    WHERE access.user_id = %s
-                      AND access.active = TRUE
-                      AND s.salon_code = %s
-                      AND st.stylist_code = %s
-                    LIMIT 1
-                    """,
-                    (
-                        int(current_user["user_id"]),
-                        salon_code,
-                        stylist_code,
-                    ),
-                )
-                if cur.fetchone() is None:
-                    abort(404)
-
-        image_url = html.escape(
-            url_for(
-                "partner_qr_png",
-                salon_code=salon_code,
-                stylist_code=stylist_code,
-                asset=asset,
-            ),
-            quote=True,
-        )
-        script_url = html.escape(
-            url_for("partner_qr_library_script"),
-            quote=True,
-        )
-        title = "Business Card Front" if card_side == "front" else "Business Card Back"
-        title_html = html.escape(title)
-
-        response = make_response(
-            f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title_html} · Krezzcut</title>
-  <style>
-    @page {{ size: 3.5in 2in; margin: 0; }}
-    * {{ box-sizing: border-box; }}
-    html, body {{ margin: 0; width: 3.5in; height: 2in; background: white; }}
-    img {{ display: block; width: 3.5in; height: 2in; object-fit: contain; }}
-    .hint {{
-      position: fixed;
-      top: calc(2in + 16px);
-      left: 0;
-      width: 3.5in;
-      margin: 0;
-      color: #555;
-      font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      text-align: center;
-    }}
-    @media print {{ .hint {{ display: none; }} }}
-  </style>
-</head>
-<body>
-  <img src="{image_url}" alt="{title_html}" data-auto-print-image>
-  <p class="hint">Press Command-P if the print dialog does not open.</p>
-  <script src="{script_url}" defer></script>
-</body>
-</html>"""
-        )
-        response.headers["Content-Type"] = "text/html; charset=utf-8"
-        return response
-    except Exception as exc:
-        if getattr(exc, "code", None) in (404, 503):
-            raise
-        print(f"🟠 Partner business-card print failed safely: {exc}")
-        abort(503)
-
-
-@app.route(
     "/partner/qr/<salon_code>/<stylist_code>/avery-8471.pdf",
     methods=["GET"],
 )
@@ -3725,6 +3580,7 @@ def partner_avery_8471_pdf(salon_code: str, stylist_code: str):
     if not _partner_dashboard_ready():
         abort(503)
 
+    pdf_buffer = None
     try:
         current_user = _partner_current_user()
         if current_user is None:
@@ -3761,13 +3617,30 @@ def partner_avery_8471_pdf(salon_code: str, stylist_code: str):
                 if stylist_row is None:
                     abort(404)
 
-        pdf_bytes = _partner_avery_8471_pdf_bytes(
-            _partner_link(salon_code, stylist_code),
-            str(stylist_row[1]),
-            str(stylist_row[0]),
-        )
-        return send_file(
-            io.BytesIO(pdf_bytes),
+        if not _PARTNER_AVERY_PDF_LOCK.acquire(blocking=False):
+            response = jsonify(
+                {
+                    "error": (
+                        "Another Avery PDF is being generated. "
+                        "Please try again in a few seconds."
+                    )
+                }
+            )
+            response.status_code = 429
+            response.headers["Retry-After"] = "5"
+            return response
+
+        try:
+            pdf_buffer = _partner_avery_8471_pdf_buffer(
+                _partner_link(salon_code, stylist_code),
+                str(stylist_row[1]),
+                str(stylist_row[0]),
+            )
+        finally:
+            _PARTNER_AVERY_PDF_LOCK.release()
+
+        response = send_file(
+            pdf_buffer,
             mimetype="application/pdf",
             as_attachment=True,
             download_name=(
@@ -3775,7 +3648,11 @@ def partner_avery_8471_pdf(salon_code: str, stylist_code: str):
             ),
             max_age=0,
         )
+        response.call_on_close(pdf_buffer.close)
+        return response
     except Exception as exc:
+        if pdf_buffer is not None and not pdf_buffer.closed:
+            pdf_buffer.close()
         if getattr(exc, "code", None) in (404, 503):
             raise
         print(f"🟠 Partner Avery 8471 PDF failed safely: {exc}")
@@ -4381,32 +4258,6 @@ def partner_dashboard():
                         salon_code=salon_code,
                         stylist_code=stylist_code,
                         download="1",
-                    ),
-                    "business_front_download_url": url_for(
-                        "partner_qr_png",
-                        salon_code=salon_code,
-                        stylist_code=stylist_code,
-                        asset="business-front",
-                        download="1",
-                    ),
-                    "business_back_download_url": url_for(
-                        "partner_qr_png",
-                        salon_code=salon_code,
-                        stylist_code=stylist_code,
-                        asset="business-back",
-                        download="1",
-                    ),
-                    "business_front_print_url": url_for(
-                        "partner_business_card_print",
-                        salon_code=salon_code,
-                        stylist_code=stylist_code,
-                        card_side="front",
-                    ),
-                    "business_back_print_url": url_for(
-                        "partner_business_card_print",
-                        salon_code=salon_code,
-                        stylist_code=stylist_code,
-                        card_side="back",
                     ),
                     "avery_pdf_download_url": url_for(
                         "partner_avery_8471_pdf",
