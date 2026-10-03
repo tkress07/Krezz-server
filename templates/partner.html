@@ -204,6 +204,80 @@
       padding: 22px;
     }
 
+    .back-link {
+      display: inline-flex;
+      margin-bottom: 18px;
+      color: var(--gold);
+      font-weight: 750;
+      text-decoration: none;
+    }
+
+    .back-link:hover {
+      text-decoration: underline;
+    }
+
+    .salon-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 16px;
+    }
+
+    .salon-card {
+      display: flex;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel-soft);
+      flex-direction: column;
+      padding: 20px;
+    }
+
+    .salon-card h3 {
+      margin: 0 0 5px;
+      color: var(--text);
+      font-size: 1.3rem;
+    }
+
+    .salon-card-location {
+      min-height: 40px;
+      margin-bottom: 16px;
+      color: var(--muted);
+    }
+
+    .salon-card-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 11px;
+      margin: 0 0 18px;
+    }
+
+    .salon-card-stats div {
+      min-width: 0;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+
+    .salon-card-stats dt {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.035em;
+      text-transform: uppercase;
+    }
+
+    .salon-card-stats dd {
+      margin: 5px 0 0;
+      color: var(--text);
+      font-size: 1.05rem;
+      font-weight: 800;
+    }
+
+    .salon-card .button {
+      align-self: flex-start;
+      margin-top: auto;
+      text-decoration: none;
+    }
+
     .qr-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
@@ -633,121 +707,135 @@
         >{{ partner_notice.message }}</p>
       {% endif %}
 
-      {% if current_user.salon_count > 1 %}
-        <nav class="location-switcher" aria-label="Choose a salon">
-          <h2>Locations</h2>
-          <div class="location-pills">
-            <a
-              class="location-pill{% if not selected_salon %} active{% endif %}"
-              href="{{ url_for('partner_dashboard') }}"
-            >All locations</a>
-            {% for salon in current_user.salons %}
-              <a
-                class="location-pill{% if selected_salon and selected_salon.salon_code == salon.salon_code %} active{% endif %}"
-                href="{{ url_for('partner_dashboard', salon=salon.salon_code) }}"
-              >{{ salon.salon_name }} · {{ salon.location_label or salon.salon_code }}</a>
-            {% endfor %}
-          </div>
-        </nav>
-      {% endif %}
+      {% if selected_salon %}
+        <a class="back-link" href="{{ url_for('partner_dashboard') }}">
+          ← Back to All Locations
+        </a>
 
-      <section class="grid" aria-label="Combined totals">
-        <article class="metric">
-          <span class="metric-label">Combined paid Krezzcut sales</span>
-          <strong class="metric-value">{{ totals.paid_sales }}</strong>
-        </article>
-        <article class="metric">
-          <span class="metric-label">Combined customer revenue</span>
-          <strong class="metric-value">{{ totals.customer_revenue_cents | money }}</strong>
-        </article>
-        <article class="metric">
-          <span class="metric-label">Combined stylist credits</span>
-          <strong class="metric-value">{{ totals.stylist_credits_cents | money }}</strong>
-        </article>
-        <article class="metric">
-          <span class="metric-label">Combined salon share</span>
-          <strong class="metric-value">{{ totals.salon_share_cents | money }}</strong>
-        </article>
-      </section>
-
-      <section class="panel" aria-labelledby="payout-summary-heading">
-        <div class="panel-heading">
-          <h2 id="payout-summary-heading">Stylist payout tracking</h2>
-          <p class="muted">Manual payments · Lifetime totals</p>
-        </div>
-        <div class="grid" aria-label="Stylist payout totals">
+        <section class="grid" aria-label="Selected location totals">
           <article class="metric">
-            <span class="metric-label">Total earned</span>
+            <span class="metric-label">Active stylists</span>
+            <strong class="metric-value">{{ selected_salon_summary.active_stylist_count }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Paid Krezzcut sales</span>
+            <strong class="metric-value">{{ selected_salon_summary.paid_sales }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Customer revenue</span>
+            <strong class="metric-value">{{ selected_salon_summary.customer_revenue_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Salon share</span>
+            <strong class="metric-value">{{ selected_salon_summary.salon_share_cents | money }}</strong>
+          </article>
+        </section>
+
+        <section class="panel" aria-labelledby="payout-summary-heading">
+          <div class="panel-heading">
+            <h2 id="payout-summary-heading">Location payout summary</h2>
+            <p class="muted">Manual payments · Lifetime totals</p>
+          </div>
+          <div class="grid" aria-label="Selected location payout totals">
+            <article class="metric">
+              <span class="metric-label">Total earned</span>
+              <strong class="metric-value">{{ selected_salon_summary.stylist_credits_cents | money }}</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">Total already paid</span>
+              <strong class="metric-value">{{ selected_salon_summary.stylist_paid_cents | money }}</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">Current amount owed</span>
+              <strong class="metric-value">{{ selected_salon_summary.stylist_owed_cents | money }}</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">Last payout date</span>
+              <strong class="metric-value">
+                {% if selected_salon_summary.last_stylist_payout_at %}
+                  {{ selected_salon_summary.last_stylist_payout_at.strftime('%b %d, %Y') }}
+                {% else %}
+                  —
+                {% endif %}
+              </strong>
+            </article>
+          </div>
+        </section>
+      {% else %}
+        <section class="grid" aria-label="Combined totals">
+          <article class="metric">
+            <span class="metric-label">Combined paid Krezzcut sales</span>
+            <strong class="metric-value">{{ totals.paid_sales }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Combined customer revenue</span>
+            <strong class="metric-value">{{ totals.customer_revenue_cents | money }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Combined stylist credits</span>
             <strong class="metric-value">{{ totals.stylist_credits_cents | money }}</strong>
           </article>
           <article class="metric">
-            <span class="metric-label">Total already paid</span>
+            <span class="metric-label">Combined stylist paid</span>
             <strong class="metric-value">{{ totals.stylist_paid_cents | money }}</strong>
           </article>
           <article class="metric">
-            <span class="metric-label">Current amount owed</span>
+            <span class="metric-label">Combined amount owed</span>
             <strong class="metric-value">{{ totals.stylist_owed_cents | money }}</strong>
           </article>
           <article class="metric">
-            <span class="metric-label">Last payout date</span>
-            <strong class="metric-value">
-              {% if totals.last_stylist_payout_at %}
-                {{ totals.last_stylist_payout_at.strftime('%b %d, %Y') }}
-              {% else %}
-                —
-              {% endif %}
-            </strong>
+            <span class="metric-label">Combined salon share</span>
+            <strong class="metric-value">{{ totals.salon_share_cents | money }}</strong>
           </article>
-        </div>
-      </section>
+        </section>
 
-      <section class="panel">
-        <div class="panel-heading">
-          <h2>Sales by salon</h2>
-          <p class="muted">Select a salon to view its stylists</p>
-        </div>
-        {% if salon_breakdown %}
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Salon</th>
-                  <th>Location</th>
-                  <th class="number">Sales</th>
-                  <th class="number">Customer revenue</th>
-                  <th class="number">Stylist credits</th>
-                  <th class="number">Stylist paid</th>
-                  <th class="number">Stylist owed</th>
-                  <th class="number">Salon share</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for salon in salon_breakdown %}
-                  <tr>
-                    <td>{{ salon.salon_name }}</td>
-                    <td>{{ salon.location_label or salon.salon_code }}</td>
-                    <td class="number">{{ salon.paid_sales }}</td>
-                    <td class="number">{{ salon.customer_revenue_cents | money }}</td>
-                    <td class="number">{{ salon.stylist_credits_cents | money }}</td>
-                    <td class="number">{{ salon.stylist_paid_cents | money }}</td>
-                    <td class="number">{{ salon.stylist_owed_cents | money }}</td>
-                    <td class="number">{{ salon.salon_share_cents | money }}</td>
-                    <td>
-                      <a
-                        class="table-link"
-                        href="{{ url_for('partner_dashboard', salon=salon.salon_code) }}"
-                      >View</a>
-                    </td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
+        <section class="panel" aria-labelledby="locations-heading">
+          <div class="panel-heading">
+            <h2 id="locations-heading">Locations</h2>
+            <p class="muted">Choose a salon to view its stylists, payouts, and QR library</p>
           </div>
-        {% else %}
-          <p class="empty">No active salons are assigned to this login.</p>
-        {% endif %}
-      </section>
+          {% if salon_breakdown %}
+            <div class="salon-grid">
+              {% for salon in salon_breakdown %}
+                <article class="salon-card">
+                  <h3>{{ salon.salon_name }}</h3>
+                  <p class="salon-card-location">
+                    {{ salon.location_label or salon.salon_code }}
+                  </p>
+                  <dl class="salon-card-stats">
+                    <div>
+                      <dt>Active stylists</dt>
+                      <dd>{{ salon.active_stylist_count }}</dd>
+                    </div>
+                    <div>
+                      <dt>Sales</dt>
+                      <dd>{{ salon.paid_sales }}</dd>
+                    </div>
+                    <div>
+                      <dt>Revenue</dt>
+                      <dd>{{ salon.customer_revenue_cents | money }}</dd>
+                    </div>
+                    <div>
+                      <dt>Stylist credits</dt>
+                      <dd>{{ salon.stylist_credits_cents | money }}</dd>
+                    </div>
+                    <div>
+                      <dt>Amount owed</dt>
+                      <dd>{{ salon.stylist_owed_cents | money }}</dd>
+                    </div>
+                  </dl>
+                  <a
+                    class="button"
+                    href="{{ url_for('partner_dashboard', salon=salon.salon_code) }}"
+                  >View Location</a>
+                </article>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="empty">No active salons are assigned to this login.</p>
+          {% endif %}
+        </section>
+      {% endif %}
 
       {% if selected_salon %}
         <section class="panel" id="stylist-payouts">
@@ -826,6 +914,7 @@
         </section>
       {% endif %}
 
+      {% if selected_salon %}
       <section class="panel" id="payout-history">
         <div class="panel-heading">
           <h2>Payout history</h2>
@@ -883,11 +972,15 @@
           <p class="empty">No stylist payouts have been recorded yet.</p>
         {% endif %}
       </section>
+      {% endif %}
 
+      {% if selected_salon %}
       <section class="panel" id="qr-library">
         <div class="panel-heading">
           <h2>QR / Partner Links Library</h2>
-          <p class="muted">{{ qr_stylists | length }} active stylists across your assigned salons</p>
+          <p class="muted">
+            {{ qr_stylists | length }} active stylists at {{ selected_salon.salon_name }}
+          </p>
         </div>
         {% if qr_stylists %}
           <div class="qr-grid">
@@ -951,7 +1044,9 @@
           <p class="empty">No active stylists are available for your assigned salons.</p>
         {% endif %}
       </section>
+      {% endif %}
 
+      {% if selected_salon %}
       <section class="panel">
         <div class="panel-heading">
           <h2>Recent orders</h2>
@@ -1007,6 +1102,7 @@
           <p class="empty">No paid partner orders yet.</p>
         {% endif %}
       </section>
+      {% endif %}
     </main>
   {% else %}
     <main class="shell auth-page">
