@@ -59,7 +59,7 @@ except Exception:
     # the PostgreSQL driver is unavailable for any reason.
     psycopg = None
 
-APP_VERSION = "KrezzServer/2.5.2-memory-safe-avery"
+APP_VERSION = "KrezzServer/2.6.0-location-first-dashboard"
 
 app = Flask(__name__)
 
@@ -3883,9 +3883,6 @@ def partner_dashboard():
                     ),
                     403,
                 )
-        elif current_user["salon_count"] == 1:
-            selected_salon = current_user["salons"][0]
-
         selected_salon_id = (
             int(selected_salon["salon_id"])
             if selected_salon is not None
@@ -3942,6 +3939,7 @@ def partner_dashboard():
                         s.salon_code,
                         s.name,
                         s.location_label,
+                        COALESCE(sc.active_stylist_count, 0)::BIGINT,
                         COUNT(po.order_id)::BIGINT,
                         COALESCE(SUM(po.amount_total_cents), 0)::BIGINT,
                         COALESCE(SUM(po.stylist_credit_cents), 0)::BIGINT,
@@ -3959,6 +3957,15 @@ def partner_dashboard():
                     LEFT JOIN (
                         SELECT
                             salon_id,
+                            COUNT(*)::BIGINT AS active_stylist_count
+                        FROM stylists
+                        WHERE active = TRUE
+                        GROUP BY salon_id
+                    ) AS sc
+                      ON sc.salon_id = s.id
+                    LEFT JOIN (
+                        SELECT
+                            salon_id,
                             SUM(amount_cents)::BIGINT AS stylist_paid_cents,
                             MAX(paid_at) AS last_stylist_payout_at
                         FROM partner_payouts
@@ -3973,6 +3980,7 @@ def partner_dashboard():
                         s.salon_code,
                         s.name,
                         s.location_label,
+                        sc.active_stylist_count,
                         pt.stylist_paid_cents,
                         pt.last_stylist_payout_at
                     ORDER BY
@@ -3984,35 +3992,37 @@ def partner_dashboard():
                 )
                 salon_rows = cur.fetchall()
 
-                cur.execute(
-                    """
-                    SELECT
-                        s.salon_code,
-                        s.name,
-                        s.location_label,
-                        st.stylist_code,
-                        st.display_name
-                    FROM salon_user_access AS access
-                    JOIN salons AS s
-                      ON s.id = access.salon_id
-                     AND s.active = TRUE
-                    JOIN stylists AS st
-                      ON st.salon_id = s.id
-                     AND st.active = TRUE
-                    WHERE access.user_id = %s
-                      AND access.active = TRUE
-                    ORDER BY
-                        s.name ASC,
-                        s.location_label ASC,
-                        st.display_name ASC,
-                        st.id ASC
-                    """,
-                    (user_id,),
-                )
-                qr_rows = cur.fetchall()
-
+                qr_rows = []
                 stylist_rows = []
+                order_rows = []
+                payout_history_rows = []
                 if selected_salon_id is not None:
+                    cur.execute(
+                        """
+                        SELECT
+                            s.salon_code,
+                            s.name,
+                            s.location_label,
+                            st.stylist_code,
+                            st.display_name
+                        FROM salon_user_access AS access
+                        JOIN salons AS s
+                          ON s.id = access.salon_id
+                         AND s.active = TRUE
+                        JOIN stylists AS st
+                          ON st.salon_id = s.id
+                         AND st.active = TRUE
+                        WHERE access.user_id = %s
+                          AND access.salon_id = %s
+                          AND access.active = TRUE
+                        ORDER BY
+                            st.display_name ASC,
+                            st.id ASC
+                        """,
+                        (user_id, selected_salon_id),
+                    )
+                    qr_rows = cur.fetchall()
+
                     cur.execute(
                         """
                         WITH order_totals AS (
@@ -4120,14 +4130,11 @@ def partner_dashboard():
                      AND st.salon_id = po.salon_id
                     WHERE po.livemode = TRUE
                       AND po.payment_status IN ('paid', 'no_payment_required')
-                      AND (
-                          %s::BIGINT IS NULL
-                          OR po.salon_id = %s
-                      )
+                      AND po.salon_id = %s
                     ORDER BY po.paid_at DESC
                     LIMIT 50
                     """,
-                    (user_id, selected_salon_id, selected_salon_id),
+                    (user_id, selected_salon_id),
                 )
                 order_rows = cur.fetchall()
 
@@ -4161,10 +4168,7 @@ def partner_dashboard():
                       ON item.payout_id = pp.id
                      AND item.payout_type = pp.payout_type
                     WHERE pp.payout_type = 'stylist_credit'
-                      AND (
-                          %s::BIGINT IS NULL
-                          OR pp.salon_id = %s
-                      )
+                      AND pp.salon_id = %s
                     GROUP BY
                         pp.id,
                         pp.paid_at,
@@ -4176,7 +4180,7 @@ def partner_dashboard():
                     ORDER BY pp.paid_at DESC, pp.id DESC
                     LIMIT 100
                     """,
-                    (user_id, selected_salon_id, selected_salon_id),
+                    (user_id, selected_salon_id),
                 )
                 payout_history_rows = cur.fetchall()
 
@@ -4200,19 +4204,29 @@ def partner_dashboard():
                 "salon_code": str(row[1]),
                 "salon_name": str(row[2]),
                 "location_label": str(row[3] or ""),
-                "paid_sales": int(row[4] or 0),
-                "customer_revenue_cents": int(row[5] or 0),
-                "stylist_credits_cents": int(row[6] or 0),
-                "salon_share_cents": int(row[7] or 0),
-                "stylist_paid_cents": int(row[8] or 0),
+                "active_stylist_count": int(row[4] or 0),
+                "paid_sales": int(row[5] or 0),
+                "customer_revenue_cents": int(row[6] or 0),
+                "stylist_credits_cents": int(row[7] or 0),
+                "salon_share_cents": int(row[8] or 0),
+                "stylist_paid_cents": int(row[9] or 0),
                 "stylist_owed_cents": max(
                     0,
-                    int(row[6] or 0) - int(row[8] or 0),
+                    int(row[7] or 0) - int(row[9] or 0),
                 ),
-                "last_stylist_payout_at": row[9],
+                "last_stylist_payout_at": row[10],
             }
             for row in salon_rows
         ]
+        selected_salon_summary = next(
+            (
+                salon
+                for salon in salon_breakdown
+                if selected_salon is not None
+                and salon["salon_code"] == selected_salon["salon_code"]
+            ),
+            None,
+        )
         stylists = [
             {
                 "stylist_id": int(row[0]),
@@ -4301,6 +4315,7 @@ def partner_dashboard():
             totals=totals,
             salon_breakdown=salon_breakdown,
             selected_salon=selected_salon,
+            selected_salon_summary=selected_salon_summary,
             stylists=stylists,
             qr_stylists=qr_stylists,
             orders=orders,
