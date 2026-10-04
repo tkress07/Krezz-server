@@ -4756,7 +4756,6 @@ def create_checkout_session():
             checkout_metadata["stylist_id"] = stylist_id
 
         session_kwargs = dict(
-            payment_method_types=["card"],
             mode="payment",
             line_items=line_items,
             automatic_tax={"enabled": True},
