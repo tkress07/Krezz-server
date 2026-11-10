@@ -4506,58 +4506,17 @@ def upload_stl():
     return jsonify({"success": True, "job_id": job_id, "path": save_path})
 
 
-def _head_for_file(path: str, content_type: str):
-    size = os.path.getsize(path)
-    resp = make_response("", 200)
-    resp.headers["Content-Type"] = content_type
-    resp.headers["Content-Length"] = str(size)
-    resp.headers["Accept-Ranges"] = "bytes"
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
+# Physical molds are not public digital products. Slant receives each STL
+# through the server-side presigned direct-upload flow in slant_upload_stl().
+# Retain old paths for compatibility, but never serve the files to customers.
 @app.route("/stl-raw/<job_id>.stl", methods=["GET", "HEAD"])
 def serve_stl_raw(job_id: str):
-    p = stl_path_for(job_id)
-    if not os.path.exists(p):
-        return abort(404)
-
-    if request.method == "HEAD":
-        return _head_for_file(p, "application/octet-stream")
-
-    resp = send_file(
-        p,
-        mimetype="application/octet-stream",
-        as_attachment=False,
-        download_name=f"{job_id}.stl",
-        conditional=True,
-        etag=True,
-    )
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Accept-Ranges"] = "bytes"
-    return resp
+    return abort(404)
 
 
 @app.route("/stl-full/<job_id>.stl", methods=["GET", "HEAD"])
 def serve_stl_full(job_id: str):
-    p = stl_path_for(job_id)
-    if not os.path.exists(p):
-        return abort(404)
-
-    if request.method == "HEAD":
-        return _head_for_file(p, "model/stl")
-
-    resp = send_file(
-        p,
-        mimetype="model/stl",
-        as_attachment=False,
-        download_name=f"{job_id}.stl",
-        conditional=True,
-        etag=True,
-    )
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Accept-Ranges"] = "bytes"
-    return resp
+    return abort(404)
 
 
 @app.route("/debug/stl/info/<job_id>", methods=["GET"])
@@ -4569,15 +4528,13 @@ def debug_stl_info(job_id: str):
     if not os.path.exists(p):
         return jsonify({"ok": False, "error": "not found", "path": p}), 404
     size = os.path.getsize(p)
-    route = "stl-full" if CFG.slant_stl_route == "full" else "stl-raw"
     return jsonify(
         {
             "ok": True,
             "job_id": job_id,
             "path": p,
             "size_bytes": size,
-            "public_url": f"{CFG.public_base_url}/{route}/{job_id}.stl",
-            "slant_stl_route": CFG.slant_stl_route,
+            "customer_downloads_enabled": False,
         }
     )
 
@@ -5226,6 +5183,40 @@ def debug_order_missing_stl(order_id):
     items = order.get("items") or []
     missing = missing_stls_for_items(items)
     return jsonify({"ok": True, "order_id": order_id, "missing_job_ids": missing, "upload_dir": CFG.upload_dir})
+
+
+# Optional STL cleanup: disabled by default. First enable report-only mode
+# with STL_CLEANUP_AUTOMATIC=true, inspect logs, then separately opt into deletion
+# via STL_CLEANUP_ALLOW_DELETE=true. Multiple workers share the disk and lock.
+def _start_stl_cleanup_worker() -> None:
+    if not env_bool("STL_CLEANUP_AUTOMATIC", False):
+        return
+
+    def _worker():
+        time.sleep(90)
+        while True:
+            try:
+                from stl_cleanup import audit_and_maybe_cleanup
+                report = audit_and_maybe_cleanup(
+                    upload_dir=CFG.upload_dir,
+                    order_data_path=CFG.order_data_path,
+                    grace_days=14,
+                    apply=env_bool("STL_CLEANUP_ALLOW_DELETE", False),
+                    max_delete=100,
+                )
+                print("🧹 STL cleanup:", json.dumps(report, ensure_ascii=False))
+            except Exception as exc:
+                print(f"⚠️ STL cleanup skipped safely: {exc}")
+            time.sleep(24 * 60 * 60)
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name="stl-cleanup",
+    ).start()
+
+
+_start_stl_cleanup_worker()
 
 
 # Start the recovery scanner. render.yaml uses one Gunicorn worker.
