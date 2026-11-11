@@ -4326,6 +4326,30 @@ def health():
     )
 
 
+@app.route("/daily-capacity", methods=["GET"])
+def daily_capacity():
+    """Read-only, anonymous capacity snapshot for the iOS checkout counter.
+
+    'used' includes paid molds AND currently reserved Stripe sessions, so
+    the customer-facing counter must not call this a sold-order count.
+    The existing atomic reservation at checkout remains authoritative.
+    """
+    info = QUOTA.stats()
+    cap = max(0, int(info.get("cap") or 0))
+    paid = max(0, int(info.get("paid_count") or 0))
+    reserved = max(0, int(info.get("reserved_count") or 0))
+    used = paid + reserved
+    response = jsonify({
+        "day": info.get("day"),
+        "limit": cap,
+        "used": used,
+        "remaining": max(0, cap - used) if cap else None,
+        "next_reset": info.get("next_reset"),
+    })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
 @app.route("/monitor/status", methods=["GET"])
 def monitor_status():
     """Private read-only operational status. Never retries or changes an order."""
